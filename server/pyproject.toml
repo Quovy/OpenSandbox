@@ -43,7 +43,9 @@ classifiers = [
 ]
 dependencies = [
     "docker",
-    "fastapi",
+    "fastapi>=0.137.0",
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.30",
     "httpx[socks]",
     "kubernetes",
     "pydantic",
