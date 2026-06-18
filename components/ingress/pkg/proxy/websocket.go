@@ -116,7 +116,7 @@ func (w *WebSocketProxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		switch key {
 		case HopByHopConnection, HopByHopKeepAlive, HopByHopProxyAuth, HopByHopProxyAuthz,
 			HopByHopTE, HopByHopTrailer, HopByHopTransferEncoding, HopByHopUpgrade,
-			SecWebSocketKey, SecWebSocketVersion, SecWebSocketExtensions:
+			HopByHopProxyConnection, SecWebSocketKey, SecWebSocketVersion, SecWebSocketExtensions:
 			continue
 		}
 		if connTokens[key] {

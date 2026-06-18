@@ -47,4 +47,5 @@ var (
 	HopByHopTrailer          = http.CanonicalHeaderKey("Trailer")
 	HopByHopTransferEncoding = http.CanonicalHeaderKey("Transfer-Encoding")
 	HopByHopUpgrade          = http.CanonicalHeaderKey("Upgrade")
+	HopByHopProxyConnection  = http.CanonicalHeaderKey("Proxy-Connection")
 )
