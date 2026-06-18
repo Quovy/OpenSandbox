@@ -153,7 +153,7 @@ If you need both gVisor's syscall isolation and FQDN egress control:
 - Use `kata-qemu` instead — it provides comparable security isolation and supports the egress sidecar.
 - Alternatively, use a CNI-level FQDN policy (e.g., Cilium `toFQDNs`) for network isolation alongside gVisor.
 
-See the [Compatibility Matrix](secure-container.md#compatibility-matrix) in the Secure Container Runtime Guide for the full feature support table.
+See the [Compatibility Matrix](../guides/secure-container.md#compatibility-matrix) in the Secure Container Runtime Guide for the full feature support table.
 
 ## Recommendations
 
