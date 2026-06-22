@@ -113,15 +113,10 @@ func (m *Manager) AddUpstream(ctx context.Context, config UpstreamConfig) (*Upst
 // RemoveUpstream closes an upstream and removes its tools.
 func (m *Manager) RemoveUpstream(name string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	up, exists := m.upstreams[name]
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("upstream %q not found", name)
-	}
-
-	if err := up.Close(); err != nil {
-		log.Warning("mcp proxy: error closing upstream %q: %v", name, err)
 	}
 
 	delete(m.upstreams, name)
@@ -131,6 +126,12 @@ func (m *Manager) RemoveUpstream(name string) error {
 		}
 	}
 	m.rebuildToolList()
+	m.mu.Unlock()
+
+	// Close outside the lock — may block on process/network IO.
+	if err := up.Close(); err != nil {
+		log.Warning("mcp proxy: error closing upstream %q: %v", name, err)
+	}
 
 	log.Info("mcp proxy: removed upstream %q", name)
 	return nil

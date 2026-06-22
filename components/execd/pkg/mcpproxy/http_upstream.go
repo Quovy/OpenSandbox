@@ -39,8 +39,9 @@ type httpUpstream struct {
 	mu        sync.RWMutex
 	sessionID string
 
-	nextID atomic.Int64
-	tools  []Tool
+	nextID       atomic.Int64
+	tools        []Tool
+	toolsFetched bool
 }
 
 func newHTTPUpstream(config UpstreamConfig) *httpUpstream {
@@ -204,7 +205,7 @@ func (h *httpUpstream) Initialize(ctx context.Context) error {
 }
 
 func (h *httpUpstream) Tools(ctx context.Context) ([]Tool, error) {
-	if h.tools != nil {
+	if h.toolsFetched {
 		return h.tools, nil
 	}
 
@@ -235,6 +236,7 @@ func (h *httpUpstream) Tools(ctx context.Context) ([]Tool, error) {
 	}
 
 	h.tools = allTools
+	h.toolsFetched = true
 	return h.tools, nil
 }
 

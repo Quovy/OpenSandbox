@@ -17,12 +17,15 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/mcpproxy"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
+
+var validUpstreamName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
 var mcpManager *mcpproxy.Manager
 
@@ -136,6 +139,10 @@ func (c *MCPController) AddUpstream() {
 		return
 	}
 
+	if !validUpstreamName.MatchString(req.Name) {
+		c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, "name must be 1-64 chars: alphanumeric, dot, hyphen, underscore")
+		return
+	}
 	if req.Transport == "stdio" && req.Command == "" {
 		c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, "command is required for stdio transport")
 		return

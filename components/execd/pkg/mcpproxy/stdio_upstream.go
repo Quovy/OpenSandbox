@@ -49,8 +49,9 @@ type stdioUpstream struct {
 	nextID  atomic.Int64
 	pending sync.Map // map[string]chan *Response — keyed by JSON-encoded ID
 
-	tools []Tool
-	done  chan struct{}
+	tools        []Tool
+	toolsFetched bool
+	done         chan struct{}
 }
 
 func newStdioUpstream(config UpstreamConfig) *stdioUpstream {
@@ -239,7 +240,7 @@ func (s *stdioUpstream) Initialize(ctx context.Context) error {
 }
 
 func (s *stdioUpstream) Tools(ctx context.Context) ([]Tool, error) {
-	if s.tools != nil {
+	if s.toolsFetched {
 		return s.tools, nil
 	}
 
@@ -270,6 +271,7 @@ func (s *stdioUpstream) Tools(ctx context.Context) ([]Tool, error) {
 	}
 
 	s.tools = allTools
+	s.toolsFetched = true
 	return s.tools, nil
 }
 
