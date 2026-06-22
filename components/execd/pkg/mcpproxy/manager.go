@@ -45,10 +45,11 @@ func NewManager() *Manager {
 // its tool list, and registers the tools. Returns error if any tool name
 // conflicts with an already-registered tool.
 func (m *Manager) AddUpstream(ctx context.Context, config UpstreamConfig) (*UpstreamInfo, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.upstreams[config.Name]; exists {
+	// Quick check under lock — reject duplicates before expensive IO.
+	m.mu.RLock()
+	_, exists := m.upstreams[config.Name]
+	m.mu.RUnlock()
+	if exists {
 		return nil, fmt.Errorf("upstream %q already registered", config.Name)
 	}
 
@@ -62,6 +63,8 @@ func (m *Manager) AddUpstream(ctx context.Context, config UpstreamConfig) (*Upst
 		return nil, fmt.Errorf("unsupported transport: %s", config.Transport)
 	}
 
+	// Initialize and fetch tools outside the lock to avoid blocking
+	// all proxy traffic while dialing a slow or unreachable upstream.
 	if err := up.Initialize(ctx); err != nil {
 		_ = up.Close()
 		return nil, fmt.Errorf("initialize upstream %q: %w", config.Name, err)
@@ -73,7 +76,15 @@ func (m *Manager) AddUpstream(ctx context.Context, config UpstreamConfig) (*Upst
 		return nil, fmt.Errorf("fetch tools from %q: %w", config.Name, err)
 	}
 
-	// Check for conflicts before registering any tools.
+	// Now lock to register — re-check for races.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.upstreams[config.Name]; exists {
+		_ = up.Close()
+		return nil, fmt.Errorf("upstream %q already registered", config.Name)
+	}
+
 	for _, t := range tools {
 		if owner, exists := m.toolIndex[t.Name]; exists {
 			_ = up.Close()
@@ -176,11 +187,14 @@ func (m *Manager) GetUpstream(name string) (*UpstreamInfo, error) {
 // HandleRequest routes a downstream MCP JSON-RPC request to the appropriate handler.
 // Returns the response and optionally a new session ID (for initialize requests).
 func (m *Manager) HandleRequest(ctx context.Context, req *Request, sessionID string) (*Response, string, error) {
+	// JSON-RPC notifications (no id) must never receive a response.
+	if req.IsNotification() {
+		return nil, "", nil
+	}
+
 	switch req.Method {
 	case "initialize":
 		return m.handleInitialize(req)
-	case "notifications/initialized":
-		return nil, "", nil // notification, no response
 	case "ping":
 		return m.handlePing(req)
 	case "tools/list":
@@ -203,7 +217,7 @@ func (m *Manager) handleInitialize(req *Request) (*Response, string, error) {
 		"protocolVersion": "2025-03-26",
 		"capabilities": map[string]any{
 			"tools": map[string]any{
-				"listChanged": true,
+				"listChanged": false,
 			},
 		},
 		"serverInfo": map[string]any{

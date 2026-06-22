@@ -34,6 +34,7 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"inputSchema,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 // UpstreamConfig describes how to connect to an upstream MCP server.
@@ -57,7 +58,13 @@ type UpstreamInfo struct {
 
 // toolsListResult matches the MCP tools/list response shape.
 type toolsListResult struct {
-	Tools []Tool `json:"tools"`
+	Tools      []Tool `json:"tools"`
+	NextCursor string `json:"nextCursor,omitempty"`
+}
+
+// toolsListParams is the MCP tools/list request params with optional cursor.
+type toolsListParams struct {
+	Cursor string `json:"cursor,omitempty"`
 }
 
 // callToolParams matches the MCP tools/call request params shape.

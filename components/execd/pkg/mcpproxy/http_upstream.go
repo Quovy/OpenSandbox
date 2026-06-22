@@ -15,12 +15,15 @@
 package mcpproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -28,13 +31,16 @@ import (
 const mcpSessionHeader = "Mcp-Session-Id"
 
 type httpUpstream struct {
-	name      string
-	url       string
-	headers   map[string]string // custom headers sent on every request
-	client    *http.Client
+	name    string
+	url     string
+	headers map[string]string // custom headers sent on every request
+	client  *http.Client
+
+	mu        sync.RWMutex
 	sessionID string
-	nextID    atomic.Int64
-	tools     []Tool
+
+	nextID atomic.Int64
+	tools  []Tool
 }
 
 func newHTTPUpstream(config UpstreamConfig) *httpUpstream {
@@ -79,9 +85,11 @@ func (h *httpUpstream) post(ctx context.Context, method string, params any) (*Re
 	for k, v := range h.headers {
 		httpReq.Header.Set(k, v)
 	}
+	h.mu.RLock()
 	if h.sessionID != "" {
 		httpReq.Header.Set(mcpSessionHeader, h.sessionID)
 	}
+	h.mu.RUnlock()
 
 	httpResp, err := h.client.Do(httpReq)
 	if err != nil {
@@ -90,7 +98,19 @@ func (h *httpUpstream) post(ctx context.Context, method string, params any) (*Re
 	defer httpResp.Body.Close()
 
 	if sid := httpResp.Header.Get(mcpSessionHeader); sid != "" {
+		h.mu.Lock()
 		h.sessionID = sid
+		h.mu.Unlock()
+	}
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("upstream %s returned %d: %s", h.name, httpResp.StatusCode, string(body))
+	}
+
+	ct := httpResp.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "text/event-stream") {
+		return h.parseSSEResponse(httpResp.Body, id)
 	}
 
 	body, err := io.ReadAll(httpResp.Body)
@@ -98,15 +118,39 @@ func (h *httpUpstream) post(ctx context.Context, method string, params any) (*Re
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upstream %s returned %d: %s", h.name, httpResp.StatusCode, string(body))
-	}
-
 	var resp Response
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 	return &resp, nil
+}
+
+// parseSSEResponse reads an SSE stream and returns the first JSON-RPC
+// response that matches the given request ID.
+func (h *httpUpstream) parseSSEResponse(r io.Reader, requestID int64) (*Response, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(data), &resp); err != nil {
+			continue
+		}
+		if resp.ID != nil {
+			return &resp, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read SSE stream: %w", err)
+	}
+	return nil, fmt.Errorf("SSE stream ended without a response for request %d", requestID)
 }
 
 func (h *httpUpstream) Initialize(ctx context.Context) error {
@@ -145,9 +189,11 @@ func (h *httpUpstream) Initialize(ctx context.Context) error {
 	for k, v := range h.headers {
 		httpReq.Header.Set(k, v)
 	}
+	h.mu.RLock()
 	if h.sessionID != "" {
 		httpReq.Header.Set(mcpSessionHeader, h.sessionID)
 	}
+	h.mu.RUnlock()
 	notifResp, err := h.client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("initialized notification: %w", err)
@@ -165,20 +211,30 @@ func (h *httpUpstream) Tools(ctx context.Context) ([]Tool, error) {
 	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
 
-	resp, err := h.post(ctx, "tools/list", struct{}{})
-	if err != nil {
-		return nil, fmt.Errorf("tools/list: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("tools/list error: %s", resp.Error.Message)
+	var allTools []Tool
+	var cursor string
+	for {
+		params := toolsListParams{Cursor: cursor}
+		resp, err := h.post(ctx, "tools/list", params)
+		if err != nil {
+			return nil, fmt.Errorf("tools/list: %w", err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("tools/list error: %s", resp.Error.Message)
+		}
+
+		var result toolsListResult
+		if err := json.Unmarshal(resp.Result, &result); err != nil {
+			return nil, fmt.Errorf("parse tools/list result: %w", err)
+		}
+		allTools = append(allTools, result.Tools...)
+		if result.NextCursor == "" {
+			break
+		}
+		cursor = result.NextCursor
 	}
 
-	var result toolsListResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("parse tools/list result: %w", err)
-	}
-
-	h.tools = result.Tools
+	h.tools = allTools
 	return h.tools, nil
 }
 
@@ -194,7 +250,10 @@ func (h *httpUpstream) CallTool(ctx context.Context, name string, arguments json
 }
 
 func (h *httpUpstream) Close() error {
-	if h.sessionID == "" {
+	h.mu.RLock()
+	sid := h.sessionID
+	h.mu.RUnlock()
+	if sid == "" {
 		return nil
 	}
 
@@ -208,7 +267,7 @@ func (h *httpUpstream) Close() error {
 	for k, v := range h.headers {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set(mcpSessionHeader, h.sessionID)
+	req.Header.Set(mcpSessionHeader, sid)
 
 	resp, err := h.client.Do(req)
 	if err != nil {

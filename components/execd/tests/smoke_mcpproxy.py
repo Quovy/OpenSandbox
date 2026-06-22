@@ -24,7 +24,6 @@ Prerequisites:
 - Optional: set env API_TOKEN if server expects X-EXECD-ACCESS-TOKEN
 """
 
-import json
 import os
 import sys
 import tempfile
@@ -453,8 +452,8 @@ def main():
         # Best-effort cleanup: remove upstream if still registered.
         try:
             session.delete(f"{BASE_URL}/mcpproxy/upstreams/mock", timeout=5)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[!] cleanup: failed to remove upstream (ignored): {exc}", file=sys.stderr)
         cleanup_mock()
 
 

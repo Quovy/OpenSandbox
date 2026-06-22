@@ -246,20 +246,30 @@ func (s *stdioUpstream) Tools(ctx context.Context) ([]Tool, error) {
 	ctx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
 
-	resp, err := s.sendRequest(ctx, "tools/list", struct{}{})
-	if err != nil {
-		return nil, fmt.Errorf("tools/list: %w", err)
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("tools/list error: %s", resp.Error.Message)
+	var allTools []Tool
+	var cursor string
+	for {
+		params := toolsListParams{Cursor: cursor}
+		resp, err := s.sendRequest(ctx, "tools/list", params)
+		if err != nil {
+			return nil, fmt.Errorf("tools/list: %w", err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("tools/list error: %s", resp.Error.Message)
+		}
+
+		var result toolsListResult
+		if err := json.Unmarshal(resp.Result, &result); err != nil {
+			return nil, fmt.Errorf("parse tools/list result: %w", err)
+		}
+		allTools = append(allTools, result.Tools...)
+		if result.NextCursor == "" {
+			break
+		}
+		cursor = result.NextCursor
 	}
 
-	var result toolsListResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("parse tools/list result: %w", err)
-	}
-
-	s.tools = result.Tools
+	s.tools = allTools
 	return s.tools, nil
 }
 
