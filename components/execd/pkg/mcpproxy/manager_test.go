@@ -28,8 +28,8 @@ type fakeUpstream struct {
 	tools []Tool
 }
 
-func (f *fakeUpstream) Name() string      { return f.name }
-func (f *fakeUpstream) Transport() string  { return "fake" }
+func (f *fakeUpstream) Name() string                       { return f.name }
+func (f *fakeUpstream) Transport() string                  { return "fake" }
 func (f *fakeUpstream) Initialize(_ context.Context) error { return nil }
 func (f *fakeUpstream) Tools(_ context.Context) ([]Tool, error) {
 	return f.tools, nil

@@ -60,7 +60,7 @@ func newStdioUpstream(config UpstreamConfig) *stdioUpstream {
 	}
 }
 
-func (s *stdioUpstream) Name() string     { return s.name }
+func (s *stdioUpstream) Name() string      { return s.name }
 func (s *stdioUpstream) Transport() string { return "stdio" }
 
 func (s *stdioUpstream) start() error {

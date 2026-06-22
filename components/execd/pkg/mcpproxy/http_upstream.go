@@ -49,7 +49,7 @@ func newHTTPUpstream(config UpstreamConfig) *httpUpstream {
 }
 
 func (h *httpUpstream) Name() string      { return h.name }
-func (h *httpUpstream) Transport() string  { return "http" }
+func (h *httpUpstream) Transport() string { return "http" }
 
 func (h *httpUpstream) post(ctx context.Context, method string, params any) (*Response, error) {
 	id := h.nextID.Add(1)

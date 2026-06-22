@@ -26,10 +26,10 @@ import (
 // Manager aggregates multiple upstream MCP servers and proxies requests.
 type Manager struct {
 	mu        sync.RWMutex
-	upstreams map[string]Upstream  // name → upstream
-	toolIndex map[string]string    // tool name → upstream name
-	allTools  []Tool               // cached aggregated list
-	sessions  map[string]*Session  // Mcp-Session-Id → session
+	upstreams map[string]Upstream // name → upstream
+	toolIndex map[string]string   // tool name → upstream name
+	allTools  []Tool              // cached aggregated list
+	sessions  map[string]*Session // Mcp-Session-Id → session
 }
 
 // NewManager creates an empty proxy manager.
