@@ -238,7 +238,7 @@ func (m *Manager) handleToolsList(req *Request, sessionID string) (*Response, st
 func (m *Manager) handleToolsCall(ctx context.Context, req *Request, sessionID string) (*Response, string, error) {
 	var params callToolParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return newErrorResponse(req.ID, CodeInvalidParams, "invalid tools/call params"), "", nil
+		return newErrorResponse(req.ID, CodeInvalidParams, "invalid tools/call params"), "", nil //nolint:nilerr // JSON-RPC error is in the response, not the Go error return
 	}
 
 	m.mu.RLock()

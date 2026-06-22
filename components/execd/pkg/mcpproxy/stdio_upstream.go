@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -301,9 +302,9 @@ func (s *stdioUpstream) Close() error {
 func normalizeID(id any) string {
 	switch v := id.(type) {
 	case float64:
-		return fmt.Sprintf("%d", int64(v))
+		return strconv.FormatInt(int64(v), 10)
 	case int64:
-		return fmt.Sprintf("%d", v)
+		return strconv.FormatInt(v, 10)
 	case string:
 		return v
 	default:
