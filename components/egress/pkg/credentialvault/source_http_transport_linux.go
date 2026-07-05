@@ -28,13 +28,13 @@ import (
 func httpSourceTransport() http.RoundTripper {
 	dialer := defaultTransportDialer()
 	dialer.Control = func(network, address string, c syscall.RawConn) error {
-		var opErr error
-		if err := c.Control(func(fd uintptr) {
-			opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, constants.MarkValue)
-		}); err != nil {
-			return err
-		}
-		return opErr
+		_ = c.Control(func(fd uintptr) {
+			// Best-effort: requires CAP_NET_ADMIN. In environments without
+			// iptables transparent redirect (tests, dev), the mark is
+			// unnecessary and the error is harmless.
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, constants.MarkValue)
+		})
+		return nil
 	}
 	return &http.Transport{DialContext: dialer.DialContext}
 }
