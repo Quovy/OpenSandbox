@@ -32,12 +32,12 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialListRes
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialMatch
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialMetadata
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialMutationSet
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialSubstitution
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultCreateRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultPatchRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CustomHeaderEntry
-import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.HTTPCredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.InlineCredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
@@ -318,18 +318,20 @@ internal class EgressAdapter(
 
     private fun CredentialSource.toJsonObject(): JsonObject =
         when (this) {
-            is InlineCredentialSource -> buildJsonObject {
-                put("type", JsonPrimitive(type))
-                put("value", JsonPrimitive(value))
-            }
-            is HTTPCredentialSource -> buildJsonObject {
-                put("type", JsonPrimitive(type))
-                put("url", JsonPrimitive(url))
-                put("method", JsonPrimitive(method))
-                headers?.let { h ->
-                    put("headers", buildJsonObject { h.forEach { (k, v) -> put(k, JsonPrimitive(v)) } })
+            is InlineCredentialSource ->
+                buildJsonObject {
+                    put("type", JsonPrimitive(type))
+                    put("value", JsonPrimitive(value))
                 }
-            }
+            is HTTPCredentialSource ->
+                buildJsonObject {
+                    put("type", JsonPrimitive(type))
+                    put("url", JsonPrimitive(url))
+                    put("method", JsonPrimitive(method))
+                    headers?.let { h ->
+                        put("headers", buildJsonObject { h.forEach { (k, v) -> put(k, JsonPrimitive(v)) } })
+                    }
+                }
         }
 
     private fun List<CredentialBinding>.toBindingJsonArray(): JsonArray = JsonArray(map { it.toJsonObject() })
