@@ -18,9 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -37,8 +39,9 @@ type httpSource struct {
 	initialMethod  string
 	initialHeaders map[string]string
 
-	nextURL     string
-	nextHeaders map[string]string
+	nextURL        string
+	nextHeaders    map[string]string
+	headersRotated bool
 
 	cachedValue string
 	expiresAt   time.Time
@@ -88,8 +91,10 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 	if url == "" {
 		url = s.initialURL
 	}
-	headers := s.nextHeaders
-	if len(headers) == 0 {
+	var headers map[string]string
+	if s.headersRotated {
+		headers = s.nextHeaders
+	} else {
 		headers = s.initialHeaders
 	}
 	s.mu.RUnlock()
@@ -136,8 +141,9 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 	if result.URL != "" {
 		s.nextURL = result.URL
 	}
-	if len(result.Headers) > 0 {
+	if result.Headers != nil {
 		s.nextHeaders = result.Headers
+		s.headersRotated = true
 	}
 	s.mu.Unlock()
 
@@ -159,6 +165,13 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("http credential source url cannot be empty")
 	}
+	parsed, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("http credential source url: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return nil, fmt.Errorf("http credential source url must use http or https scheme, got %q", parsed.Scheme)
+	}
 	if cfg.Method == "" {
 		cfg.Method = http.MethodGet
 	}
@@ -166,6 +179,11 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 		initialURL:     cfg.URL,
 		initialMethod:  cfg.Method,
 		initialHeaders: cfg.Headers,
-		client:         &http.Client{Timeout: httpSourceDefaultTimeout},
+		client: &http.Client{
+			Timeout: httpSourceDefaultTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return errors.New("http credential source: redirects are not allowed")
+			},
+		},
 	}, nil
 }
