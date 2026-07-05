@@ -17,6 +17,11 @@ package constants
 const (
 	MarkValue = 0x1
 	MarkHex   = "0x1"
+
+	// CredentialFetchMarkValue bypasses iptables transparent HTTP redirect
+	// without bypassing nft egress policy (unlike MarkValue which does both).
+	CredentialFetchMarkValue = 0x2
+	CredentialFetchMarkHex   = "0x2"
 )
 
 const (

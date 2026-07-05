@@ -144,7 +144,13 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 		s.expiresAt = time.Time{}
 	}
 	if result.URL != "" {
-		s.nextURL = result.URL
+		if validateHTTPSourceURL(result.URL) == nil {
+			s.nextURL = result.URL
+			if result.Headers == nil {
+				s.nextHeaders = nil
+				s.headersRotated = true
+			}
+		}
 	}
 	if result.Headers != nil {
 		s.nextHeaders = result.Headers
@@ -170,15 +176,8 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("http credential source url cannot be empty")
 	}
-	parsed, err := url.Parse(cfg.URL)
-	if err != nil {
-		return nil, fmt.Errorf("http credential source url: %w", err)
-	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return nil, fmt.Errorf("http credential source url must use http or https scheme, got %q", parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("http credential source url must include a host")
+	if err := validateHTTPSourceURL(cfg.URL); err != nil {
+		return nil, err
 	}
 	if cfg.Method == "" {
 		cfg.Method = http.MethodGet
@@ -186,15 +185,8 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 	if _, err := http.NewRequest(cfg.Method, cfg.URL, nil); err != nil {
 		return nil, fmt.Errorf("http credential source: invalid method or url: %w", err)
 	}
-	for name, value := range cfg.Headers {
-		if !headerFieldNamePattern.MatchString(name) {
-			return nil, fmt.Errorf("http credential source: invalid header name %q", name)
-		}
-		for i := range value {
-			if value[i] == '\r' || value[i] == '\n' {
-				return nil, fmt.Errorf("http credential source: header %q value contains CR/LF", name)
-			}
-		}
+	if err := validateHTTPSourceHeaders(cfg.Headers); err != nil {
+		return nil, err
 	}
 	return &httpSource{
 		initialURL:     cfg.URL,
@@ -208,4 +200,33 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 			},
 		},
 	}, nil
+}
+
+func validateHTTPSourceHeaders(headers map[string]string) error {
+	for name, value := range headers {
+		if !headerFieldNamePattern.MatchString(name) {
+			return fmt.Errorf("http credential source: invalid header name %q", name)
+		}
+		for i := range value {
+			b := value[i]
+			if b < 0x20 || b == 0x7f {
+				return fmt.Errorf("http credential source: header %q value contains invalid character 0x%02x", name, b)
+			}
+		}
+	}
+	return nil
+}
+
+func validateHTTPSourceURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("http credential source url: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return fmt.Errorf("http credential source url must use http or https scheme, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("http credential source url must include a host")
+	}
+	return nil
 }

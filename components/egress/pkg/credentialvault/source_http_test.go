@@ -309,7 +309,44 @@ func TestHttpSourceFactoryRejectsHeaderValueWithCRLF(t *testing.T) {
 		"url":     "https://vault.example.com/cred",
 		"headers": map[string]string{"X-Auth": "value\r\ninjection"},
 	}))
-	require.ErrorContains(t, err, "CR/LF")
+	require.ErrorContains(t, err, "invalid character")
+}
+
+func TestHttpSourceFactoryRejectsHeaderValueWithControlChar(t *testing.T) {
+	_, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     "https://vault.example.com/cred",
+		"headers": map[string]string{"X-Auth": "value\x00null"},
+	}))
+	require.ErrorContains(t, err, "invalid character")
+}
+
+func TestHttpSourceURLOnlyRotationClearsBootstrapHeaders(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			require.Equal(t, "boot", r.Header.Get("X-Auth"))
+			fmt.Fprintf(w, `{"value":"first","url":"http://%s/refreshed","ttl":0}`, r.Host)
+			return
+		}
+		require.Equal(t, "", r.Header.Get("X-Auth"), "bootstrap header should not leak to rotated URL")
+		fmt.Fprintf(w, `{"value":"second","ttl":0}`)
+	}))
+	defer srv.Close()
+
+	src, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     srv.URL,
+		"headers": map[string]string{"X-Auth": "boot"},
+	}))
+	require.NoError(t, err)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
 }
 
 func TestHttpSourceRejectsRedirects(t *testing.T) {

@@ -32,7 +32,7 @@ func httpSourceTransport() http.RoundTripper {
 			// Best-effort: requires CAP_NET_ADMIN. In environments without
 			// iptables transparent redirect (tests, dev), the mark is
 			// unnecessary and the error is harmless.
-			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, constants.MarkValue)
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, constants.CredentialFetchMarkValue)
 		})
 		return nil
 	}
