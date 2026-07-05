@@ -37,6 +37,8 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultCr
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultPatchRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialVaultState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CustomHeaderEntry
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialSource
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.HTTPCredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.InlineCredentialSource
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
@@ -314,10 +316,20 @@ internal class EgressAdapter(
             put("source", source.toJsonObject())
         }
 
-    private fun InlineCredentialSource.toJsonObject(): JsonObject =
-        buildJsonObject {
-            put("type", JsonPrimitive(type))
-            put("value", JsonPrimitive(value))
+    private fun CredentialSource.toJsonObject(): JsonObject =
+        when (this) {
+            is InlineCredentialSource -> buildJsonObject {
+                put("type", JsonPrimitive(type))
+                put("value", JsonPrimitive(value))
+            }
+            is HTTPCredentialSource -> buildJsonObject {
+                put("type", JsonPrimitive(type))
+                put("url", JsonPrimitive(url))
+                put("method", JsonPrimitive(method))
+                headers?.let { h ->
+                    put("headers", buildJsonObject { h.forEach { (k, v) -> put(k, JsonPrimitive(v)) } })
+                }
+            }
         }
 
     private fun List<CredentialBinding>.toBindingJsonArray(): JsonArray = JsonArray(map { it.toJsonObject() })

@@ -149,6 +149,33 @@ async def test_async_credential_vault_create_patch_and_list_bindings() -> None:
     assert exc_info.value.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_async_credential_vault_create_with_http_source() -> None:
+    transport = _CredentialVaultAsyncTransport()
+    adapter = EgressAdapter(
+        ConnectionConfig(transport=transport),
+        SandboxEndpoint(endpoint="sandbox.internal:18080"),
+    )
+
+    from opensandbox.models import HTTPCredentialSource, Credential
+
+    cred = Credential(
+        name="vault-token",
+        source=HTTPCredentialSource(url="https://vault.example.com/cred", method="POST"),
+    )
+    serialized = cred.model_dump(mode="json")
+    assert serialized["source"]["type"] == "http"
+    assert serialized["source"]["url"] == "https://vault.example.com/cred"
+    assert serialized["source"]["method"] == "POST"
+
+    cred_from_dict = Credential(
+        name="vault-token-2",
+        source={"type": "http", "url": "https://vault.example.com/cred"},
+    )
+    assert isinstance(cred_from_dict.source, HTTPCredentialSource)
+    assert cred_from_dict.source.url == "https://vault.example.com/cred"
+
+
 def test_sync_credential_vault_get_and_delete() -> None:
     transport = _CredentialVaultSyncTransport()
     adapter = EgressAdapterSync(
