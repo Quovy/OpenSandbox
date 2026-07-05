@@ -521,11 +521,8 @@ export interface components {
             type: "http";
             /** @description HTTP endpoint URL to fetch the credential from. */
             url: string;
-            /**
-             * @description HTTP method. Defaults to GET.
-             * @default GET
-             */
-            method: string;
+            /** @description HTTP method. Defaults to GET when omitted. */
+            method?: string;
             /** @description Optional static headers sent with the request. */
             headers?: {
                 [key: string]: string;

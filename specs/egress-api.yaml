@@ -554,8 +554,7 @@ components:
           description: HTTP endpoint URL to fetch the credential from.
         method:
           type: string
-          default: GET
-          description: HTTP method. Defaults to GET.
+          description: HTTP method. Defaults to GET when omitted.
         headers:
           type: object
           additionalProperties:

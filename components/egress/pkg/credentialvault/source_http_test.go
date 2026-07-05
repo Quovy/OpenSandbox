@@ -275,6 +275,43 @@ func TestHttpSourceFactoryRejectsRelativeURL(t *testing.T) {
 	require.ErrorContains(t, err, "must use http or https scheme")
 }
 
+func TestHttpSourceFactoryRejectsHostlessURL(t *testing.T) {
+	for _, u := range []string{"http:/token", "https:///token", "http://"} {
+		_, err := httpSourceFactory(mustMarshal(map[string]string{
+			"type": "http",
+			"url":  u,
+		}))
+		require.ErrorContains(t, err, "must include a host", u)
+	}
+}
+
+func TestHttpSourceFactoryRejectsInvalidMethod(t *testing.T) {
+	_, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":   "http",
+		"url":    "https://vault.example.com/cred",
+		"method": "BAD METHOD",
+	}))
+	require.ErrorContains(t, err, "invalid method")
+}
+
+func TestHttpSourceFactoryRejectsInvalidHeaderName(t *testing.T) {
+	_, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     "https://vault.example.com/cred",
+		"headers": map[string]string{"Bad Header": "value"},
+	}))
+	require.ErrorContains(t, err, "invalid header name")
+}
+
+func TestHttpSourceFactoryRejectsHeaderValueWithCRLF(t *testing.T) {
+	_, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     "https://vault.example.com/cred",
+		"headers": map[string]string{"X-Auth": "value\r\ninjection"},
+	}))
+	require.ErrorContains(t, err, "CR/LF")
+}
+
 func TestHttpSourceRejectsRedirects(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://evil.example.com", http.StatusFound)

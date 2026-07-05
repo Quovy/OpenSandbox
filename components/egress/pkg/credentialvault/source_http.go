@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -30,6 +31,10 @@ import (
 )
 
 const httpSourceDefaultTimeout = 10 * time.Second
+
+func defaultTransportDialer() *net.Dialer {
+	return &net.Dialer{Timeout: 5 * time.Second}
+}
 
 type httpSource struct {
 	mu sync.RWMutex
@@ -172,15 +177,32 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
 		return nil, fmt.Errorf("http credential source url must use http or https scheme, got %q", parsed.Scheme)
 	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("http credential source url must include a host")
+	}
 	if cfg.Method == "" {
 		cfg.Method = http.MethodGet
+	}
+	if _, err := http.NewRequest(cfg.Method, cfg.URL, nil); err != nil {
+		return nil, fmt.Errorf("http credential source: invalid method or url: %w", err)
+	}
+	for name, value := range cfg.Headers {
+		if !headerFieldNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("http credential source: invalid header name %q", name)
+		}
+		for i := range value {
+			if value[i] == '\r' || value[i] == '\n' {
+				return nil, fmt.Errorf("http credential source: header %q value contains CR/LF", name)
+			}
+		}
 	}
 	return &httpSource{
 		initialURL:     cfg.URL,
 		initialMethod:  cfg.Method,
 		initialHeaders: cfg.Headers,
 		client: &http.Client{
-			Timeout: httpSourceDefaultTimeout,
+			Timeout:   httpSourceDefaultTimeout,
+			Transport: httpSourceTransport(),
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return errors.New("http credential source: redirects are not allowed")
 			},

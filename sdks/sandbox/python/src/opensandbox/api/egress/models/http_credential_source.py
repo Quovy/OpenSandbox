@@ -37,13 +37,13 @@ class HTTPCredentialSource:
     Attributes:
         type_ (HTTPCredentialSourceType):
         url (str): HTTP endpoint URL to fetch the credential from.
-        method (str | Unset): HTTP method. Defaults to GET. Default: 'GET'.
+        method (str | Unset): HTTP method. Defaults to GET when omitted.
         headers (HTTPCredentialSourceHeaders | Unset): Optional static headers sent with the request.
     """
 
     type_: HTTPCredentialSourceType
     url: str
-    method: str | Unset = "GET"
+    method: str | Unset = UNSET
     headers: HTTPCredentialSourceHeaders | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
