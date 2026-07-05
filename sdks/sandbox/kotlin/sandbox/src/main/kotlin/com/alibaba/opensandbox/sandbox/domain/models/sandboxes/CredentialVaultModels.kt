@@ -172,6 +172,16 @@ class Credential private constructor(
             return this
         }
 
+        fun source(source: InlineCredentialSource): Builder {
+            this.source = source as CredentialSource
+            return this
+        }
+
+        fun source(source: HTTPCredentialSource): Builder {
+            this.source = source as CredentialSource
+            return this
+        }
+
         fun inlineSource(value: String): Builder {
             this.source = InlineCredentialSource.of(value)
             return this

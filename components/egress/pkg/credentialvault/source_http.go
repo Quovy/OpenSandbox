@@ -145,16 +145,18 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 	}
 	urlValid := result.URL == "" || validateHTTPSourceURL(result.URL) == nil
 	headersValid := result.Headers == nil || validateHTTPSourceHeaders(result.Headers) == nil
-	if urlValid && result.URL != "" {
-		s.nextURL = result.URL
-		if result.Headers == nil {
-			s.nextHeaders = nil
+	if urlValid && headersValid {
+		if result.URL != "" {
+			s.nextURL = result.URL
+			if result.Headers == nil {
+				s.nextHeaders = nil
+				s.headersRotated = true
+			}
+		}
+		if result.Headers != nil {
+			s.nextHeaders = result.Headers
 			s.headersRotated = true
 		}
-	}
-	if urlValid && headersValid && result.Headers != nil {
-		s.nextHeaders = result.Headers
-		s.headersRotated = true
 	}
 	s.mu.Unlock()
 
