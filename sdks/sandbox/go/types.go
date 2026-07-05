@@ -299,10 +299,10 @@ func (s InlineCredentialSource) MarshalJSON() ([]byte, error) {
 // the credential. Optional "url", "headers", and "ttl" fields in the
 // response control subsequent fetch behavior and caching.
 type HTTPCredentialSource struct {
-	Type    CredentialSourceType  `json:"type"`
-	URL     string                `json:"url"`
-	Method  string                `json:"method,omitempty"`
-	Headers map[string]string     `json:"headers,omitempty"`
+	Type    CredentialSourceType `json:"type"`
+	URL     string               `json:"url"`
+	Method  string               `json:"method,omitempty"`
+	Headers map[string]string    `json:"headers,omitempty"`
 }
 
 // MarshalJSON defaults the type field so callers can omit it.

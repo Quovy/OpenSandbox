@@ -24,6 +24,7 @@ from opensandbox.adapters.egress_adapter import EgressAdapter
 from opensandbox.config import ConnectionConfig
 from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.exceptions import SandboxApiException
+from opensandbox.models import Credential, HTTPCredentialSource
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.sync.adapters.egress_adapter import EgressAdapterSync
 
@@ -149,16 +150,7 @@ async def test_async_credential_vault_create_patch_and_list_bindings() -> None:
     assert exc_info.value.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_async_credential_vault_create_with_http_source() -> None:
-    transport = _CredentialVaultAsyncTransport()
-    adapter = EgressAdapter(
-        ConnectionConfig(transport=transport),
-        SandboxEndpoint(endpoint="sandbox.internal:18080"),
-    )
-
-    from opensandbox.models import HTTPCredentialSource, Credential
-
+def test_http_credential_source_serialization() -> None:
     cred = Credential(
         name="vault-token",
         source=HTTPCredentialSource(url="https://vault.example.com/cred", method="POST"),
