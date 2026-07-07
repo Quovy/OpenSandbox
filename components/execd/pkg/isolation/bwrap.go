@@ -55,7 +55,7 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 		// namespace creation inside the sandbox.
 		argv = append(argv, "--unshare-user", "--disable-userns")
 	}
-	argv = append(argv, "--unshare-pid", "--unshare-uts", "--unshare-ipc")
+	argv = append(argv, "--unshare-pid", "--unshare-uts", "--hostname", "sandbox", "--unshare-ipc")
 	if !opts.ShareNet {
 		argv = append(argv, "--unshare-net")
 	}
