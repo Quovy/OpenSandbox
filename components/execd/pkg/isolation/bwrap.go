@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -53,8 +54,8 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 			gid = *opts.Gid
 		}
 		argv = append(argv,
-			"--uid", fmt.Sprintf("%d", uid),
-			"--gid", fmt.Sprintf("%d", gid),
+			"--uid", strconv.FormatUint(uint64(uid), 10),
+			"--gid", strconv.FormatUint(uint64(gid), 10),
 		)
 	}
 
