@@ -44,12 +44,34 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 		return nil, err
 	}
 
+	useUserns := opts.UidMode == UidModeUserns
+
 	var argv []string
 
-	// 1. Namespace flags — no --unshare-user (real setuid instead).
+	// 1. Namespace flags.
+	if useUserns {
+		// User namespace mode: bwrap handles uid/gid mapping via
+		// --unshare-user. --disable-userns prevents nested user
+		// namespace creation inside the sandbox.
+		argv = append(argv, "--unshare-user", "--disable-userns")
+	}
 	argv = append(argv, "--unshare-pid", "--unshare-uts", "--unshare-ipc")
 	if !opts.ShareNet {
 		argv = append(argv, "--unshare-net")
+	}
+	if useUserns {
+		uid := uint32(os.Getuid())
+		gid := uint32(os.Getgid())
+		if opts.Uid != nil {
+			uid = *opts.Uid
+		}
+		if opts.Gid != nil {
+			gid = *opts.Gid
+		}
+		argv = append(argv,
+			"--uid", fmt.Sprintf("%d", uid),
+			"--gid", fmt.Sprintf("%d", gid),
+		)
 	}
 
 	// 2. Root filesystem (read-only).
@@ -102,24 +124,28 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 	// The user command is appended by the caller via cmd.Args after Wrap.
 	argv = append(argv, "--")
 
-	// setpriv runs before the user command.
-	uid := uint32(os.Getuid())
-	gid := uint32(os.Getgid())
-	if opts.Uid != nil {
-		uid = *opts.Uid
-	}
-	if opts.Gid != nil {
-		gid = *opts.Gid
-	}
-
-	if uid != 0 || gid != 0 {
-		setprivArgv := []string{
-			"setpriv",
-			fmt.Sprintf("--reuid=%d", uid),
-			fmt.Sprintf("--regid=%d", gid),
-			"--clear-groups",
+	// In userns mode, uid/gid are already set via --uid/--gid in the
+	// namespace flags (segment 1). setpriv is not needed and would fail
+	// because CAP_SETUID is not available inside a user namespace.
+	if !useUserns {
+		uid := uint32(os.Getuid())
+		gid := uint32(os.Getgid())
+		if opts.Uid != nil {
+			uid = *opts.Uid
 		}
-		argv = append(argv, setprivArgv...)
+		if opts.Gid != nil {
+			gid = *opts.Gid
+		}
+
+		if uid != 0 || gid != 0 {
+			setprivArgv := []string{
+				"setpriv",
+				fmt.Sprintf("--reuid=%d", uid),
+				fmt.Sprintf("--regid=%d", gid),
+				"--clear-groups",
+			}
+			argv = append(argv, setprivArgv...)
+		}
 	}
 
 	return argv, nil
@@ -138,6 +164,9 @@ func validateWrapOptions(opts WrapOptions) error {
 	}
 	if !opts.EnvPassthrough.Mode.Valid() && opts.EnvPassthrough.Mode != "" {
 		return fmt.Errorf("isolation: unknown env mode %q", opts.EnvPassthrough.Mode)
+	}
+	if opts.UidMode != "" && !opts.UidMode.Valid() {
+		return fmt.Errorf("isolation: unknown uid mode %q", opts.UidMode)
 	}
 	return nil
 }
