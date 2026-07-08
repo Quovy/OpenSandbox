@@ -38,7 +38,12 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 
 	// 1. Namespace flags.
 	if useUserns {
-		argv = append(argv, "--unshare-user", "--disable-userns")
+		argv = append(argv, "--unshare-user")
+		// --disable-userns is unsupported by the setuid build of bwrap;
+		// only add it for the non-setuid binary.
+		if !bwrapIsSetuid {
+			argv = append(argv, "--disable-userns")
+		}
 	}
 	argv = append(argv, "--unshare-pid", "--unshare-uts", "--hostname", "sandbox", "--unshare-ipc", "--unshare-cgroup")
 	if !opts.ShareNet {

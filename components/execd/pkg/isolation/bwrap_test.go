@@ -267,6 +267,21 @@ func TestBuildArgv_Userns(t *testing.T) {
 		assert.Contains(t, s, "--gid 1000", "userns mode must include --gid")
 	})
 
+	t.Run("userns_mode_setuid_bwrap_skips_disable_userns", func(t *testing.T) {
+		// --disable-userns is unsupported by the setuid build of bwrap.
+		bwrapIsSetuid = true
+		defer func() { bwrapIsSetuid = false }()
+
+		opts := basicWrapOpts()
+		opts.UidMode = UidModeUserns
+		argv, err := buildArgv(opts, "")
+		require.NoError(t, err)
+		s := strings.Join(argv, " ")
+
+		assert.Contains(t, s, "--unshare-user", "userns mode must still include --unshare-user")
+		assert.NotContains(t, s, "--disable-userns", "setuid bwrap must not include --disable-userns")
+	})
+
 	t.Run("userns_mode_no_setpriv", func(t *testing.T) {
 		opts := basicWrapOpts()
 		u, g := uint32(1000), uint32(1000)
