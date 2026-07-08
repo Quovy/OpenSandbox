@@ -101,8 +101,12 @@ func buildArgv(opts WrapOptions, seccompFd string) ([]string, error) {
 		argv = append(argv, "--seccomp", seccompFd)
 	}
 
-	// 11. Lifecycle: orphan prevention + session isolation.
-	argv = append(argv, "--die-with-parent", "--new-session")
+	// 11. Lifecycle: kill sandbox when execd dies.
+	// Note: --new-session is intentionally omitted. bwrap is launched with
+	// SysProcAttr{Setpgid: true}, making it a process-group leader, and
+	// setsid(2) returns EPERM for a group leader — it would fail every
+	// session start. Process-group isolation from Setpgid is sufficient.
+	argv = append(argv, "--die-with-parent")
 
 	// 12. Separator + identity switch.
 	argv = append(argv, "--")
