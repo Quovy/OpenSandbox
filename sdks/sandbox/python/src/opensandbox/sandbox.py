@@ -22,7 +22,11 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from opensandbox.models.execd import Execution
+    from opensandbox.mount import NfsMountOptions, OssfsMountOptions
 
 from opensandbox.adapters.factory import AdapterFactory
 from opensandbox.config import ConnectionConfig
@@ -342,6 +346,94 @@ class Sandbox:
         preserved.
         """
         await self._egress_service.delete_rules(targets)
+
+    async def mount(
+        self, options: "NfsMountOptions | OssfsMountOptions"
+    ) -> "Execution":
+        """
+        Mount a NAS export or an OSS bucket inside this sandbox using shell commands.
+
+        Depending on the ``options`` type this method either runs ``mount -t nfs``
+        (see :class:`opensandbox.mount.NfsMountOptions`) or ``ossfs`` / ``ossfs2``
+        (see :class:`opensandbox.mount.OssfsMountOptions`). The remote sandbox is
+        expected to have the corresponding mount binary installed, or ``installation``
+        can be used to install it at mount time.
+
+        Args:
+            options: NAS or OSS mount options.
+
+        Returns:
+            The :class:`~opensandbox.models.execd.Execution` returned by ``commands.run``.
+
+        Raises:
+            InvalidArgumentException: if the options are invalid.
+            MountFailedException: if the mount command fails inside the sandbox.
+        """
+        # Local imports keep the public Sandbox class import graph identical to
+        # before the mount syntax sugar was added.
+        from opensandbox.mount._shell import (
+            build_nfs_command,
+            build_ossfs1_passwd_entry,
+            build_ossfs1_plan,
+            build_ossfs2_entries,
+            build_ossfs2_plan,
+            ensure_success,
+            select_ossfs_version,
+            validate_nfs,
+            validate_ossfs,
+        )
+        from opensandbox.mount.models import (
+            NfsMountOptions,
+            OssfsMountOptions,
+            OssfsVersion,
+        )
+
+        if isinstance(options, NfsMountOptions):
+            validate_nfs(options)
+            cmd = build_nfs_command(options)
+            execution = await self._command_service.run(cmd)
+            ensure_success(execution, "NAS mount failure")
+            return execution
+
+        if isinstance(options, OssfsMountOptions):
+            validate_ossfs(options)
+            version = select_ossfs_version(options)
+            if version is OssfsVersion.OSSFS_1_0:
+                plan1 = build_ossfs1_plan(options)
+                await self._filesystem_service.write_files(
+                    [build_ossfs1_passwd_entry(plan1)]
+                )
+                execution = await self._command_service.run(plan1.command)
+                ensure_success(execution, "ossfs1.0 mount failure")
+                return execution
+            plan = build_ossfs2_plan(options)
+            await self._filesystem_service.write_files(build_ossfs2_entries(plan))
+            execution = await self._command_service.run(plan.command)
+            ensure_success(execution, "ossfs2.0 mount failure")
+            return execution
+
+        raise TypeError(
+            f"Unsupported mount options type: {type(options).__name__}. "
+            "Expected NfsMountOptions or OssfsMountOptions."
+        )
+
+    async def umount(self, mount_point: str) -> "Execution":
+        """
+        Unmount a previously mounted path inside this sandbox.
+
+        Args:
+            mount_point: Absolute path inside the sandbox to unmount.
+
+        Raises:
+            InvalidArgumentException: if ``mount_point`` is blank.
+            MountFailedException: if the umount command fails.
+        """
+        from opensandbox.mount._shell import build_umount_command, ensure_success
+
+        cmd = build_umount_command(mount_point)
+        execution = await self._command_service.run(cmd)
+        ensure_success(execution, "umount failure")
+        return execution
 
     async def pause(self) -> None:
         """

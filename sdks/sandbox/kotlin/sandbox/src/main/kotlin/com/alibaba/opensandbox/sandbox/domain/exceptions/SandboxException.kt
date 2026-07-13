@@ -116,6 +116,22 @@ class SnapshotFailedException(
     )
 
 /**
+ * Thrown when a NAS or OSS mount syntax-sugar call fails inside the sandbox.
+ *
+ * The [Execution] handle from the failed shell command is exposed so callers can
+ * inspect the exit code, stdout and stderr for diagnostics.
+ */
+class MountFailedException(
+    message: String? = null,
+    cause: Throwable? = null,
+    val execution: com.alibaba.opensandbox.sandbox.domain.models.execd.executions.Execution? = null,
+) : SandboxException(
+        message = message,
+        cause = cause,
+        error = SandboxError(SandboxError.MOUNT_FAILED, message),
+    )
+
+/**
  * Thrown when an invalid argument is provided to an SDK method.
  * Similar to [IllegalArgumentException] but within the SDK's exception hierarchy.
  */
@@ -216,6 +232,9 @@ data class SandboxError(
         const val UNHEALTHY = "UNHEALTHY"
         const val INVALID_ARGUMENT = "INVALID_ARGUMENT"
         const val UNEXPECTED_RESPONSE = "UNEXPECTED_RESPONSE"
+
+        /** A `sandbox.mount(...)` syntax-sugar call failed inside the sandbox. */
+        const val MOUNT_FAILED = "MOUNT_FAILED"
 
         /** A snapshot reached the `Failed` state while waiting for it to become ready. */
         const val SNAPSHOT_FAILED = "SNAPSHOT_FAILED"

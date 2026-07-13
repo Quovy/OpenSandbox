@@ -43,6 +43,11 @@ public static class SandboxErrorCodes
     /// Unexpected response from the server.
     /// </summary>
     public const string UnexpectedResponse = "UNEXPECTED_RESPONSE";
+
+    /// <summary>
+    /// A NAS or OSS mount syntax-sugar call failed inside the sandbox.
+    /// </summary>
+    public const string MountFailed = "MOUNT_FAILED";
 }
 
 /// <summary>
@@ -229,5 +234,36 @@ public class InvalidArgumentException : SandboxException
     public InvalidArgumentException(string? message = null, Exception? innerException = null)
         : base(message, innerException, new SandboxError(SandboxErrorCodes.InvalidArgument, message))
     {
+    }
+}
+
+/// <summary>
+/// Exception thrown when a NAS or OSS mount syntax-sugar call fails inside the sandbox.
+/// </summary>
+/// <remarks>
+/// The <see cref="Execution"/> property exposes the failing execution handle
+/// returned by the underlying <c>Commands.RunAsync</c> call so callers can inspect
+/// the exit code, stdout, and stderr for diagnostics.
+/// </remarks>
+public class MountFailedException : SandboxException
+{
+    /// <summary>
+    /// Gets the failing execution result attached to this exception, if any.
+    /// </summary>
+    public OpenSandbox.Models.Execution? Execution { get; }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="MountFailedException"/> class.
+    /// </summary>
+    /// <param name="message">The error message.</param>
+    /// <param name="execution">The failing execution result.</param>
+    /// <param name="innerException">The inner exception.</param>
+    public MountFailedException(
+        string? message = null,
+        OpenSandbox.Models.Execution? execution = null,
+        Exception? innerException = null)
+        : base(message, innerException, new SandboxError(SandboxErrorCodes.MountFailed, message))
+    {
+        Execution = execution;
     }
 }

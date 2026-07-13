@@ -382,6 +382,43 @@ async with await SandboxManager.create(connection_config=config) as manager:
         await manager.kill_sandbox(info.id)
 ```
 
+### 15. NAS / OSS Mounts
+
+`Sandbox.mount(...)` runs `mount -t nfs`, `ossfs` or `ossfs2` inside a running sandbox via `commands.run(...)`, so the sandbox image must have the corresponding binary installed (or use `installation=...` to install it on demand). The password / configuration files are created with mode 600 in one step and are cleaned up even when the mount command itself fails.
+
+Both `Sandbox` (async) and `SandboxSync` expose the same API.
+
+```python
+from opensandbox.mount import NfsMountOptions, OssfsMountOptions, OssfsVersion
+
+# Mount a NAS export
+await sandbox.mount(
+    NfsMountOptions(
+        endpoint="nas-server.example.com",
+        nas_path="/share",
+        mount_point="/mnt/nas",
+        installation="apt-get install -y nfs-common",  # optional
+    )
+)
+
+# Mount an OSS bucket via ossfs 2.x
+await sandbox.mount(
+    OssfsMountOptions(
+        endpoint="https://oss-cn-hangzhou.aliyuncs.com",
+        bucket="my-bucket",
+        bucket_directory="subdir",         # optional; maps to --oss_bucket_prefix
+        mount_point="/mnt/oss",
+        access_key_id=os.environ["OSS_AK"],
+        access_key_secret=os.environ["OSS_SK"],
+        version=OssfsVersion.OSSFS_2_0,
+    )
+)
+
+await sandbox.umount("/mnt/nas")
+```
+
+Failures raise `MountFailedException`, which exposes the failing `Execution` so callers can inspect exit code and stderr.
+
 ## Configuration
 
 ### 1. Connection Configuration

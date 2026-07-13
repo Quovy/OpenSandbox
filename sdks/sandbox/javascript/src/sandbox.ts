@@ -48,6 +48,24 @@ import type {
   Volume,
 } from "./models/sandboxes.js";
 import { SandboxReadyTimeoutException } from "./core/exceptions.js";
+import type { Execution } from "./models/execution.js";
+import type { NfsMountOptions, OssfsMountOptions } from "./mount/models.js";
+import {
+  isNfsMountOptions,
+  isOssfsMountOptions,
+} from "./mount/models.js";
+import {
+  buildNfsCommand,
+  buildOssfs1PasswdEntry,
+  buildOssfs1Plan,
+  buildOssfs2Entries,
+  buildOssfs2Plan,
+  buildUmountCommand,
+  ensureSuccess,
+  selectOssfsVersion,
+  validateNfs,
+  validateOssfs,
+} from "./mount/shell.js";
 
 const HOST_PATH_PATTERN = /^([/]|[A-Za-z]:[\\/])/;
 
@@ -576,6 +594,57 @@ export class Sandbox {
 
   async getMetrics() {
     return await this.metrics.getMetrics();
+  }
+
+  /**
+   * Mount a NAS export or an OSS bucket inside this sandbox using shell commands.
+   *
+   * Depending on the option shape this method either runs `mount -t nfs` (see
+   * {@link NfsMountOptions}) or `ossfs` / `ossfs2` (see {@link OssfsMountOptions}).
+   * The remote sandbox must have the corresponding mount binary installed, or
+   * `installation` can install it at mount time.
+   *
+   * @throws InvalidArgumentException if the options are invalid.
+   * @throws MountFailedException if the mount command fails inside the sandbox.
+   */
+  async mount(options: NfsMountOptions | OssfsMountOptions): Promise<Execution> {
+    if (isNfsMountOptions(options)) {
+      validateNfs(options);
+      const execution = await this.commands.run(buildNfsCommand(options));
+      ensureSuccess(execution, "NAS mount failure");
+      return execution;
+    }
+    if (isOssfsMountOptions(options)) {
+      validateOssfs(options);
+      const version = selectOssfsVersion(options);
+      if (version === "1.0") {
+        const plan1 = buildOssfs1Plan(options);
+        await this.files.writeFiles([buildOssfs1PasswdEntry(plan1)]);
+        const execution = await this.commands.run(plan1.command);
+        ensureSuccess(execution, "ossfs1.0 mount failure");
+        return execution;
+      }
+      const plan = buildOssfs2Plan(options);
+      await this.files.writeFiles(buildOssfs2Entries(plan));
+      const execution = await this.commands.run(plan.command);
+      ensureSuccess(execution, "ossfs2.0 mount failure");
+      return execution;
+    }
+    throw new TypeError(
+      "Unsupported mount options: expected NfsMountOptions or OssfsMountOptions",
+    );
+  }
+
+  /**
+   * Unmount a previously mounted path inside this sandbox.
+   *
+   * @throws InvalidArgumentException if `mountPoint` is blank.
+   * @throws MountFailedException if the umount command fails.
+   */
+  async umount(mountPoint: string): Promise<Execution> {
+    const execution = await this.commands.run(buildUmountCommand(mountPoint));
+    ensureSuccess(execution, "umount failure");
+    return execution;
   }
 
   async pause(): Promise<void> {

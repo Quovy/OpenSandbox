@@ -17,6 +17,8 @@
 Sandbox-related exception definitions.
 """
 
+from typing import Any
+
 
 class SandboxError:
     """
@@ -28,6 +30,7 @@ class SandboxError:
     UNHEALTHY = "UNHEALTHY"
     INVALID_ARGUMENT = "INVALID_ARGUMENT"
     UNEXPECTED_RESPONSE = "UNEXPECTED_RESPONSE"
+    MOUNT_FAILED = "MOUNT_FAILED"
     POOL_EMPTY = "POOL_EMPTY"
     POOL_ACQUIRE_FAILED = "POOL_ACQUIRE_FAILED"
     POOL_STATE_STORE_UNAVAILABLE = "POOL_STATE_STORE_UNAVAILABLE"
@@ -152,6 +155,26 @@ class InvalidArgumentException(SandboxException):
         super().__init__(
             message, cause, SandboxError(SandboxError.INVALID_ARGUMENT, message)
         )
+
+
+class MountFailedException(SandboxException):
+    """
+    Thrown when a NAS or OSS mount syntax-sugar call fails inside the sandbox.
+
+    The ``execution`` attribute exposes the ``Execution`` handle returned by the
+    underlying command so callers can inspect exit code and stderr for diagnostics.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        cause: Exception | None = None,
+        execution: Any | None = None,
+    ) -> None:
+        super().__init__(
+            message, cause, SandboxError(SandboxError.MOUNT_FAILED, message)
+        )
+        self.execution = execution
 
 
 class PoolEmptyException(SandboxException):

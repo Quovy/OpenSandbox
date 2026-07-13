@@ -19,6 +19,7 @@ Exception definitions for OpenSandbox SDK.
 
 from opensandbox.exceptions.sandbox import (
     InvalidArgumentException,
+    MountFailedException,
     PoolAcquireFailedException,
     PoolDestroyedException,
     PoolDestroyIncompleteException,
@@ -40,6 +41,7 @@ __all__ = [
     "SandboxUnhealthyException",
     "SandboxReadyTimeoutException",
     "InvalidArgumentException",
+    "MountFailedException",
     "PoolEmptyException",
     "PoolAcquireFailedException",
     "PoolDestroyedException",

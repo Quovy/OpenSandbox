@@ -14,6 +14,7 @@
 
 export {
   InvalidArgumentException,
+  MountFailedException,
   SandboxApiException,
   SandboxError,
   SandboxException,
@@ -136,6 +137,16 @@ export type {
   SandboxCreateOptions,
 } from "./sandbox.js";
 export { Sandbox } from "./sandbox.js";
+export {
+  DEFAULT_NFS_OPTIONS,
+  isNfsMountOptions,
+  isOssfsMountOptions,
+} from "./mount/index.js";
+export type {
+  NfsMountOptions,
+  OssfsMountOptions,
+  OssfsVersion,
+} from "./mount/index.js";
 
 export type {
   ContentReplaceEntry,

@@ -21,7 +21,11 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from opensandbox.models.execd import Execution
+    from opensandbox.mount import NfsMountOptions, OssfsMountOptions
 
 from opensandbox.config.connection_sync import ConnectionConfigSync
 from opensandbox.constants import DEFAULT_EGRESS_PORT, DEFAULT_EXECD_PORT
@@ -346,6 +350,77 @@ class SandboxSync:
         preserved.
         """
         self._egress_service.delete_rules(targets)
+
+    def mount(
+        self, options: "NfsMountOptions | OssfsMountOptions"
+    ) -> "Execution":
+        """
+        Mount a NAS export or an OSS bucket inside this sandbox using shell commands.
+
+        See :meth:`opensandbox.sandbox.Sandbox.mount` for full semantics.
+
+        Raises:
+            InvalidArgumentException: if the options are invalid.
+            MountFailedException: if the mount command fails inside the sandbox.
+        """
+        from opensandbox.mount._shell import (
+            build_nfs_command,
+            build_ossfs1_passwd_entry,
+            build_ossfs1_plan,
+            build_ossfs2_entries,
+            build_ossfs2_plan,
+            ensure_success,
+            select_ossfs_version,
+            validate_nfs,
+            validate_ossfs,
+        )
+        from opensandbox.mount.models import (
+            NfsMountOptions,
+            OssfsMountOptions,
+            OssfsVersion,
+        )
+
+        if isinstance(options, NfsMountOptions):
+            validate_nfs(options)
+            cmd = build_nfs_command(options)
+            execution = self._command_service.run(cmd)
+            ensure_success(execution, "NAS mount failure")
+            return execution
+
+        if isinstance(options, OssfsMountOptions):
+            validate_ossfs(options)
+            version = select_ossfs_version(options)
+            if version is OssfsVersion.OSSFS_1_0:
+                plan1 = build_ossfs1_plan(options)
+                self._filesystem_service.write_files(
+                    [build_ossfs1_passwd_entry(plan1)]
+                )
+                execution = self._command_service.run(plan1.command)
+                ensure_success(execution, "ossfs1.0 mount failure")
+                return execution
+            plan = build_ossfs2_plan(options)
+            self._filesystem_service.write_files(build_ossfs2_entries(plan))
+            execution = self._command_service.run(plan.command)
+            ensure_success(execution, "ossfs2.0 mount failure")
+            return execution
+
+        raise TypeError(
+            f"Unsupported mount options type: {type(options).__name__}. "
+            "Expected NfsMountOptions or OssfsMountOptions."
+        )
+
+    def umount(self, mount_point: str) -> "Execution":
+        """
+        Unmount a previously mounted path inside this sandbox.
+
+        See :meth:`opensandbox.sandbox.Sandbox.umount` for full semantics.
+        """
+        from opensandbox.mount._shell import build_umount_command, ensure_success
+
+        cmd = build_umount_command(mount_point)
+        execution = self._command_service.run(cmd)
+        ensure_success(execution, "umount failure")
+        return execution
 
     def pause(self) -> None:
         """

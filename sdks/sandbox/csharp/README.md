@@ -226,6 +226,40 @@ foreach (var s in list.Items)
 }
 ```
 
+### NAS / OSS Mounts
+
+`sandbox.MountAsync(...)` runs `mount -t nfs`, `ossfs`, or `ossfs2` inside a running sandbox via `Commands.RunAsync`, so the sandbox image must have the corresponding binary installed (or use `Installation` to install it on demand). The password / configuration files are created with mode 600 in one step and are cleaned up even when the mount command itself fails.
+
+```csharp
+using OpenSandbox;
+using OpenSandbox.Models;
+
+// Mount a NAS export
+await sandbox.MountAsync(new NfsMountOptions
+{
+    Endpoint = "nas-server.example.com",
+    NasPath = "/share",
+    MountPoint = "/mnt/nas",
+    Installation = "apt-get install -y nfs-common", // optional
+});
+
+// Mount an OSS bucket via ossfs 2.x
+await sandbox.MountAsync(new OssfsMountOptions
+{
+    Endpoint = "https://oss-cn-hangzhou.aliyuncs.com",
+    Bucket = "my-bucket",
+    BucketDirectory = "subdir",             // optional; maps to --oss_bucket_prefix
+    MountPoint = "/mnt/oss",
+    AccessKeyId = Environment.GetEnvironmentVariable("OSS_AK")!,
+    AccessKeySecret = Environment.GetEnvironmentVariable("OSS_SK")!,
+    Version = OssfsVersion.Ossfs20,
+});
+
+await sandbox.UmountAsync("/mnt/nas");
+```
+
+Failures throw `MountFailedException` (`OpenSandbox.Core`), which exposes the failing `Execution` on `ex.Execution` so callers can inspect exit code and stderr.
+
 ## Configuration
 
 ### 1. Connection Configuration

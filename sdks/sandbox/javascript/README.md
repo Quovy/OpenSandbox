@@ -205,6 +205,38 @@ console.log(list.items.map((s) => s.id));
 await manager.close();
 ```
 
+### NAS / OSS Mounts
+
+`sandbox.mount(...)` runs `mount -t nfs`, `ossfs` or `ossfs2` inside a running sandbox via `commands.run(...)`, so the sandbox image must have the corresponding binary installed (or use `installation` to install it on demand). The password / configuration files are created with mode 600 in one step and are cleaned up even when the mount command itself fails.
+
+```ts
+import { Sandbox } from "@alibaba-group/opensandbox";
+
+// Mount a NAS export
+await sandbox.mount({
+  endpoint: "nas-server.example.com",
+  nasPath: "/share",
+  mountPoint: "/mnt/nas",
+  installation: "apt-get install -y nfs-common", // optional
+});
+
+// Mount an OSS bucket via ossfs 2.x
+await sandbox.mount({
+  endpoint: "https://oss-cn-hangzhou.aliyuncs.com",
+  bucket: "my-bucket",
+  bucketDirectory: "subdir",         // optional; maps to --oss_bucket_prefix
+  mountPoint: "/mnt/oss",
+  accessKeyId: process.env.OSS_AK!,
+  accessKeySecret: process.env.OSS_SK!,
+  version: "2.0",
+});
+
+await sandbox.umount("/mnt/nas");
+```
+
+Failures throw `MountFailedException`, which exposes the failing `Execution` on
+`err.execution` so callers can inspect exit code and stderr.
+
 ## Configuration
 
 ### 1. Connection Configuration

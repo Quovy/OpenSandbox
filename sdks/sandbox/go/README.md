@@ -249,6 +249,43 @@ Created with `NewEgressClient(baseURL, authToken string, opts ...Option)`.
 | `ListCredentialVaultBindings(ctx)` | List sanitized binding metadata |
 | `GetCredentialVaultBinding(ctx, name)` | Get sanitized metadata for one binding |
 
+### NAS / OSS Mounts
+
+`Sandbox.Mount(ctx, options)` runs `mount -t nfs`, `ossfs`, or `ossfs2` inside a running sandbox via `RunCommand`, so the sandbox image must have the corresponding binary installed (or use `Installation` to install it on demand). The password / configuration files are created with mode 600 in one step and are cleaned up even when the mount command itself fails.
+
+```go
+import opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
+
+// Mount a NAS export.
+if _, err := sb.Mount(ctx, &opensandbox.NfsMountOptions{
+    Endpoint:     "nas-server.example.com",
+    NasPath:      "/share",
+    MountPoint:   "/mnt/nas",
+    Installation: "apt-get install -y nfs-common", // optional
+}); err != nil {
+    var mfe *opensandbox.MountFailedError
+    if errors.As(err, &mfe) {
+        log.Fatalf("mount failed: %v (stderr: %v)", mfe.Message, mfe.Execution.Stderr)
+    }
+    log.Fatal(err)
+}
+
+// Mount an OSS bucket via ossfs 2.x.
+_, err := sb.Mount(ctx, &opensandbox.OssfsMountOptions{
+    Endpoint:        "https://oss-cn-hangzhou.aliyuncs.com",
+    Bucket:          "my-bucket",
+    BucketDirectory: "subdir",           // optional; maps to --oss_bucket_prefix
+    MountPoint:      "/mnt/oss",
+    AccessKeyID:     os.Getenv("OSS_AK"),
+    AccessKeySecret: os.Getenv("OSS_SK"),
+    Version:         opensandbox.OssfsVersion20,
+})
+
+_, _ = sb.Umount(ctx, "/mnt/nas")
+```
+
+Failures return `*MountFailedError`, which exposes the failing `*Execution` on `err.Execution` so callers can inspect exit code and stderr.
+
 ## SSE Streaming
 
 Methods that stream output (`RunCommand`, `ExecuteCode`, `RunInSession`, `WatchMetrics`) accept an `EventHandler` callback:

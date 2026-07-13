@@ -35,6 +35,26 @@ export type { paths as LifecyclePaths } from "./api/lifecycle.js";
 export type { paths as ExecdPaths } from "./api/execd.js";
 export type { paths as EgressPaths } from "./api/egress.js";
 
+// Low-level mount syntax-sugar builders. Public users normally go through
+// `sandbox.mount(...)` and `sandbox.umount(...)` from the root entrypoint;
+// these builders are only useful for advanced tooling that wants the raw
+// shell command without executing it.
+export {
+  OSSFS1_PASSWD_PATH_PREFIX,
+  buildNfsCommand,
+  buildOssfs1PasswdEntry,
+  buildOssfs1Plan,
+  buildOssfs2Entries,
+  buildOssfs2Plan,
+  buildUmountCommand,
+  ensureSuccess,
+  selectOssfsVersion,
+  shQuote,
+  validateNfs,
+  validateOssfs,
+} from "./mount/shell.js";
+export type { Ossfs1Plan, Ossfs2Plan } from "./mount/shell.js";
+
 export { SandboxesAdapter } from "./adapters/sandboxesAdapter.js";
 export { EgressAdapter } from "./adapters/egressAdapter.js";
 export type { EgressRawHttpOptions } from "./adapters/egressAdapter.js";

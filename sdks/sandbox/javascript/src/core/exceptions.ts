@@ -18,6 +18,7 @@ export type SandboxErrorCode =
   | "UNHEALTHY"
   | "INVALID_ARGUMENT"
   | "UNEXPECTED_RESPONSE"
+  | "MOUNT_FAILED"
   // Allow server-defined codes as well.
   | (string & {});
 
@@ -33,6 +34,7 @@ export class SandboxError {
   static readonly UNHEALTHY: SandboxErrorCode = "UNHEALTHY";
   static readonly INVALID_ARGUMENT: SandboxErrorCode = "INVALID_ARGUMENT";
   static readonly UNEXPECTED_RESPONSE: SandboxErrorCode = "UNEXPECTED_RESPONSE";
+  static readonly MOUNT_FAILED: SandboxErrorCode = "MOUNT_FAILED";
 
   constructor(
     readonly code: SandboxErrorCode,
@@ -131,5 +133,26 @@ export class InvalidArgumentException extends SandboxException {
       cause: opts.cause,
       error: new SandboxError(SandboxError.INVALID_ARGUMENT, opts.message),
     });
+  }
+}
+
+/**
+ * Thrown when a NAS or OSS mount syntax-sugar call fails inside the sandbox.
+ *
+ * The `execution` field exposes the {@link import("../models/execution.js").Execution}
+ * handle returned by the underlying `commands.run` call so callers can inspect
+ * the exit code, stdout and stderr for diagnostics.
+ */
+export class MountFailedException extends SandboxException {
+  readonly name: string = "MountFailedException";
+  readonly execution?: unknown;
+
+  constructor(opts: { message?: string; cause?: unknown; execution?: unknown }) {
+    super({
+      message: opts.message,
+      cause: opts.cause,
+      error: new SandboxError(SandboxError.MOUNT_FAILED, opts.message),
+    });
+    this.execution = opts.execution;
   }
 }

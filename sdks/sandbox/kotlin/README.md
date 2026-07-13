@@ -287,6 +287,44 @@ Pool lifecycle semantics:
 > In distributed mode, `resize(maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile. Use `resize(0)` and wait for `snapshot().idleCount == 0` when you need to drain the distributed idle buffer; `releaseAllIdle()` is only a best-effort cleanup pass.
 > `SandboxPoolManager.destroy(poolName)` is a stronger administrative operation: it writes a `DESTROYING` fence, drains visible idle IDs, best-effort kills idle sandboxes, clears persistent pool state, and then writes a `DESTROYED` tombstone for the configured TTL to prevent old nodes from recreating the same pool namespace. If drain or persistent-state cleanup cannot complete, `destroy()` throws `PoolDestroyIncompleteException` and leaves the namespace fenced as `DESTROYING`; retry `destroy()` to finish cleanup.
 
+### NAS / OSS Mounts
+
+`Sandbox.mount(...)` runs `mount -t nfs`, `ossfs` or `ossfs2` inside a running sandbox via `commands()`, so the sandbox image must have the corresponding binary installed (or use `installation` to install it on demand). The password / configuration files are created with mode 600 in one step and are cleaned up even when the mount command itself fails.
+
+```kotlin
+import com.alibaba.opensandbox.sandbox.domain.models.mount.NfsMountOptions
+import com.alibaba.opensandbox.sandbox.domain.models.mount.OssfsMountOptions
+import com.alibaba.opensandbox.sandbox.mount.mount
+import com.alibaba.opensandbox.sandbox.mount.umount
+
+// Mount a NAS export
+sandbox.mount(
+    NfsMountOptions.builder()
+        .endpoint("nas-server.example.com")
+        .nasPath("/share")
+        .mountPoint("/mnt/nas")
+        .installation("apt-get install -y nfs-common") // optional
+        .build()
+)
+
+// Mount an OSS bucket via ossfs 2.x
+sandbox.mount(
+    OssfsMountOptions.builder()
+        .endpoint("https://oss-cn-hangzhou.aliyuncs.com")
+        .bucket("my-bucket")
+        .bucketDirectory("subdir")          // optional; maps to --oss_bucket_prefix
+        .mountPoint("/mnt/oss")
+        .accessKeyId(System.getenv("OSS_AK"))
+        .accessKeySecret(System.getenv("OSS_SK"))
+        .version(OssfsMountOptions.Version.OSSFS_2_0)
+        .build()
+)
+
+sandbox.umount("/mnt/nas")
+```
+
+Failures raise `MountFailedException`, which exposes the failing `Execution` so callers can inspect exit code and stderr.
+
 ## Configuration
 
 ### 1. Connection Configuration
