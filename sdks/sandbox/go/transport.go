@@ -51,11 +51,22 @@ type TransportConfig struct {
 
 // DefaultTransportConfig returns connection pool settings tuned for SDK
 // workloads: moderate concurrency across multiple sandbox endpoints.
+//
+// IdleConnTimeout is intentionally lower than Go's stdlib default of 90s.
+// Many enterprise load balancers silently drop idle TCP connections after
+// 60s without sending FIN/RST. If the SDK holds a connection idle past
+// that point, the next request reuses a black-holed connection: the
+// request writes succeed locally but no response headers ever arrive,
+// causing the client to hang until http.Client.Timeout fires with
+// "Client.Timeout exceeded while awaiting headers". Evicting idle
+// connections well before the typical LB idle timeout avoids this class
+// of intermittent failure. Callers that know their infrastructure keeps
+// connections alive longer can override via TransportConfig.
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
 		MaxIdleConns:                  100,
 		MaxIdleConnsPerHost:           10,
-		IdleConnTimeout:               90 * time.Second,
+		IdleConnTimeout:               25 * time.Second,
 		TLSHandshakeTimeout:           10 * time.Second,
 		DialTimeout:                   30 * time.Second,
 		KeepAlive:                     30 * time.Second,

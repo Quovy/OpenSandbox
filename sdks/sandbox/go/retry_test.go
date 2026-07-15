@@ -351,8 +351,11 @@ func TestDefaultTransport(t *testing.T) {
 	if tr.MaxIdleConnsPerHost != 10 {
 		assert.Fail(t, fmt.Sprintf("MaxIdleConnsPerHost = %d, want 10", tr.MaxIdleConnsPerHost))
 	}
-	if tr.IdleConnTimeout != 90*time.Second {
-		assert.Fail(t, fmt.Sprintf("IdleConnTimeout = %v, want 90s", tr.IdleConnTimeout))
+	// IdleConnTimeout is intentionally set below the typical enterprise LB
+	// idle timeout (~60s) to evict potentially black-holed connections
+	// before they are reused. See DefaultTransportConfig for rationale.
+	if tr.IdleConnTimeout != 25*time.Second {
+		assert.Fail(t, fmt.Sprintf("IdleConnTimeout = %v, want 25s", tr.IdleConnTimeout))
 	}
 	if tr.TLSHandshakeTimeout != 10*time.Second {
 		assert.Fail(t, fmt.Sprintf("TLSHandshakeTimeout = %v, want 10s", tr.TLSHandshakeTimeout))

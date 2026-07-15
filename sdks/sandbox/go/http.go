@@ -18,9 +18,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -35,9 +38,14 @@ type Client struct {
 	apiKey     string
 	authHeader string
 	httpClient *http.Client
-	timeout    *time.Duration // stored separately, applied after all options
-	headers    map[string]string
-	retry      *RetryConfig
+	// streamClient shares the same Transport as httpClient but always has
+	// Timeout=0. It is used by doStreamRequest so that a caller-configured
+	// per-request timeout on httpClient does not kill long-lived SSE
+	// connections. See the comment on defaultTimeout above.
+	streamClient *http.Client
+	timeout      *time.Duration // stored separately, applied after all options
+	headers      map[string]string
+	retry        *RetryConfig
 }
 
 // Option configures a Client.
@@ -114,6 +122,15 @@ func NewClient(baseURL, apiKey, authHeader string, opts ...Option) *Client {
 	if c.timeout != nil {
 		c.httpClient.Timeout = *c.timeout
 	}
+	// Build a stream client that shares the same Transport (and therefore
+	// the same connection pool) as httpClient but never sets an overall
+	// http.Client.Timeout. A non-zero Timeout on an SSE request kills the
+	// connection at the deadline mid-stream, regardless of activity;
+	// long-running commands and metric watches must control their total
+	// duration via the caller's context instead.
+	streamClient := *c.httpClient
+	streamClient.Timeout = 0
+	c.streamClient = &streamClient
 	return c
 }
 
@@ -127,15 +144,47 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	})
 }
 
-// doRequestOnce is the single-attempt implementation of doRequest.
+// doRequestOnce is the single-attempt implementation of doRequest from the
+// perspective of the higher-level retry policy (withRetry). Internally, it
+// may transparently retry once against a fresh TCP connection when a stale
+// pooled connection appears to have been silently dropped by an intermediate
+// load balancer; see shouldRetryStaleConnection for the trigger conditions.
 func (c *Client) doRequestOnce(ctx context.Context, method, path string, body any, result any) error {
-	var bodyReader io.Reader
+	var encodedBody []byte
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("opensandbox: marshal request: %w", err)
 		}
-		bodyReader = bytes.NewReader(buf)
+		encodedBody = buf
+	}
+
+	err := c.sendJSONRequest(ctx, method, path, encodedBody, result)
+	if err == nil {
+		return nil
+	}
+	if !shouldRetryStaleConnection(method, err) {
+		return err
+	}
+	// The failure looks like a reused-but-silently-dropped keep-alive
+	// connection: request written locally but no response headers arrived
+	// before http.Client.Timeout fired. Evict idle connections in the pool
+	// and retry exactly once on a freshly dialed connection. Only safe for
+	// idempotent methods; see shouldRetryStaleConnection.
+	if tr, ok := c.httpClient.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	return c.sendJSONRequest(ctx, method, path, encodedBody, result)
+}
+
+// sendJSONRequest builds and executes a single HTTP request. encodedBody is
+// the pre-marshaled JSON payload (or nil for GET/DELETE-style requests). The
+// caller is responsible for retry policy; this function performs exactly one
+// round-trip.
+func (c *Client) sendJSONRequest(ctx context.Context, method, path string, encodedBody []byte, result any) error {
+	var bodyReader io.Reader
+	if encodedBody != nil {
+		bodyReader = bytes.NewReader(encodedBody)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
@@ -150,7 +199,7 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 	if c.apiKey != "" {
 		req.Header.Set(c.authHeader, c.apiKey)
 	}
-	if body != nil {
+	if encodedBody != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
@@ -176,6 +225,60 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 	}
 	io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// shouldRetryStaleConnection reports whether err looks like a stale pooled
+// connection failure that should be retried on a fresh connection. This
+// targets the common case where an idle keep-alive connection has been
+// silently dropped by an intermediate load balancer: the write succeeds
+// locally but the response headers never arrive.
+//
+// The check is deliberately conservative:
+//
+//   - Only idempotent methods are eligible (GET, HEAD, OPTIONS). Retrying a
+//     POST that may have already been applied server-side is unsafe.
+//   - The caller's context must not be the source of the failure. If the
+//     caller cancelled or its deadline elapsed, retrying would be
+//     pointless and misleading.
+//   - The error must not be an APIError (i.e. we did receive response
+//     headers). Response-body-side failures are out of scope; a retry
+//     there could mask real server errors.
+//   - The error must be either the Go net/http "awaiting headers" timeout
+//     signature or a net.Error reporting Timeout()==true. Both indicate we
+//     never got past the response-header phase.
+func shouldRetryStaleConnection(method string, err error) bool {
+	if err == nil {
+		return false
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	default:
+		return false
+	}
+	// APIError means we received response headers; not a stale-connection case.
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return false
+	}
+	// The Go net/http package appends this exact suffix when
+	// http.Client.Timeout fires while waiting for response headers. This is
+	// the definitive signature of a black-holed reused connection. Check
+	// this BEFORE the generic context.DeadlineExceeded check below, since
+	// the wrapped error also satisfies errors.Is(context.DeadlineExceeded)
+	// but is emphatically not caller-driven.
+	if strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
+		return true
+	}
+	// Caller-driven cancellation/deadline: don't paper over it with a retry.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Fall back to a generic timeout classification for other transports.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // doStreamRequest builds an HTTP request, executes it, and streams SSE events
@@ -212,7 +315,7 @@ func (c *Client) doStreamRequest(ctx context.Context, method, path string, body 
 		}
 		req.Header.Set("Accept", "text/event-stream")
 
-		r, err := c.httpClient.Do(req)
+		r, err := c.streamClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("opensandbox: do request: %w", err)
 		}
