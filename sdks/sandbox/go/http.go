@@ -23,7 +23,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -159,32 +161,58 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body an
 		encodedBody = buf
 	}
 
-	err := c.sendJSONRequest(ctx, method, path, encodedBody, result)
+	var reusedIdle atomic.Bool
+	err := c.sendJSONRequest(ctx, method, path, encodedBody, result, &reusedIdle)
 	if err == nil {
 		return nil
 	}
-	if !shouldRetryStaleConnection(method, err) {
+	if !shouldRetryStaleConnection(method, err, reusedIdle.Load()) {
 		return err
 	}
-	// The failure looks like a reused-but-silently-dropped keep-alive
-	// connection: request written locally but no response headers arrived
-	// before http.Client.Timeout fired. Evict idle connections in the pool
-	// and retry exactly once on a freshly dialed connection. Only safe for
-	// idempotent methods; see shouldRetryStaleConnection.
+	// The failure signature matches a reused-but-silently-dropped keep-alive
+	// connection: we observed the http client picking up an idle pooled
+	// connection, wrote the request locally, and then no response headers
+	// arrived before the header-phase timeout fired. Evict idle connections
+	// in the pool and retry exactly once on a freshly dialed connection.
+	// Only safe for idempotent methods; see shouldRetryStaleConnection.
+	//
+	// The retry uses the same caller ctx and http.Client.Timeout as the
+	// first attempt. That matches the "one bounded retry within the
+	// caller's budget" semantics: the total wait a caller can observe is
+	// bounded by roughly two http.Client.Timeout windows, but the retry
+	// only fires when we can prove (via httptrace) that the first attempt
+	// reused an idle pooled connection — which never happens on a genuinely
+	// slow-but-alive server that just accepted a fresh connection.
 	if tr, ok := c.httpClient.Transport.(*http.Transport); ok {
 		tr.CloseIdleConnections()
 	}
-	return c.sendJSONRequest(ctx, method, path, encodedBody, result)
+	return c.sendJSONRequest(ctx, method, path, encodedBody, result, nil)
 }
 
 // sendJSONRequest builds and executes a single HTTP request. encodedBody is
 // the pre-marshaled JSON payload (or nil for GET/DELETE-style requests). The
 // caller is responsible for retry policy; this function performs exactly one
 // round-trip.
-func (c *Client) sendJSONRequest(ctx context.Context, method, path string, encodedBody []byte, result any) error {
+//
+// If reusedIdle is non-nil, it is set to true when the underlying http
+// transport handed the request an already-idle pooled connection. This is
+// the signal used to distinguish "server is genuinely slow" (fresh dial,
+// reusedIdle=false) from "we reused a black-holed pooled connection"
+// (reusedIdle=true); see doRequestOnce for how it is used.
+func (c *Client) sendJSONRequest(ctx context.Context, method, path string, encodedBody []byte, result any, reusedIdle *atomic.Bool) error {
 	var bodyReader io.Reader
 	if encodedBody != nil {
 		bodyReader = bytes.NewReader(encodedBody)
+	}
+
+	if reusedIdle != nil {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if info.Reused && info.WasIdle {
+					reusedIdle.Store(true)
+				}
+			},
+		})
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
@@ -233,21 +261,37 @@ func (c *Client) sendJSONRequest(ctx context.Context, method, path string, encod
 // silently dropped by an intermediate load balancer: the write succeeds
 // locally but the response headers never arrive.
 //
-// The check is deliberately conservative:
+// The check is deliberately conservative and requires ALL of:
 //
-//   - Only idempotent methods are eligible (GET, HEAD, OPTIONS). Retrying a
-//     POST that may have already been applied server-side is unsafe.
-//   - The caller's context must not be the source of the failure. If the
-//     caller cancelled or its deadline elapsed, retrying would be
-//     pointless and misleading.
-//   - The error must not be an APIError (i.e. we did receive response
-//     headers). Response-body-side failures are out of scope; a retry
-//     there could mask real server errors.
-//   - The error must be either the Go net/http "awaiting headers" timeout
-//     signature or a net.Error reporting Timeout()==true. Both indicate we
-//     never got past the response-header phase.
-func shouldRetryStaleConnection(method string, err error) bool {
+//   - reusedIdlePooledConn is true. The httptrace GotConn hook observed the
+//     transport handing this request an already-idle pooled connection. If
+//     the transport instead dialed a fresh connection and that fresh
+//     connection is slow, this is not a stale-reuse case — the server or
+//     network is genuinely slow, and retrying would just double the caller's
+//     timeout budget for no benefit. This gates out the "slow server"
+//     scenario raised in PR review.
+//   - Method is idempotent (GET/HEAD/OPTIONS). Retrying a POST that may
+//     have already been applied server-side is unsafe.
+//   - The error is not an APIError (that would mean we received response
+//     headers; response-body-side failures are out of scope).
+//   - The error signature matches the header-phase timeout: either the Go
+//     net/http "Client.Timeout exceeded while awaiting headers" suffix, or
+//     an http.Transport.ResponseHeaderTimeout firing, or a net.Error whose
+//     Timeout() is true. All indicate we never got past the response-header
+//     phase.
+//   - The error is not a plain caller-driven context.Canceled /
+//     context.DeadlineExceeded. Checked after the more specific timeout
+//     signatures, because http.Client.Timeout wraps DeadlineExceeded and
+//     would otherwise be misclassified as caller-driven.
+func shouldRetryStaleConnection(method string, err error, reusedIdlePooledConn bool) bool {
 	if err == nil {
+		return false
+	}
+	// Without an observed idle-pool reuse, this cannot be a stale-connection
+	// case: a freshly dialed connection that times out simply means the
+	// remote is slow or unreachable, and retrying wastes the caller's
+	// timeout budget. See the doc comment above.
+	if !reusedIdlePooledConn {
 		return false
 	}
 	switch method {
@@ -261,15 +305,20 @@ func shouldRetryStaleConnection(method string, err error) bool {
 		return false
 	}
 	// The Go net/http package appends this exact suffix when
-	// http.Client.Timeout fires while waiting for response headers. This is
-	// the definitive signature of a black-holed reused connection. Check
-	// this BEFORE the generic context.DeadlineExceeded check below, since
-	// the wrapped error also satisfies errors.Is(context.DeadlineExceeded)
-	// but is emphatically not caller-driven.
+	// http.Client.Timeout fires while waiting for response headers.
 	if strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
 		return true
 	}
+	// http.Transport.ResponseHeaderTimeout fires this specific error text
+	// when the transport gives up waiting for response headers on a
+	// specific connection. This is the SDK's primary header-phase guard
+	// for streaming requests but also protects non-streaming requests.
+	if strings.Contains(err.Error(), "timeout awaiting response headers") {
+		return true
+	}
 	// Caller-driven cancellation/deadline: don't paper over it with a retry.
+	// Checked AFTER the specific timeout signatures above, since
+	// http.Client.Timeout wraps context.DeadlineExceeded.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}

@@ -357,6 +357,15 @@ func TestDefaultTransport(t *testing.T) {
 	if tr.IdleConnTimeout != 25*time.Second {
 		assert.Fail(t, fmt.Sprintf("IdleConnTimeout = %v, want 25s", tr.IdleConnTimeout))
 	}
+	// ResponseHeaderTimeout bounds the pre-response-header wait for BOTH
+	// non-streaming and streaming requests. Streaming requests set
+	// http.Client.Timeout=0 to allow long-lived bodies, so this transport-
+	// level guard is what prevents SSE endpoints from hanging indefinitely
+	// when a server or LB accepts the TCP connection but never emits
+	// response headers.
+	if tr.ResponseHeaderTimeout != 30*time.Second {
+		assert.Fail(t, fmt.Sprintf("ResponseHeaderTimeout = %v, want 30s", tr.ResponseHeaderTimeout))
+	}
 	if tr.TLSHandshakeTimeout != 10*time.Second {
 		assert.Fail(t, fmt.Sprintf("TLSHandshakeTimeout = %v, want 10s", tr.TLSHandshakeTimeout))
 	}

@@ -101,6 +101,49 @@ func TestStreamClient_TimeoutOverrideStillYieldsZeroOnStreamClient(t *testing.T)
 	}
 }
 
+// TestStreamRequest_ResponseHeaderTimeoutBoundsPreStreamHang verifies the
+// PR-review fix for "keep a setup timeout for SSE handshakes": even though
+// the stream client has Timeout=0 to allow arbitrarily long response bodies,
+// the underlying Transport's ResponseHeaderTimeout must bound the wait for
+// the initial SSE response headers. Without this, a streaming endpoint or
+// load balancer that accepts the connection but never sends headers would
+// make RunCommand / ExecuteCode / WatchMetrics hang indefinitely.
+func TestStreamRequest_ResponseHeaderTimeoutBoundsPreStreamHang(t *testing.T) {
+	blackHole := newHijackBlackHoleHandler()
+	defer blackHole.release()
+
+	srv := httptest.NewServer(http.HandlerFunc(blackHole.ServeHTTP))
+	defer srv.Close()
+
+	// Custom transport with a tight ResponseHeaderTimeout so the test
+	// completes fast. All other defaults preserved.
+	tc := DefaultTransportConfig()
+	tc.ResponseHeaderTimeout = 300 * time.Millisecond
+	client := NewClient(srv.URL, "", "OPEN-SANDBOX-API-KEY",
+		WithHTTPClient(&http.Client{Transport: tc.NewTransport()}),
+	)
+
+	handler := func(event StreamEvent) error { return nil }
+	// Use a caller context deadline far larger than the transport timeout.
+	// If the transport-level guard is missing, this test hangs until the
+	// caller ctx fires; if the guard works, we get a header-phase timeout
+	// error well before the ctx deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := client.doStreamRequest(ctx, http.MethodGet, "/", nil, handler)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	if !strings.Contains(err.Error(), "timeout awaiting response headers") {
+		assert.Fail(t, fmt.Sprintf("expected response-header timeout, got: %v", err))
+	}
+	if elapsed > 3*time.Second {
+		assert.Fail(t, fmt.Sprintf("expected header-phase guard to fire quickly (<3s), took %v", elapsed))
+	}
+}
+
 // hijackBlackHoleHandler simulates an intermediate load balancer that has
 // silently dropped a keep-alive connection: it hijacks the TCP connection,
 // discards the request, and never writes any response. The connection is
@@ -136,16 +179,18 @@ func (h *hijackBlackHoleHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 func (h *hijackBlackHoleHandler) release() { close(h.closed) }
 
-// TestStaleConnectionRetry_GETRetriesOnFreshConnection verifies that a GET
-// that hangs waiting for response headers (because a pooled connection was
-// silently dropped by an LB) is transparently retried once on a fresh TCP
-// connection. This is the core mitigation for the intermittent
+// TestStaleConnectionRetry_GETRetriesOnReusedPooledConn verifies that a GET
+// that hangs waiting for response headers on a REUSED pooled connection
+// (because an LB silently dropped it) is transparently retried once on a
+// fresh TCP connection. This is the core mitigation for the intermittent
 // "Client.Timeout exceeded while awaiting headers" failures observed
 // against enterprise load balancers.
-func TestStaleConnectionRetry_GETRetriesOnFreshConnection(t *testing.T) {
-	// Mux: first request black-holes (hijack, never respond); subsequent
-	// requests reply 200 with a JSON body. We use a request counter to
-	// switch behavior.
+//
+// The test primes the connection pool with a successful request first, so
+// the second (black-holed) request actually reuses an idle pooled
+// connection. This matches production reality and exercises the
+// httptrace-driven "reused idle" gate.
+func TestStaleConnectionRetry_GETRetriesOnReusedPooledConn(t *testing.T) {
 	var reqCount atomic.Int32
 	blackHole := newHijackBlackHoleHandler()
 	defer blackHole.release()
@@ -153,7 +198,10 @@ func TestStaleConnectionRetry_GETRetriesOnFreshConnection(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
 		n := reqCount.Add(1)
-		if n == 1 {
+		// First call: prime the pool with a successful response.
+		// Second call: black-hole (simulates LB-dropped keep-alive conn).
+		// Third call (retry): reply normally.
+		if n == 2 {
 			blackHole.ServeHTTP(w, r)
 			return
 		}
@@ -164,10 +212,16 @@ func TestStaleConnectionRetry_GETRetriesOnFreshConnection(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	// Tight http.Client.Timeout so the black-holed first request surfaces
-	// the stall quickly.
 	client := NewClient(srv.URL, "", "OPEN-SANDBOX-API-KEY", WithTimeout(300*time.Millisecond))
 
+	// Prime the pool: this request completes and returns the conn to the
+	// idle pool so the next request can reuse it.
+	var priming map[string]bool
+	require.NoError(t, client.doRequest(context.Background(), http.MethodGet, "/probe", nil, &priming))
+
+	// Now the real test: request #2 will reuse the idle pooled conn and
+	// hit the black-hole; the SDK must retry on a fresh connection and
+	// succeed on request #3.
 	var result map[string]bool
 	start := time.Now()
 	err := client.doRequest(context.Background(), http.MethodGet, "/probe", nil, &result)
@@ -175,21 +229,20 @@ func TestStaleConnectionRetry_GETRetriesOnFreshConnection(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, true, result["ok"])
-	if reqCount.Load() < 2 {
-		assert.Fail(t, fmt.Sprintf("expected at least 2 server hits (first black-holed, retry succeeds), got %d", reqCount.Load()))
+	if reqCount.Load() != 3 {
+		assert.Fail(t, fmt.Sprintf("expected 3 total server hits (prime, black-hole, retry), got %d", reqCount.Load()))
 	}
-	// Sanity: total time should be roughly one timeout window plus the
-	// retry. Give generous headroom for CI slowness.
 	if elapsed > 5*time.Second {
 		assert.Fail(t, fmt.Sprintf("retry took too long: %v", elapsed))
 	}
 }
 
-// TestStaleConnectionRetry_POSTNotRetried verifies that non-idempotent
-// methods are NEVER retried by the stale-connection fallback, even when the
-// error signature matches, because retrying a POST that may have been
-// applied server-side is unsafe.
-func TestStaleConnectionRetry_POSTNotRetried(t *testing.T) {
+// TestStaleConnectionRetry_FreshConnDoesNotRetry verifies the critical
+// guard from PR review: a slow server that never returns response headers
+// on a FRESHLY DIALED connection must NOT be retried. Retrying would
+// double the caller's timeout budget for no benefit and would issue the
+// same GET twice against a server that is simply overloaded.
+func TestStaleConnectionRetry_FreshConnDoesNotRetry(t *testing.T) {
 	var reqCount atomic.Int32
 	blackHole := newHijackBlackHoleHandler()
 	defer blackHole.release()
@@ -202,13 +255,63 @@ func TestStaleConnectionRetry_POSTNotRetried(t *testing.T) {
 
 	client := NewClient(srv.URL, "", "OPEN-SANDBOX-API-KEY", WithTimeout(300*time.Millisecond))
 
-	err := client.doRequest(context.Background(), http.MethodPost, "/anything", map[string]string{"a": "b"}, nil)
+	// A brand-new client with an empty pool: the request must dial fresh.
+	// Server never returns headers -> Client.Timeout fires. Because this
+	// is NOT a reused-idle-conn scenario, the SDK must respect the
+	// caller's timeout budget and not retry.
+	start := time.Now()
+	err := client.doRequest(context.Background(), http.MethodGet, "/anything", nil, nil)
+	elapsed := time.Since(start)
+
 	require.Error(t, err)
 	if !strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
 		assert.Fail(t, fmt.Sprintf("expected client-timeout error, got: %v", err))
 	}
 	if reqCount.Load() != 1 {
-		assert.Fail(t, fmt.Sprintf("POST must not be retried on stale-connection failure; got %d hits", reqCount.Load()))
+		assert.Fail(t, fmt.Sprintf("fresh-dial slow-server must not be retried; got %d hits", reqCount.Load()))
+	}
+	// The elapsed time should be roughly one timeout window, not two.
+	if elapsed > 2*time.Second {
+		assert.Fail(t, fmt.Sprintf("elapsed=%v suggests the SDK retried and burned two timeout budgets", elapsed))
+	}
+}
+
+// TestStaleConnectionRetry_POSTNotRetried verifies that non-idempotent
+// methods are NEVER retried by the stale-connection fallback, even when the
+// error signature matches, because retrying a POST that may have been
+// applied server-side is unsafe.
+func TestStaleConnectionRetry_POSTNotRetried(t *testing.T) {
+	var reqCount atomic.Int32
+	blackHole := newHijackBlackHoleHandler()
+	defer blackHole.release()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/anything", func(w http.ResponseWriter, r *http.Request) {
+		reqCount.Add(1)
+		blackHole.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "", "OPEN-SANDBOX-API-KEY", WithTimeout(300*time.Millisecond))
+
+	// Prime the pool with a successful GET so the follow-up POST reuses
+	// an idle pooled connection. This confirms POST is refused even when
+	// the reused-idle guard would otherwise allow a retry.
+	require.NoError(t, client.doRequest(context.Background(), http.MethodGet, "/ok", nil, nil))
+	priming := reqCount.Load()
+
+	err := client.doRequest(context.Background(), http.MethodPost, "/anything", map[string]string{"a": "b"}, nil)
+	require.Error(t, err)
+	if !strings.Contains(err.Error(), "Client.Timeout exceeded while awaiting headers") {
+		assert.Fail(t, fmt.Sprintf("expected client-timeout error, got: %v", err))
+	}
+	if got := reqCount.Load() - priming; got != 1 {
+		assert.Fail(t, fmt.Sprintf("POST must not be retried on stale-connection failure; got %d POST hits", got))
 	}
 }
 
@@ -217,32 +320,47 @@ func TestStaleConnectionRetry_POSTNotRetried(t *testing.T) {
 // error mapping do not accidentally broaden or narrow the policy.
 func TestShouldRetryStaleConnection_TableDriven(t *testing.T) {
 	awaitHeadersErr := errors.New(`Get "http://x": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`)
+	respHeaderTimeoutErr := errors.New(`Get "http://x": net/http: timeout awaiting response headers`)
 	plainCtxDeadline := context.DeadlineExceeded
 	plainCtxCanceled := context.Canceled
 	apiErr := &APIError{StatusCode: 502}
 	randomErr := errors.New("boom")
 
 	cases := []struct {
-		name   string
-		method string
-		err    error
-		want   bool
+		name       string
+		method     string
+		err        error
+		reusedIdle bool
+		want       bool
 	}{
-		{"GET awaiting-headers timeout retries", http.MethodGet, awaitHeadersErr, true},
-		{"HEAD awaiting-headers timeout retries", http.MethodHead, awaitHeadersErr, true},
-		{"OPTIONS awaiting-headers timeout retries", http.MethodOptions, awaitHeadersErr, true},
-		{"POST awaiting-headers timeout does not retry", http.MethodPost, awaitHeadersErr, false},
-		{"PUT awaiting-headers timeout does not retry", http.MethodPut, awaitHeadersErr, false},
-		{"PATCH awaiting-headers timeout does not retry", http.MethodPatch, awaitHeadersErr, false},
-		{"DELETE awaiting-headers timeout does not retry", http.MethodDelete, awaitHeadersErr, false},
-		{"caller ctx deadline does not retry", http.MethodGet, plainCtxDeadline, false},
-		{"caller ctx canceled does not retry", http.MethodGet, plainCtxCanceled, false},
-		{"APIError does not retry (headers already received)", http.MethodGet, apiErr, false},
-		{"generic non-timeout error does not retry", http.MethodGet, randomErr, false},
-		{"nil error does not retry", http.MethodGet, nil, false},
+		// Positive: idempotent method + observed idle-conn reuse + header-phase timeout.
+		{"GET awaiting-headers on reused idle conn retries", http.MethodGet, awaitHeadersErr, true, true},
+		{"HEAD awaiting-headers on reused idle conn retries", http.MethodHead, awaitHeadersErr, true, true},
+		{"OPTIONS awaiting-headers on reused idle conn retries", http.MethodOptions, awaitHeadersErr, true, true},
+		{"GET response-header timeout on reused idle conn retries", http.MethodGet, respHeaderTimeoutErr, true, true},
+
+		// The critical guard: fresh-conn slow server MUST NOT be retried.
+		// This protects the caller's timeout budget for the "genuinely slow
+		// server" scenario raised in PR review.
+		{"GET awaiting-headers on FRESH conn does not retry", http.MethodGet, awaitHeadersErr, false, false},
+		{"HEAD awaiting-headers on FRESH conn does not retry", http.MethodHead, awaitHeadersErr, false, false},
+		{"GET response-header timeout on FRESH conn does not retry", http.MethodGet, respHeaderTimeoutErr, false, false},
+
+		// Non-idempotent methods are never retried even on reused idle conn.
+		{"POST awaiting-headers on reused idle conn does not retry", http.MethodPost, awaitHeadersErr, true, false},
+		{"PUT awaiting-headers on reused idle conn does not retry", http.MethodPut, awaitHeadersErr, true, false},
+		{"PATCH awaiting-headers on reused idle conn does not retry", http.MethodPatch, awaitHeadersErr, true, false},
+		{"DELETE awaiting-headers on reused idle conn does not retry", http.MethodDelete, awaitHeadersErr, true, false},
+
+		// Caller-driven and non-timeout errors are never retried.
+		{"caller ctx deadline does not retry", http.MethodGet, plainCtxDeadline, true, false},
+		{"caller ctx canceled does not retry", http.MethodGet, plainCtxCanceled, true, false},
+		{"APIError does not retry (headers already received)", http.MethodGet, apiErr, true, false},
+		{"generic non-timeout error does not retry", http.MethodGet, randomErr, true, false},
+		{"nil error does not retry", http.MethodGet, nil, true, false},
 	}
 	for _, tc := range cases {
-		if got := shouldRetryStaleConnection(tc.method, tc.err); got != tc.want {
+		if got := shouldRetryStaleConnection(tc.method, tc.err, tc.reusedIdle); got != tc.want {
 			assert.Fail(t, fmt.Sprintf("%s: shouldRetryStaleConnection = %v, want %v", tc.name, got, tc.want))
 		}
 	}

@@ -38,6 +38,13 @@ type TransportConfig struct {
 	// TLSHandshakeTimeout limits the TLS handshake duration.
 	TLSHandshakeTimeout time.Duration
 
+	// ResponseHeaderTimeout caps the time spent waiting for a server's
+	// response headers after fully writing the request. Unlike
+	// http.Client.Timeout, it does NOT cover reading the response body,
+	// so it is safe to apply to long-lived SSE streams while still
+	// bounding the pre-stream handshake. Zero disables the bound.
+	ResponseHeaderTimeout time.Duration
+
 	// DialTimeout limits TCP connection establishment.
 	DialTimeout time.Duration
 
@@ -64,10 +71,16 @@ type TransportConfig struct {
 // connections alive longer can override via TransportConfig.
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
-		MaxIdleConns:                  100,
-		MaxIdleConnsPerHost:           10,
-		IdleConnTimeout:               25 * time.Second,
-		TLSHandshakeTimeout:           10 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     25 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Bounds the response-header phase for every request, including
+		// SSE streams that intentionally leave http.Client.Timeout at 0.
+		// Without this, a server or LB that accepts the TCP connection
+		// but never emits response headers would make streaming calls
+		// (ExecuteCode / RunCommand / WatchMetrics) hang indefinitely.
+		ResponseHeaderTimeout:         30 * time.Second,
 		DialTimeout:                   30 * time.Second,
 		KeepAlive:                     30 * time.Second,
 		AllowWeakServerCertKeyLengths: false,
@@ -87,11 +100,12 @@ func (tc TransportConfig) NewTransport() *http.Transport {
 			Timeout:   tc.DialTimeout,
 			KeepAlive: tc.KeepAlive,
 		}).DialContext,
-		MaxIdleConns:        tc.MaxIdleConns,
-		MaxIdleConnsPerHost: tc.MaxIdleConnsPerHost,
-		IdleConnTimeout:     tc.IdleConnTimeout,
-		TLSHandshakeTimeout: tc.TLSHandshakeTimeout,
-		TLSClientConfig:     tlsClientConfig,
+		MaxIdleConns:          tc.MaxIdleConns,
+		MaxIdleConnsPerHost:   tc.MaxIdleConnsPerHost,
+		IdleConnTimeout:       tc.IdleConnTimeout,
+		TLSHandshakeTimeout:   tc.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: tc.ResponseHeaderTimeout,
+		TLSClientConfig:       tlsClientConfig,
 	}
 }
 
