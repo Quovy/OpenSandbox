@@ -226,6 +226,7 @@ var execdConfigEnvBlacklist = []string{
 	"JUPYTER_HOST",
 	"JUPYTER_TOKEN",
 	"EXECD_ISOLATION_CONFIG",
+	"EXECD_ENVS",
 }
 
 func unsetExecdConfigEnv() []string {
