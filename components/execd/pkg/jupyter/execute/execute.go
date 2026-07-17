@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alibaba/opensandbox/internal/safego"
@@ -57,6 +58,10 @@ type Client struct {
 
 	// WebSocket URL for kernel connection
 	wsURL string
+
+	// activeStream is the in-flight streaming execution, if any. Used by
+	// receiveMessages/Disconnect to fail it when the WebSocket goes away.
+	activeStream *streamExecutionState
 }
 
 // NewClient creates a new code execution client
@@ -99,11 +104,26 @@ func (c *Client) Connect(wsURL string) error {
 // Disconnect disconnects the WebSocket connection to the kernel
 func (c *Client) Disconnect() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
+	}
+	active := c.activeStream
+	c.mu.Unlock()
+
+	// Fail any in-flight execution not yet in finalization; otherwise
+	// finalizeExecution's grace period will wind it down on its own.
+	if active != nil {
+		active.executeMutex.Lock()
+		alreadyFinalizing := active.executeDone
+		active.executeMutex.Unlock()
+		if !alreadyFinalizing {
+			c.clearActiveStream(active)
+			active.terminate(&ErrorOutput{
+				EName:  "KernelDisconnected",
+				EValue: "kernel WebSocket was disconnected before execution completed",
+			})
+		}
 	}
 }
 
@@ -120,9 +140,16 @@ type streamExecutionState struct {
 	executeDone  bool
 	executeMutex sync.Mutex
 	resultMutex  sync.Mutex
+
+	// resultChan is the terminal result channel; closed exactly once.
+	resultChan chan *ExecutionResult
+	// closed lets concurrent senders skip after terminate() has closed the chan.
+	closed atomic.Bool
+	// closeOnce guards the single close + terminal-error injection.
+	closeOnce sync.Once
 }
 
-func newStreamExecutionState(startTime time.Time) *streamExecutionState {
+func newStreamExecutionState(startTime time.Time, resultChan chan *ExecutionResult) *streamExecutionState {
 	return &streamExecutionState{
 		startTime: startTime,
 		result: &ExecutionResult{
@@ -130,7 +157,40 @@ func newStreamExecutionState(startTime time.Time) *streamExecutionState {
 			Stream:        make([]*StreamOutput, 0),
 			ExecutionTime: 0,
 		},
+		resultChan: resultChan,
 	}
+}
+
+// trySend delivers a result to resultChan, safe against a concurrent terminate().
+func (s *streamExecutionState) trySend(r *ExecutionResult) {
+	if s.closed.Load() {
+		return
+	}
+	// terminate() may close the chan between the check above and the send below.
+	defer func() { _ = recover() }()
+	s.resultChan <- r
+}
+
+// terminate optionally injects a synthetic error and closes resultChan. Idempotent.
+func (s *streamExecutionState) terminate(errOutput *ErrorOutput) {
+	s.closeOnce.Do(func() {
+		if errOutput != nil {
+			s.resultMutex.Lock()
+			if s.result.Error == nil {
+				s.result.Error = errOutput
+				s.result.Status = "error"
+			}
+			s.resultMutex.Unlock()
+
+			// Best-effort; if reader is gone, skip rather than block.
+			select {
+			case s.resultChan <- &ExecutionResult{Status: "error", Error: errOutput}:
+			default:
+			}
+		}
+		s.closed.Store(true)
+		close(s.resultChan)
+	})
 }
 
 // ExecuteCodeStream executes code in streaming mode, sending results to the provided channel
@@ -144,17 +204,37 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 		return err
 	}
 
-	state := newStreamExecutionState(time.Now())
+	state := newStreamExecutionState(time.Now(), resultChan)
 
 	// Clear temporary handlers
 	c.clearTemporaryHandlers()
 	c.registerExecuteCodeStreamHandlers(state, resultChan)
 
+	// Publish before the write so receive/Disconnect can fail it if the WS dies.
+	c.mu.Lock()
+	c.activeStream = state
+	c.mu.Unlock()
+
 	if err := c.writeMessage(msg); err != nil {
+		c.clearActiveStream(state)
 		return fmt.Errorf("failed to send execution request: %w", err)
 	}
 
 	return nil
+}
+
+func (c *Client) clearActiveStream(state *streamExecutionState) {
+	c.mu.Lock()
+	if c.activeStream == state {
+		c.activeStream = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) currentActiveStream() *streamExecutionState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.activeStream
 }
 
 func (c *Client) buildExecuteMessage(code string) (*Message, error) {
@@ -237,7 +317,7 @@ func (c *Client) handleExecuteResult(msg *Message, state *streamExecutionState, 
 		ExecutionCount: execResult.ExecutionCount,
 		ExecutionData:  execResult.Data,
 	}
-	resultChan <- notify
+	state.trySend(notify)
 }
 
 func (c *Client) handleStreamOutput(msg *Message, state *streamExecutionState, resultChan chan *ExecutionResult) {
@@ -252,7 +332,7 @@ func (c *Client) handleStreamOutput(msg *Message, state *streamExecutionState, r
 	notify := &ExecutionResult{
 		Stream: []*StreamOutput{&stream},
 	}
-	resultChan <- notify
+	state.trySend(notify)
 }
 
 func (c *Client) handleExecutionError(msg *Message, state *streamExecutionState, resultChan chan *ExecutionResult) {
@@ -269,7 +349,7 @@ func (c *Client) handleExecutionError(msg *Message, state *streamExecutionState,
 		Error:  &errOutput,
 		Status: "error",
 	}
-	resultChan <- notify
+	state.trySend(notify)
 }
 
 func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState, resultChan chan *ExecutionResult) {
@@ -291,19 +371,29 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 }
 
 func (c *Client) finalizeExecution(state *streamExecutionState, resultChan chan *ExecutionResult) {
+	defer c.clearActiveStream(state)
+
 	state.resultMutex.Lock()
 	state.result.ExecutionTime = time.Since(state.startTime)
 	notify := &ExecutionResult{
 		ExecutionTime: state.result.ExecutionTime,
 	}
-	resultChan <- notify
 	state.resultMutex.Unlock()
+	state.trySend(notify)
 
 	pollInterval := execdflag.JupyterIdlePollInterval
 	if pollInterval <= 0 {
 		pollInterval = 100 * time.Millisecond
 	}
+	gracePeriod := execdflag.JupyterIdleGracePeriod
+	if gracePeriod <= 0 {
+		gracePeriod = 5 * time.Second
+	}
 
+	// Wait for a late execute_reply/error, but bail out after gracePeriod
+	// with a synthetic error rather than hanging forever. See issue #1206.
+	deadline := time.Now().Add(gracePeriod)
+	var syntheticErr *ErrorOutput
 	for {
 		state.resultMutex.Lock()
 		done := state.result.ExecutionCount > 0 || state.result.Error != nil
@@ -311,10 +401,20 @@ func (c *Client) finalizeExecution(state *streamExecutionState, resultChan chan 
 		if done {
 			break
 		}
+		if time.Now().After(deadline) {
+			syntheticErr = &ErrorOutput{
+				EName: "KernelReplyTimeout",
+				EValue: fmt.Sprintf(
+					"kernel reported idle but no execute_reply arrived within %s; the shell-channel reply was likely lost",
+					gracePeriod,
+				),
+			}
+			break
+		}
 		time.Sleep(pollInterval)
 	}
 
-	close(resultChan)
+	state.terminate(syntheticErr)
 }
 
 func (c *Client) writeMessage(msg *Message) error {
@@ -460,6 +560,7 @@ func (c *Client) clearTemporaryHandlers() {
 
 // Receive WebSocket messages
 func (c *Client) receiveMessages() {
+	var readErr error
 	for {
 		c.mu.Lock()
 		conn := c.conn
@@ -471,14 +572,33 @@ func (c *Client) receiveMessages() {
 
 		// Receive message
 		var msg Message
-		err := conn.ReadJSON(&msg)
-		if err != nil {
+		if err := conn.ReadJSON(&msg); err != nil {
 			// connection may already be closed
+			readErr = err
 			break
 		}
 
 		// Process message
 		c.handleMessage(&msg)
+	}
+
+	// If the read loop exited before idle was observed, fail the in-flight
+	// execution; otherwise finalizeExecution's grace period owns the close.
+	if state := c.currentActiveStream(); state != nil {
+		state.executeMutex.Lock()
+		alreadyFinalizing := state.executeDone
+		state.executeMutex.Unlock()
+		if !alreadyFinalizing {
+			errOutput := &ErrorOutput{
+				EName:  "KernelStreamAborted",
+				EValue: "kernel message stream was closed before execution completed",
+			}
+			if readErr != nil {
+				errOutput.EValue = fmt.Sprintf("kernel message stream was closed before execution completed: %v", readErr)
+			}
+			state.terminate(errOutput)
+			c.clearActiveStream(state)
+		}
 	}
 }
 

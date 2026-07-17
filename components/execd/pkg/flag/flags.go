@@ -39,6 +39,12 @@ var (
 	// late execute_result/error messages after receiving idle status.
 	JupyterIdlePollInterval time.Duration
 
+	// JupyterIdleGracePeriod bounds the wait for a late execute_reply/error
+	// after kernel idle. On timeout ExecuteCodeStream synthesizes an error
+	// and closes the stream, preventing codes.run() from hanging when the
+	// shell-channel reply is lost. See issue #1206.
+	JupyterIdleGracePeriod time.Duration
+
 	// IsolationConfigPath points to the TOML isolation config file.
 	// Empty means use built-in defaults.
 	IsolationConfigPath string

@@ -298,3 +298,153 @@ func TestExecuteCodeStreamFallsBackWhenPollIntervalIsNonPositive(t *testing.T) {
 	require.GreaterOrEqual(t, elapsed, 90*time.Millisecond, "expected non-positive poll interval to fall back to runtime default (100ms)")
 	require.Less(t, elapsed, 300*time.Millisecond, "expected fallback poll interval to still close stream promptly")
 }
+
+// Reproduces issue #1206: kernel goes idle but no execute_reply/error ever
+// arrives. finalizeExecution must bail out within JupyterIdleGracePeriod
+// with a synthetic error instead of polling forever.
+func TestExecuteCodeStreamGivesUpWhenExecuteReplyNeverArrives(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	previousGracePeriod := execdflag.JupyterIdleGracePeriod
+	execdflag.JupyterIdlePollInterval = 5 * time.Millisecond
+	execdflag.JupyterIdleGracePeriod = 60 * time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+		execdflag.JupyterIdleGracePeriod = previousGracePeriod
+	})
+
+	// Mock kernel only publishes idle; no execute_reply/execute_result/error.
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		require.NoError(t, conn.ReadJSON(&executeRequest))
+
+		statusContent, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header: Header{
+				MessageID:   "status-msg-id",
+				Session:     executeRequest.Header.Session,
+				MessageType: string(MsgStatus),
+			},
+			ParentHeader: executeRequest.Header,
+			Content:      json.RawMessage(statusContent),
+		}))
+
+		// Hold the WS open so the grace-period path runs, not the disconnect path.
+		time.Sleep(500 * time.Millisecond)
+	})
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	executor := NewExecutor(wsURL, nil)
+	require.NoError(t, executor.Connect())
+	defer executor.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, executor.ExecuteCodeStream("print('missing reply')", resultChan))
+
+	start := time.Now()
+	var terminalErr *ErrorOutput
+	for result := range resultChan {
+		if result != nil && result.Error != nil {
+			terminalErr = result.Error
+		}
+	}
+	elapsed := time.Since(start)
+
+	require.NotNil(t, terminalErr, "expected a synthetic error when execute_reply never arrives")
+	require.Equal(t, "KernelReplyTimeout", terminalErr.EName,
+		"expected KernelReplyTimeout to be surfaced when idle grace period expires")
+	require.GreaterOrEqual(t, elapsed, 50*time.Millisecond,
+		"expected finalizeExecution to wait roughly one grace period before giving up")
+	require.Less(t, elapsed, 400*time.Millisecond,
+		"expected finalizeExecution to close the stream shortly after the grace period")
+}
+
+// WebSocket dies before idle: receiveMessages must fail the stream instead
+// of silently break-ing and leaving the caller blocked on resultChan.
+func TestExecuteCodeStreamFailsWhenWebSocketDiesBeforeIdle(t *testing.T) {
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		require.NoError(t, conn.ReadJSON(&executeRequest))
+		// Drop the connection with no idle/reply.
+		_ = conn.Close()
+	})
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	executor := NewExecutor(wsURL, nil)
+	require.NoError(t, executor.Connect())
+	defer executor.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, executor.ExecuteCodeStream("print('lost socket')", resultChan))
+
+	done := make(chan *ErrorOutput, 1)
+	go func() {
+		var terminalErr *ErrorOutput
+		for result := range resultChan {
+			if result != nil && result.Error != nil {
+				terminalErr = result.Error
+			}
+		}
+		done <- terminalErr
+	}()
+
+	select {
+	case terminalErr := <-done:
+		require.NotNil(t, terminalErr, "expected a synthetic error when WebSocket dies mid-execution")
+		require.Equal(t, "KernelStreamAborted", terminalErr.EName,
+			"expected KernelStreamAborted when the read loop exits before idle")
+	case <-time.After(2 * time.Second):
+		t.Fatal("resultChan was never closed after WebSocket death — codes.run() would hang")
+	}
+}
+
+// Explicit Disconnect() mid-execution must release the caller with a typed
+// error instead of leaking resultChan.
+func TestExecuteCodeStreamFailsWhenDisconnectedMidExecution(t *testing.T) {
+	serverReady := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		require.NoError(t, conn.ReadJSON(&executeRequest))
+		close(serverReady)
+		// Block until the client Disconnects.
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	executor := NewExecutor(wsURL, nil)
+	require.NoError(t, executor.Connect())
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, executor.ExecuteCodeStream("print('will be interrupted')", resultChan))
+
+	<-serverReady
+
+	done := make(chan *ErrorOutput, 1)
+	go func() {
+		var terminalErr *ErrorOutput
+		for result := range resultChan {
+			if result != nil && result.Error != nil {
+				terminalErr = result.Error
+			}
+		}
+		done <- terminalErr
+	}()
+
+	executor.Disconnect()
+
+	select {
+	case terminalErr := <-done:
+		require.NotNil(t, terminalErr, "expected a synthetic error when Disconnect races an in-flight execution")
+		// Disconnect and receiveMessages exit races; either terminal is valid.
+		require.Contains(t, []string{"KernelDisconnected", "KernelStreamAborted"}, terminalErr.EName,
+			"expected a documented disconnect-related terminal error")
+	case <-time.After(2 * time.Second):
+		t.Fatal("resultChan was never closed after Disconnect — codes.run() would hang")
+	}
+}

@@ -30,6 +30,7 @@ const (
 	accessTokenEnv             = "EXECD_ACCESS_TOKEN"
 	gracefulShutdownTimeoutEnv = "EXECD_API_GRACE_SHUTDOWN"
 	jupyterIdlePollIntervalEnv = "EXECD_JUPYTER_IDLE_POLL_INTERVAL"
+	jupyterIdleGracePeriodEnv  = "EXECD_JUPYTER_IDLE_GRACE_PERIOD"
 	isolationConfigEnv         = "EXECD_ISOLATION_CONFIG"
 )
 
@@ -41,6 +42,7 @@ func InitFlags() {
 	ServerAccessToken = ""
 	ApiGracefulShutdownTimeout = time.Second * 1
 	JupyterIdlePollInterval = 100 * time.Millisecond
+	JupyterIdleGracePeriod = 5 * time.Second
 	IsolationConfigPath = ""
 
 	// First, set default values from environment variables
@@ -86,8 +88,21 @@ func InitFlags() {
 		}
 	}
 
+	if idleGracePeriod := os.Getenv(jupyterIdleGracePeriodEnv); idleGracePeriod != "" {
+		duration, err := time.ParseDuration(idleGracePeriod)
+		if err != nil {
+			stdlog.Panicf("Failed to parse jupyter idle grace period from env: %v", err)
+		}
+		if duration <= 0 {
+			stdlog.Printf("Invalid %s=%s; fallback to default %s", jupyterIdleGracePeriodEnv, idleGracePeriod, JupyterIdleGracePeriod)
+		} else {
+			JupyterIdleGracePeriod = duration
+		}
+	}
+
 	flag.DurationVar(&ApiGracefulShutdownTimeout, "graceful-shutdown-timeout", ApiGracefulShutdownTimeout, "API graceful shutdown timeout duration (default: 1s)")
 	flag.DurationVar(&JupyterIdlePollInterval, "jupyter-idle-poll-interval", JupyterIdlePollInterval, "Polling interval after Jupyter idle status before closing stream (default: 100ms)")
+	flag.DurationVar(&JupyterIdleGracePeriod, "jupyter-idle-grace-period", JupyterIdleGracePeriod, "Maximum time to wait after Jupyter idle status for a late execute_reply/error before giving up and closing the stream with a synthetic error (default: 5s)")
 
 	// Isolation config
 	if v := os.Getenv(isolationConfigEnv); v != "" {
@@ -100,6 +115,10 @@ func InitFlags() {
 	if JupyterIdlePollInterval <= 0 {
 		stdlog.Printf("Invalid --jupyter-idle-poll-interval=%s; fallback to default %s", JupyterIdlePollInterval, 100*time.Millisecond)
 		JupyterIdlePollInterval = 100 * time.Millisecond
+	}
+	if JupyterIdleGracePeriod <= 0 {
+		stdlog.Printf("Invalid --jupyter-idle-grace-period=%s; fallback to default %s", JupyterIdleGracePeriod, 5*time.Second)
+		JupyterIdleGracePeriod = 5 * time.Second
 	}
 
 	// Log final values
