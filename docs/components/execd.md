@@ -109,6 +109,7 @@ override it.
 | `--access-token` | `""` | Optional shared API access token. |
 | `--graceful-shutdown-timeout` | `1s` | SSE tail-drain wait window before closing. |
 | `--jupyter-idle-poll-interval` | `100ms` | Poll interval after Jupyter reports idle. |
+| `--jupyter-idle-grace-period` | `5s` | Maximum wait after Jupyter idle for a late `execute_reply`/error before closing the stream with a synthetic `KernelReplyTimeout` error. |
 | `--isolation-config` | `""` | Path to the isolation TOML config (see below). |
 
 ### Environment Variables
@@ -120,6 +121,7 @@ override it.
 | `EXECD_ACCESS_TOKEN` | Same as `--access-token` (overridden by explicit flag). |
 | `EXECD_API_GRACE_SHUTDOWN` | Same as `--graceful-shutdown-timeout`. |
 | `EXECD_JUPYTER_IDLE_POLL_INTERVAL` | Same as `--jupyter-idle-poll-interval`. |
+| `EXECD_JUPYTER_IDLE_GRACE_PERIOD` | Same as `--jupyter-idle-grace-period`. |
 | `EXECD_ISOLATION_CONFIG` | Same as `--isolation-config`. |
 | `EXECD_CLONE3_COMPAT` | Linux clone3 compatibility switch (see below). |
 | `EXECD_LOG_FILE` | Optional log output file path; default is stdout. |

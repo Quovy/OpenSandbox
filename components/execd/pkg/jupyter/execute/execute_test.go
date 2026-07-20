@@ -359,6 +359,69 @@ func TestExecuteCodeStreamGivesUpWhenExecuteReplyNeverArrives(t *testing.T) {
 		"expected finalizeExecution to close the stream shortly after the grace period")
 }
 
+// Regression for PR #1321 review: on the idle-grace timeout path, no
+// ExecutionTime-only "completion" notify may be emitted before the error.
+// dispatchExecutionResultHooks would otherwise fire OnExecuteComplete first
+// and misreport a hung execution as successful.
+func TestExecuteCodeStreamDoesNotSignalCompletionBeforeSyntheticError(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	previousGracePeriod := execdflag.JupyterIdleGracePeriod
+	execdflag.JupyterIdlePollInterval = 5 * time.Millisecond
+	execdflag.JupyterIdleGracePeriod = 40 * time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+		execdflag.JupyterIdleGracePeriod = previousGracePeriod
+	})
+
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		require.NoError(t, conn.ReadJSON(&executeRequest))
+
+		statusContent, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header: Header{
+				MessageID:   "status-msg-id",
+				Session:     executeRequest.Header.Session,
+				MessageType: string(MsgStatus),
+			},
+			ParentHeader: executeRequest.Header,
+			Content:      json.RawMessage(statusContent),
+		}))
+
+		time.Sleep(300 * time.Millisecond)
+	})
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	executor := NewExecutor(wsURL, nil)
+	require.NoError(t, executor.Connect())
+	defer executor.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, executor.ExecuteCodeStream("print('missing reply')", resultChan))
+
+	var results []*ExecutionResult
+	for r := range resultChan {
+		if r != nil {
+			results = append(results, r)
+		}
+	}
+
+	require.NotEmpty(t, results, "expected at least one terminal result")
+	for i, r := range results {
+		// A pre-error "success completion" notify has ExecutionTime > 0 and
+		// no Error. That is exactly the shape dispatchExecutionResultHooks
+		// treats as OnExecuteComplete — must never appear on the error path.
+		if r.Error == nil && r.ExecutionTime > 0 {
+			t.Fatalf("result[%d] looks like a success-completion notify on the error path: %+v (all results: %+v)", i, r, results)
+		}
+	}
+	// The final notify must carry the synthetic error.
+	last := results[len(results)-1]
+	require.NotNil(t, last.Error, "final notify on the error path must carry the error")
+	require.Equal(t, "KernelReplyTimeout", last.Error.EName)
+}
+
 // WebSocket dies before idle: receiveMessages must fail the stream instead
 // of silently break-ing and leaving the caller blocked on resultChan.
 func TestExecuteCodeStreamFailsWhenWebSocketDiesBeforeIdle(t *testing.T) {

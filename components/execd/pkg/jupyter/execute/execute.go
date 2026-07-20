@@ -373,14 +373,6 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 func (c *Client) finalizeExecution(state *streamExecutionState, resultChan chan *ExecutionResult) {
 	defer c.clearActiveStream(state)
 
-	state.resultMutex.Lock()
-	state.result.ExecutionTime = time.Since(state.startTime)
-	notify := &ExecutionResult{
-		ExecutionTime: state.result.ExecutionTime,
-	}
-	state.resultMutex.Unlock()
-	state.trySend(notify)
-
 	pollInterval := execdflag.JupyterIdlePollInterval
 	if pollInterval <= 0 {
 		pollInterval = 100 * time.Millisecond
@@ -414,6 +406,19 @@ func (c *Client) finalizeExecution(state *streamExecutionState, resultChan chan 
 		time.Sleep(pollInterval)
 	}
 
+	// Record ExecutionTime and, on the success path (no error observed and no
+	// synthetic error), emit a terminal ExecutionTime-only notify so runtime
+	// dispatches OnExecuteComplete. On error paths, terminate() pushes the
+	// error notify — do NOT precede it with a success signal (issue #1206).
+	state.resultMutex.Lock()
+	state.result.ExecutionTime = time.Since(state.startTime)
+	isSuccess := state.result.Error == nil && syntheticErr == nil
+	execTime := state.result.ExecutionTime
+	state.resultMutex.Unlock()
+
+	if isSuccess {
+		state.trySend(&ExecutionResult{ExecutionTime: execTime})
+	}
 	state.terminate(syntheticErr)
 }
 
