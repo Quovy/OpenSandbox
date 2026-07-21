@@ -24,6 +24,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -215,10 +217,20 @@ func httpSourceFactory(raw json.RawMessage) (CredentialSource, error) {
 }
 
 func validateHTTPSourceHeaders(headers map[string]string) error {
+	seen := make(map[string]string, len(headers))
 	for name, value := range headers {
 		if !headerFieldNamePattern.MatchString(name) {
 			return fmt.Errorf("http credential source: invalid header name %q", name)
 		}
+		// Header names are case-insensitive. If two map entries collapse to
+		// the same canonical name, Go map iteration order determines which
+		// value wins after req.Header.Set, so provider auth would become
+		// nondeterministic. Reject at write time instead.
+		lower := strings.ToLower(name)
+		if existing, ok := seen[lower]; ok {
+			return fmt.Errorf("http credential source: duplicate header %q (also seen as %q)", name, existing)
+		}
+		seen[lower] = name
 		for i := range value {
 			b := value[i]
 			if b < 0x20 || b == 0x7f {
@@ -239,6 +251,12 @@ func validateHTTPSourceURL(raw string) error {
 	}
 	if parsed.Host == "" {
 		return fmt.Errorf("http credential source url must include a host")
+	}
+	if port := parsed.Port(); port != "" {
+		p, err := strconv.Atoi(port)
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("http credential source url has invalid port %q", port)
+		}
 	}
 	return nil
 }

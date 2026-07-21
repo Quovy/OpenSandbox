@@ -127,7 +127,7 @@ non-empty `value` and may optionally rotate the refresh endpoint or headers:
 | Field | Required | Behavior |
 | --- | --- | --- |
 | `value` | Yes | Plaintext credential returned to the sidecar's injection pipeline. Empty values are rejected. |
-| `ttl` | No | Cache lifetime in seconds. Omit or set to `0` to force a fresh fetch on every request. |
+| `ttl` | No | Cache lifetime in seconds. Omitting `ttl` caches the value indefinitely (no refresh until the sandbox is destroyed). Set `ttl: 0` to force a fresh fetch on every request. |
 | `url` | No | Refresh endpoint for the next fetch. Must be an absolute `http`/`https` URL with a host, and must satisfy egress policy for the sandbox. |
 | `headers` | No | Headers to send on the next fetch. Header names must be RFC 7230 tokens and values must not contain control bytes (`< 0x20` or `0x7f`). |
 

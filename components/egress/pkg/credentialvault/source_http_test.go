@@ -423,4 +423,31 @@ func TestHttpSourceEchoedURLKeepsBootstrapHeaders(t *testing.T) {
 	require.Equal(t, int32(2), calls.Load())
 }
 
+func TestHttpSourceFactoryRejectsOutOfRangePort(t *testing.T) {
+	cases := []string{
+		"http://vault.example.com:0/cred",
+		"http://vault.example.com:65536/cred",
+		"http://vault.example.com:99999/cred",
+	}
+	for _, raw := range cases {
+		_, err := httpSourceFactory(mustMarshal(map[string]string{
+			"type": "http",
+			"url":  raw,
+		}))
+		require.ErrorContains(t, err, "invalid port", "url %s should be rejected", raw)
+	}
+}
+
+func TestHttpSourceFactoryRejectsDuplicateHeadersCaseInsensitive(t *testing.T) {
+	_, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type": "http",
+		"url":  "https://vault.example.com/cred",
+		"headers": map[string]string{
+			"X-Auth": "one",
+			"x-auth": "two",
+		},
+	}))
+	require.ErrorContains(t, err, "duplicate header")
+}
+
 func intPtr(v int) *int { return &v }
