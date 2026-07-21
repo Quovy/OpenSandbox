@@ -76,6 +76,97 @@ For the underlying egress-sidecar limitation, see [Egress](/components/egress#se
 Credential bindings are intentionally precise. A default-deny egress policy is
 required. Use a narrow path match, for example `/v1/*` for Anthropic API calls.
 
+## Credential Sources
+
+Every credential declares a `source` that tells the sidecar how to obtain the
+plaintext value. Two source shapes are supported.
+
+### Inline source
+
+The credential value is provided directly by the SDK caller. This is the default
+form used throughout this guide:
+
+```python
+Credential(name="anthropic-api-key", source={"value": "sk-ant-..."})
+```
+
+Inline sources are stored in memory in the sidecar, redacted from all vault
+responses, and never re-fetched. Use this for static tokens rotated by the
+platform operator.
+
+### HTTP source
+
+The credential value is fetched by the egress sidecar from an internal HTTP
+provider (for example a short-lived token issuer or a credential broker) on
+first use, then cached until an optional TTL expires:
+
+```python
+Credential(
+    name="anthropic-api-key",
+    source={
+        "type": "http",
+        "url": "https://vault.internal/credentials/anthropic",
+        "method": "GET",
+        "headers": {"X-Auth": "bootstrap-token"},
+    },
+)
+```
+
+**Provider response contract.** The provider must return a JSON body with a
+non-empty `value` and may optionally rotate the refresh endpoint or headers:
+
+```json
+{
+  "value": "the-real-credential",
+  "url": "https://vault.internal/credentials/anthropic/v2",
+  "headers": {"X-Auth": "rotated-token"},
+  "ttl": 300
+}
+```
+
+| Field | Required | Behavior |
+| --- | --- | --- |
+| `value` | Yes | Plaintext credential returned to the sidecar's injection pipeline. Empty values are rejected. |
+| `ttl` | No | Cache lifetime in seconds. Omit or set to `0` to force a fresh fetch on every request. |
+| `url` | No | Refresh endpoint for the next fetch. Must be an absolute `http`/`https` URL with a host, and must satisfy egress policy for the sandbox. |
+| `headers` | No | Headers to send on the next fetch. Header names must be RFC 7230 tokens and values must not contain control bytes (`< 0x20` or `0x7f`). |
+
+**Rotation semantics.** The sidecar only replaces cached state when it can
+validate the response, so a malformed rotation cannot corrupt future fetches:
+
+- If `url` is present and differs from the current refresh URL, the sidecar
+  starts using it on the next fetch. If the accompanying response omits
+  `headers`, the sidecar treats this as a cross-endpoint rotation and clears
+  bootstrap headers to avoid leaking them to the new host.
+- If `url` is present but equals the current refresh URL, the sidecar keeps
+  using the existing headers (bootstrap or previously rotated) on the next
+  fetch. Providers that echo their own refresh URL will therefore continue to
+  receive their bootstrap credentials.
+- If `headers` is present, its exact contents replace any previously used
+  headers. An empty object (`"headers": {}`) explicitly clears headers.
+- If `url` or `headers` fail validation, both fields are rejected together and
+  the previously cached URL and header set continue to apply.
+
+**Security constraints applied at write time.** Vault create/patch requests
+reject bad HTTP sources before they can be activated:
+
+- URL must use `http` or `https` and include a host.
+- HTTP method must be a valid RFC 7230 token (defaults to `GET`).
+- Header names must match `^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$`; values must not
+  contain any byte below `0x20` or equal to `0x7f`.
+- Redirect responses from the provider are rejected; the sidecar will not
+  forward bootstrap headers to a redirected host.
+
+**Egress policy.** HTTP source fetches use a dedicated firewall mark that
+bypasses only the transparent MITM redirect, not the sandbox's egress network
+policy. The provider host must therefore be reachable under the same
+`network_policy` that governs the sandbox, so include it in the `allow` list
+when using `defaultAction="deny"`.
+
+**Compatibility.** The HTTP source shape is available with `egress >= 1.1.2`
+and the corresponding SDK versions that expose `HTTPCredentialSource` /
+`source={"type": "http", ...}`. Older clients only understand inline sources.
+
 ## Auth Types
 
 Each binding uses an `auth` rule to describe how the referenced credential is
