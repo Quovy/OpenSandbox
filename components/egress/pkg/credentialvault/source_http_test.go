@@ -393,4 +393,34 @@ func TestHttpSourceHeadersRotationClearsBootstrapHeaders(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestHttpSourceEchoedURLKeepsBootstrapHeaders(t *testing.T) {
+	var calls atomic.Int32
+	var srvURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		// Bootstrap headers must reach the provider on every call, since the
+		// response only echoes the same refresh URL without rotating headers.
+		require.Equal(t, "boot", r.Header.Get("X-Auth"),
+			"bootstrap header should be preserved when URL is unchanged (call %d)", n)
+		fmt.Fprintf(w, `{"value":"v%d","url":%q,"ttl":0}`, n, srvURL)
+	}))
+	defer srv.Close()
+	srvURL = srv.URL
+
+	src, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     srv.URL,
+		"headers": map[string]string{"X-Auth": "boot"},
+	}))
+	require.NoError(t, err)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, int32(2), calls.Load())
+}
+
 func intPtr(v int) *int { return &v }

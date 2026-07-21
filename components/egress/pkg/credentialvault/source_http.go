@@ -146,7 +146,17 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 	urlValid := result.URL == "" || validateHTTPSourceURL(result.URL) == nil
 	headersValid := result.Headers == nil || validateHTTPSourceHeaders(result.Headers) == nil
 	if urlValid && headersValid {
-		if result.URL != "" {
+		// Determine whether the response actually rotates the URL. Providers
+		// that echo the same refresh endpoint should not implicitly clear
+		// bootstrap headers, otherwise the next fetch would go to the same
+		// endpoint without auth headers. Only an explicit `headers: {}` (or a
+		// non-nil rotated map) may clear or replace headers.
+		currentURL := s.nextURL
+		if currentURL == "" {
+			currentURL = s.initialURL
+		}
+		urlChanged := result.URL != "" && result.URL != currentURL
+		if urlChanged {
 			s.nextURL = result.URL
 			if result.Headers == nil {
 				s.nextHeaders = nil
