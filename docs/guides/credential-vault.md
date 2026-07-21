@@ -150,12 +150,25 @@ validate the response, so a malformed rotation cannot corrupt future fetches:
 **Security constraints applied at write time.** Vault create/patch requests
 reject bad HTTP sources before they can be activated:
 
-- URL must use `http` or `https` and include a host.
+- URL must use `http` or `https` and include a host, and its port (when
+  present) must be in the range 1–65535.
+- URL host must not resolve to a loopback address (`127.0.0.0/8`, `::1`, or
+  the literal `localhost`). The sandbox nft output chain accepts loopback
+  traffic unconditionally, so a loopback provider would bypass the sandbox
+  network policy.
 - HTTP method must be a valid RFC 7230 token (defaults to `GET`).
-- Header names must match `^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$`; values must not
-  contain any byte below `0x20` or equal to `0x7f`.
+- Header names must match `^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$` and each name
+  must be unique after lower-casing (so `X-Auth` and `x-auth` cannot both
+  appear); values must not contain any byte below `0x20` or equal to `0x7f`.
 - Redirect responses from the provider are rejected; the sidecar will not
   forward bootstrap headers to a redirected host.
+
+**URL equivalence during rotation.** When comparing a response `url` to the
+current refresh URL, the sidecar normalizes scheme/host case, drops an
+explicit default port for the scheme (`:80` for `http`, `:443` for `https`),
+and ignores URL fragments. Providers that echo the same endpoint in a
+slightly different textual form (for example, adding the default port or
+changing host casing) are treated as unchanged and keep the current headers.
 
 **Egress policy.** HTTP source fetches use a dedicated firewall mark that
 bypasses only the transparent MITM redirect, not the sandbox's egress network

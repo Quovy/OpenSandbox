@@ -151,13 +151,16 @@ func (s *httpSource) fetch(ctx context.Context) (string, error) {
 		// Determine whether the response actually rotates the URL. Providers
 		// that echo the same refresh endpoint should not implicitly clear
 		// bootstrap headers, otherwise the next fetch would go to the same
-		// endpoint without auth headers. Only an explicit `headers: {}` (or a
-		// non-nil rotated map) may clear or replace headers.
+		// endpoint without auth headers. Compare canonical forms so an echo
+		// that only differs in host case, an explicit default port, or a
+		// fragment is not treated as a cross-endpoint rotation. Only an
+		// explicit `headers: {}` (or a non-nil rotated map) may clear or
+		// replace headers.
 		currentURL := s.nextURL
 		if currentURL == "" {
 			currentURL = s.initialURL
 		}
-		urlChanged := result.URL != "" && result.URL != currentURL
+		urlChanged := result.URL != "" && canonicalHTTPSourceURL(result.URL) != canonicalHTTPSourceURL(currentURL)
 		if urlChanged {
 			s.nextURL = result.URL
 			if result.Headers == nil {
@@ -258,5 +261,53 @@ func validateHTTPSourceURL(raw string) error {
 			return fmt.Errorf("http credential source url has invalid port %q", port)
 		}
 	}
+	if isLoopbackHost(parsed.Hostname()) {
+		return fmt.Errorf("http credential source url must not target a loopback host %q; the sandbox nft output chain accepts loopback unconditionally, so such fetches bypass network policy", parsed.Hostname())
+	}
 	return nil
+}
+
+// isLoopbackHost reports whether host resolves to a loopback address. It
+// covers IPv4/IPv6 literals (including 127.0.0.0/8 and ::1) and the special
+// hostname "localhost". Zones are stripped from IPv6 literals before parsing.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	// Strip an IPv6 zone identifier ("fe80::1%eth0") before net.ParseIP.
+	if i := strings.Index(host, "%"); i >= 0 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// canonicalHTTPSourceURL returns a normalized form of a validated HTTP source
+// URL that ignores case-insensitive scheme/host differences, an explicit
+// default port for the scheme, and URL fragments, so that echoing the same
+// endpoint in a different textual form does not look like a rotation.
+func canonicalHTTPSourceURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		parsed.Host = host + ":" + port
+	} else {
+		parsed.Host = host
+	}
+	parsed.Fragment = ""
+	return parsed.String()
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -28,6 +29,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testProviderHost is a non-loopback hostname used in test URLs so that
+// httpSourceFactory does not reject them at write time. The dialer installed
+// by newRedirectingSource actually connects to the httptest.Server's loopback
+// address, so no real DNS lookup happens.
+const testProviderHost = "vault.test"
+
+// redirectingDialer returns a DialContext that ignores its address argument
+// and always dials the given httptest.Server's listener address instead. This
+// lets tests use a non-loopback URL (which passes validateHTTPSourceURL) while
+// still exercising the real HTTP client against an in-process server.
+func redirectingDialer(srv *httptest.Server) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	target := srv.Listener.Addr().String()
+	var d net.Dialer
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return d.DialContext(ctx, network, target)
+	}
+}
+
+// installTestDialer replaces the transport on an httpSource so that any host
+// in the URL is dialed to srv. Panics if src is not the internal *httpSource
+// type or its transport is not an *http.Transport.
+func installTestDialer(src CredentialSource, srv *httptest.Server) {
+	hs, ok := src.(*httpSource)
+	if !ok {
+		panic(fmt.Sprintf("expected *httpSource, got %T", src))
+	}
+	tr, ok := hs.client.Transport.(*http.Transport)
+	if !ok {
+		panic(fmt.Sprintf("expected *http.Transport, got %T", hs.client.Transport))
+	}
+	tr.DialContext = redirectingDialer(srv)
+}
+
+// testProviderURL returns a URL rooted at testProviderHost with the given
+// path. Callers should pair it with installTestDialer so the request reaches
+// srv despite the non-loopback host.
+func testProviderURL(path string) string {
+	return "http://" + testProviderHost + path
+}
+
 func TestHttpSourceResolveBasic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"value":"my-secret"}`)
@@ -36,9 +77,10 @@ func TestHttpSourceResolveBasic(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 	require.Equal(t, "http", src.Type())
 
 	val, err := src.Resolve(context.Background())
@@ -56,9 +98,10 @@ func TestHttpSourceCachesWithNilTTL(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	for i := 0; i < 5; i++ {
 		val, err := src.Resolve(context.Background())
@@ -78,9 +121,10 @@ func TestHttpSourceRefetchesAfterTTLExpires(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	v1, err := src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -117,10 +161,11 @@ func TestHttpSourceDynamicURLAndHeaders(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]any{
 		"type":    "http",
-		"url":     srv.URL + "/initial",
+		"url":     testProviderURL("/initial"),
 		"headers": map[string]string{"X-Auth": "boot"},
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	v1, err := src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -139,9 +184,10 @@ func TestHttpSourceReturnsErrorOnNon200(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.ErrorContains(t, err, "status 403")
@@ -155,9 +201,10 @@ func TestHttpSourceReturnsErrorOnEmptyValue(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.ErrorContains(t, err, "response value is empty")
@@ -189,9 +236,10 @@ func TestHttpSourceFactoryDefaultsMethodToGET(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -206,10 +254,11 @@ func TestHttpSourceCustomMethod(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]any{
 		"type":   "http",
-		"url":    srv.URL,
+		"url":    testProviderURL("/cred"),
 		"method": "POST",
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -239,9 +288,10 @@ func TestHttpSourceConcurrentResolveSingleFetch(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	const goroutines = 10
 	var wg sync.WaitGroup
@@ -323,11 +373,13 @@ func TestHttpSourceFactoryRejectsHeaderValueWithControlChar(t *testing.T) {
 
 func TestHttpSourceURLOnlyRotationClearsBootstrapHeaders(t *testing.T) {
 	var calls atomic.Int32
+	initialURL := testProviderURL("/initial")
+	rotatedURL := "http://" + testProviderHost + "/refreshed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
 		if n == 1 {
 			require.Equal(t, "boot", r.Header.Get("X-Auth"))
-			fmt.Fprintf(w, `{"value":"first","url":"http://%s/refreshed","ttl":0}`, r.Host)
+			fmt.Fprintf(w, `{"value":"first","url":%q,"ttl":0}`, rotatedURL)
 			return
 		}
 		require.Equal(t, "", r.Header.Get("X-Auth"), "bootstrap header should not leak to rotated URL")
@@ -337,10 +389,11 @@ func TestHttpSourceURLOnlyRotationClearsBootstrapHeaders(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]any{
 		"type":    "http",
-		"url":     srv.URL,
+		"url":     initialURL,
 		"headers": map[string]string{"X-Auth": "boot"},
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -357,9 +410,10 @@ func TestHttpSourceRejectsRedirects(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]string{
 		"type": "http",
-		"url":  srv.URL,
+		"url":  testProviderURL("/cred"),
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.ErrorContains(t, err, "redirects are not allowed")
@@ -367,11 +421,13 @@ func TestHttpSourceRejectsRedirects(t *testing.T) {
 
 func TestHttpSourceHeadersRotationClearsBootstrapHeaders(t *testing.T) {
 	var calls atomic.Int32
+	initialURL := testProviderURL("/initial")
+	rotatedURL := "http://" + testProviderHost + "/refreshed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
 		if n == 1 {
 			require.Equal(t, "boot", r.Header.Get("X-Auth"))
-			fmt.Fprintf(w, `{"value":"first","url":"http://%s/refreshed","headers":{},"ttl":0}`, r.Host)
+			fmt.Fprintf(w, `{"value":"first","url":%q,"headers":{},"ttl":0}`, rotatedURL)
 			return
 		}
 		require.Equal(t, "", r.Header.Get("X-Auth"), "bootstrap header should not leak after rotation")
@@ -381,10 +437,11 @@ func TestHttpSourceHeadersRotationClearsBootstrapHeaders(t *testing.T) {
 
 	src, err := httpSourceFactory(mustMarshal(map[string]any{
 		"type":    "http",
-		"url":     srv.URL,
+		"url":     initialURL,
 		"headers": map[string]string{"X-Auth": "boot"},
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -395,24 +452,24 @@ func TestHttpSourceHeadersRotationClearsBootstrapHeaders(t *testing.T) {
 
 func TestHttpSourceEchoedURLKeepsBootstrapHeaders(t *testing.T) {
 	var calls atomic.Int32
-	var srvURL string
+	sameURL := testProviderURL("/cred")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
 		// Bootstrap headers must reach the provider on every call, since the
 		// response only echoes the same refresh URL without rotating headers.
 		require.Equal(t, "boot", r.Header.Get("X-Auth"),
 			"bootstrap header should be preserved when URL is unchanged (call %d)", n)
-		fmt.Fprintf(w, `{"value":"v%d","url":%q,"ttl":0}`, n, srvURL)
+		fmt.Fprintf(w, `{"value":"v%d","url":%q,"ttl":0}`, n, sameURL)
 	}))
 	defer srv.Close()
-	srvURL = srv.URL
 
 	src, err := httpSourceFactory(mustMarshal(map[string]any{
 		"type":    "http",
-		"url":     srv.URL,
+		"url":     sameURL,
 		"headers": map[string]string{"X-Auth": "boot"},
 	}))
 	require.NoError(t, err)
+	installTestDialer(src, srv)
 
 	_, err = src.Resolve(context.Background())
 	require.NoError(t, err)
@@ -436,6 +493,60 @@ func TestHttpSourceFactoryRejectsOutOfRangePort(t *testing.T) {
 		}))
 		require.ErrorContains(t, err, "invalid port", "url %s should be rejected", raw)
 	}
+}
+
+func TestHttpSourceFactoryRejectsLoopbackHost(t *testing.T) {
+	cases := []string{
+		"http://127.0.0.1/cred",
+		"http://127.5.5.5/cred",
+		"http://[::1]/cred",
+		"http://localhost/cred",
+		"http://LocalHost:8080/cred",
+	}
+	for _, raw := range cases {
+		_, err := httpSourceFactory(mustMarshal(map[string]string{
+			"type": "http",
+			"url":  raw,
+		}))
+		require.ErrorContains(t, err, "loopback", "url %s should be rejected", raw)
+	}
+}
+
+func TestHttpSourceEquivalentEchoedURLKeepsBootstrapHeaders(t *testing.T) {
+	// Provider echoes its own refresh URL in a slightly different textual
+	// form on every fetch: switches host casing and adds the explicit
+	// default port. The rotation logic should treat this as the same
+	// endpoint and preserve the bootstrap auth header instead of clearing
+	// it as if the URL had rotated.
+	var calls atomic.Int32
+	// "http://Vault.TEST:80/cred" — equivalent to testProviderURL("/cred")
+	// after canonicalisation (lowercased host, dropped default port).
+	echoedURL := "http://Vault.TEST:80/cred"
+	require.Equal(t, "vault.test", testProviderHost,
+		"echoedURL and testProviderHost must canonicalise to the same value")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		require.Equal(t, "boot", r.Header.Get("X-Auth"),
+			"bootstrap header should be preserved across equivalent URL echoes (call %d)", n)
+		fmt.Fprintf(w, `{"value":"v%d","url":%q,"ttl":0}`, n, echoedURL)
+	}))
+	defer srv.Close()
+
+	src, err := httpSourceFactory(mustMarshal(map[string]any{
+		"type":    "http",
+		"url":     testProviderURL("/cred"),
+		"headers": map[string]string{"X-Auth": "boot"},
+	}))
+	require.NoError(t, err)
+	installTestDialer(src, srv)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
+
+	_, err = src.Resolve(context.Background())
+	require.NoError(t, err)
+
+	require.Equal(t, int32(2), calls.Load())
 }
 
 func TestHttpSourceFactoryRejectsDuplicateHeadersCaseInsensitive(t *testing.T) {
