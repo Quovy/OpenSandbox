@@ -47,13 +47,36 @@ var forwardSignals = []os.Signal{
 	syscall.SIGWINCH,
 }
 
-// getShell returns the preferred shell, falling back to sh if bash is not available.
-// This is needed for Alpine-based Docker images that only have sh by default.
+// getShell returns "bash" if available, otherwise "sh". The result is cached
+// for the process lifetime; tests that mutate PATH must call
+// resetShellCacheForTest.
+var (
+	shellCacheOnce sync.Once
+	shellCacheVal  string
+)
+
 func getShell() string {
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash"
+	shellCacheOnce.Do(func() {
+		if _, err := exec.LookPath("bash"); err == nil {
+			shellCacheVal = "bash"
+		} else {
+			shellCacheVal = "sh"
+		}
+	})
+	return shellCacheVal
+}
+
+// shellCommand returns (shell, argv) for launching the preferred shell,
+// prepending --noprofile --norc when Bash is selected. Extra positional
+// arguments (script path, or "-c" + code) are appended after.
+func shellCommand(extra ...string) (string, []string) {
+	shell := getShell()
+	args := make([]string, 0, 2+len(extra))
+	if shell == "bash" {
+		args = append(args, "--noprofile", "--norc")
 	}
-	return "sh"
+	args = append(args, extra...)
+	return shell, args
 }
 
 func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
@@ -116,6 +139,7 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 
 	startAt := time.Now()
 	log.Info("received command: %v", log.SanitizeCommand(request.Code))
+	// --noprofile/--norc are no-ops for `bash -c`, so shellCommand is not used here.
 	shell := getShell()
 	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
@@ -276,6 +300,7 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 
 	startAt := time.Now()
 	log.Info("received command: %v", log.SanitizeCommand(request.Code))
+	// --noprofile/--norc are no-ops for `bash -c`, so shellCommand is not used here.
 	shell := getShell()
 	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
