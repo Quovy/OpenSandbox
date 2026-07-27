@@ -37,6 +37,8 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
 
+const bashShell = "bash"
+
 var forwardSignals = []os.Signal{
 	syscall.SIGINT,
 	syscall.SIGTERM,
@@ -57,8 +59,8 @@ var (
 
 func getShell() string {
 	shellCacheOnce.Do(func() {
-		if _, err := exec.LookPath("bash"); err == nil {
-			shellCacheVal = "bash"
+		if _, err := exec.LookPath(bashShell); err == nil {
+			shellCacheVal = bashShell
 		} else {
 			shellCacheVal = "sh"
 		}
@@ -72,7 +74,7 @@ func getShell() string {
 func shellCommand(extra ...string) (string, []string) {
 	shell := getShell()
 	args := make([]string, 0, 2+len(extra))
-	if shell == "bash" {
+	if shell == bashShell {
 		args = append(args, "--noprofile", "--norc")
 	}
 	args = append(args, extra...)
