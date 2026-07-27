@@ -34,7 +34,11 @@ from opensandbox_server.config import load_config
 from opensandbox_server.integrations.renew_intent import start_renew_intent_consumer
 from opensandbox_server.logging_config import configure_logging
 from opensandbox_server.startup_guard import api_key_confirm
-from opensandbox_server.tenants import validate_tenant_config, TenantProvider
+from opensandbox_server.tenants import (
+    validate_tenant_config,
+    validate_tenant_namespaces,
+    TenantProvider,
+)
 
 # Load configuration before initializing routers/middleware
 app_config = load_config()
@@ -94,6 +98,18 @@ async def lifespan(app: FastAPI):
     if tenant_provider is not None:
         tenant_provider.start()
         sandbox_service.set_tenant_provider(tenant_provider)
+
+        # OSEP-0014: startup MUST validate all tenant namespaces exist and
+        # are accessible before serving traffic (fail-fast). Multi-tenancy is
+        # Kubernetes-only, which validate_tenant_config() already enforces.
+        try:
+            from opensandbox_server.services.k8s.client import K8sClient
+
+            core_v1_api = K8sClient(app_config.kubernetes).get_core_v1_api()
+            validate_tenant_namespaces(tenant_provider.list_tenants(), core_v1_api)
+        except Exception as exc:
+            logger.error("Tenant namespace validation failed: %s", exc)
+            os._exit(1)
 
     from anyio.to_thread import current_default_thread_limiter
 

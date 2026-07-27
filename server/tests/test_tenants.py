@@ -22,7 +22,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from opensandbox_server.tenants import validate_tenant_config
+from opensandbox_server.tenants import (
+    validate_tenant_config,
+    validate_tenant_namespaces,
+)
 from opensandbox_server.tenants.context import get_current_tenant, set_current_tenant
 from opensandbox_server.tenants.file_provider import (
     FileTenantProvider,
@@ -494,3 +497,65 @@ def test_validate_tenant_config_ok():
     cfg.runtime.type = "kubernetes"
     cfg.server.api_key = None
     validate_tenant_config(cfg)
+
+
+# --- validate_tenant_namespaces ---
+
+
+def _tenant(name: str, namespace: str) -> TenantEntry:
+    return TenantEntry(name=name, namespace=namespace, api_keys=("k",))
+
+
+def test_validate_tenant_namespaces_ok():
+    core_v1 = MagicMock()
+    tenants = [_tenant("alpha", "ns-alpha"), _tenant("beta", "ns-beta")]
+    validate_tenant_namespaces(tenants, core_v1)
+    assert core_v1.read_namespace.call_count == 2
+
+
+def test_validate_tenant_namespaces_dedupes_shared_namespace():
+    core_v1 = MagicMock()
+    tenants = [_tenant("alpha", "shared"), _tenant("beta", "shared")]
+    validate_tenant_namespaces(tenants, core_v1)
+    assert core_v1.read_namespace.call_count == 1
+
+
+def test_validate_tenant_namespaces_missing_raises():
+    from kubernetes.client import ApiException
+
+    core_v1 = MagicMock()
+    core_v1.read_namespace.side_effect = ApiException(status=404)
+    with pytest.raises(ValueError, match="does not exist"):
+        validate_tenant_namespaces([_tenant("alpha", "ns-alpha")], core_v1)
+
+
+def test_validate_tenant_namespaces_forbidden_raises():
+    from kubernetes.client import ApiException
+
+    core_v1 = MagicMock()
+    core_v1.read_namespace.side_effect = ApiException(status=403)
+    with pytest.raises(ValueError, match="not accessible"):
+        validate_tenant_namespaces([_tenant("alpha", "ns-alpha")], core_v1)
+
+
+def test_validate_tenant_namespaces_aggregates_failures():
+    from kubernetes.client import ApiException
+
+    core_v1 = MagicMock()
+
+    def _read(name: str):
+        if name == "ok":
+            return MagicMock()
+        raise ApiException(status=404)
+
+    core_v1.read_namespace.side_effect = lambda name: _read(name)
+    tenants = [
+        _tenant("alpha", "ok"),
+        _tenant("beta", "missing-1"),
+        _tenant("gamma", "missing-2"),
+    ]
+    with pytest.raises(ValueError) as exc_info:
+        validate_tenant_namespaces(tenants, core_v1)
+    message = str(exc_info.value)
+    assert "missing-1" in message
+    assert "missing-2" in message
