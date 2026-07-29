@@ -177,6 +177,42 @@ class Sandbox internal constructor(
         fun resumer(): Resumer = Resumer()
 
         /**
+         * Public entry point for wrappers to report sandbox.create telemetry.
+         *
+         * When a wrapper layer (e.g. AONE SDK) sets `skipHealthCheck=true` on the
+         * builder/connector/resumer, the SDK suppresses its automatic telemetry
+         * reporting so the wrapper owns the timing. The wrapper then calls this
+         * method after its own readiness checks to submit the complete
+         * `sandbox.create` latency event.
+         *
+         * This method never throws and never blocks the caller. It is safe to call
+         * from both Java and Kotlin. Each invocation enqueues one metrics event;
+         * callers should report exactly once per create attempt.
+         *
+         * @param connectionConfig connection configuration (used for URL, headers, opt-out)
+         * @param sandboxId optional created sandbox ID
+         * @param image optional image or snapshot reference
+         * @param createDurationMs measured end-to-end create latency in milliseconds
+         * @param success whether the full create flow succeeded
+         */
+        @JvmStatic
+        fun reportCreateMetrics(
+            connectionConfig: ConnectionConfig,
+            sandboxId: String?,
+            image: String?,
+            createDurationMs: Long,
+            success: Boolean,
+        ) {
+            LifecycleMetricsReporter.reportSandboxCreate(
+                connectionConfig = connectionConfig,
+                sandboxId = sandboxId,
+                image = image,
+                createDurationMs = createDurationMs,
+                success = success,
+            )
+        }
+
+        /**
          * Initialization result indicating the type of sandbox being initialized.
          */
         private sealed class InitializationResult {
@@ -374,22 +410,26 @@ class Sandbox internal constructor(
                         createdSandboxId = response.id
                         InitializationResult.NewSandbox(response.id)
                     }
-                LifecycleMetricsReporter.reportSandboxCreate(
-                    connectionConfig = connectionConfig,
-                    sandboxId = sandbox.id,
-                    image = startupSource,
-                    createDurationMs = elapsedMillis(started),
-                    success = true,
-                )
+                if (!skipHealthCheck) {
+                    LifecycleMetricsReporter.reportSandboxCreate(
+                        connectionConfig = connectionConfig,
+                        sandboxId = sandbox.id,
+                        image = startupSource,
+                        createDurationMs = elapsedMillis(started),
+                        success = true,
+                    )
+                }
                 return sandbox
             } catch (e: Throwable) {
-                LifecycleMetricsReporter.reportSandboxCreate(
-                    connectionConfig = connectionConfig,
-                    sandboxId = createdSandboxId,
-                    image = startupSource,
-                    createDurationMs = elapsedMillis(started),
-                    success = false,
-                )
+                if (!skipHealthCheck) {
+                    LifecycleMetricsReporter.reportSandboxCreate(
+                        connectionConfig = connectionConfig,
+                        sandboxId = createdSandboxId,
+                        image = startupSource,
+                        createDurationMs = elapsedMillis(started),
+                        success = false,
+                    )
+                }
                 throw e
             }
         }
