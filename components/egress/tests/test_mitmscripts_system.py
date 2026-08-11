@@ -852,5 +852,54 @@ class SystemAddonNpmScopedPackageTest(unittest.TestCase):
         self.assertNotIn("Authorization", flow.request.headers._values)
 
 
+class SystemAddonTlsClientHelloTest(unittest.TestCase):
+    def _client_hello_data(self, sni: str | None) -> Any:
+        class _ClientHello:
+            def __init__(self, sni: str | None) -> None:
+                self.sni = sni
+
+        class _Data:
+            def __init__(self, sni: str | None) -> None:
+                self.client_hello = _ClientHello(sni)
+                self.ignore_connection = False
+
+        return _Data(sni)
+
+    def test_no_sni_passes_through(self) -> None:
+        """Connections without SNI cannot be MITM'd (upstream hostname
+        verification would fall back to the IP) and must pass through."""
+        system = _load_system_module()
+        data = self._client_hello_data(None)
+        system.tls_clienthello(data)
+        self.assertTrue(data.ignore_connection)
+
+    def test_no_sni_passes_through_even_with_patterns(self) -> None:
+        system = _load_system_module()
+        system.ctx.options.ignore_hosts = [r".*\.oss[-a-z0-9]*\.aliyuncs\.com"]
+        data = self._client_hello_data(None)
+        system.tls_clienthello(data)
+        self.assertTrue(data.ignore_connection)
+
+    def test_sni_matching_ignore_hosts_passes_through(self) -> None:
+        system = _load_system_module()
+        system.ctx.options.ignore_hosts = [r".*\.oss[-a-z0-9]*\.aliyuncs\.com"]
+        data = self._client_hello_data("taskline-oss-daily.oss-cn-wulanchabu.aliyuncs.com")
+        system.tls_clienthello(data)
+        self.assertTrue(data.ignore_connection)
+
+    def test_sni_not_matching_keeps_connection(self) -> None:
+        system = _load_system_module()
+        system.ctx.options.ignore_hosts = [r".*\.oss[-a-z0-9]*\.aliyuncs\.com"]
+        data = self._client_hello_data("dashscope.aliyuncs.com")
+        system.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+
+    def test_empty_patterns_keeps_sni_connection(self) -> None:
+        system = _load_system_module()
+        data = self._client_hello_data("example.com")
+        system.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
+
+
 if __name__ == "__main__":
     unittest.main()
