@@ -111,6 +111,33 @@ def validate_tenant_namespaces(
     logger.info("Validated %d tenant namespace(s) at startup", len(checked))
 
 
+def validate_tenant_namespaces_on_startup(provider, core_v1_api) -> None:
+    """Validate tenant namespaces at startup if the provider can enumerate them.
+
+    Enforces the OSEP-0014 fail-fast requirement that all tenant namespaces
+    exist and are accessible before the server accepts traffic. Providers that
+    resolve tenants per API key (e.g. the HTTP provider) cannot enumerate all
+    tenants at startup; validating their empty set would silently report
+    success, so validation is skipped with a warning instead.
+
+    Args:
+        provider: The configured tenant provider.
+        core_v1_api: A Kubernetes ``CoreV1Api`` used to read namespaces.
+
+    Raises:
+        ValueError: If any tenant namespace is missing or inaccessible (for
+            enumerable providers).
+    """
+    if not getattr(provider, "supports_enumeration", True):
+        logger.warning(
+            "Skipping tenant namespace startup validation: the tenant provider "
+            "cannot enumerate all tenants. Ensure tenant namespaces exist and "
+            "are accessible before issuing tenant API keys."
+        )
+        return
+    validate_tenant_namespaces(provider.list_tenants(), core_v1_api)
+
+
 __all__ = [
     "TenantEntry",
     "TenantProvider",
@@ -125,4 +152,5 @@ __all__ = [
     "resolve_tenants_path",
     "validate_tenant_config",
     "validate_tenant_namespaces",
+    "validate_tenant_namespaces_on_startup",
 ]

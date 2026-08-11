@@ -25,6 +25,7 @@ import pytest
 from opensandbox_server.tenants import (
     validate_tenant_config,
     validate_tenant_namespaces,
+    validate_tenant_namespaces_on_startup,
 )
 from opensandbox_server.tenants.context import get_current_tenant, set_current_tenant
 from opensandbox_server.tenants.file_provider import (
@@ -559,3 +560,63 @@ def test_validate_tenant_namespaces_aggregates_failures():
     message = str(exc_info.value)
     assert "missing-1" in message
     assert "missing-2" in message
+
+
+# --- validate_tenant_namespaces_on_startup ---
+
+
+def test_startup_validation_file_provider_validates(tmp_path):
+    f = tmp_path / "tenants.toml"
+    f.write_text(SAMPLE_TOML)
+    provider = FileTenantProvider(f)
+    provider.start()
+    try:
+        assert provider.supports_enumeration
+        core_v1 = MagicMock()
+        validate_tenant_namespaces_on_startup(provider, core_v1)
+        assert core_v1.read_namespace.call_count == 2
+    finally:
+        provider.close()
+
+
+def test_startup_validation_file_provider_missing_raises(tmp_path):
+    from kubernetes.client import ApiException
+
+    f = tmp_path / "tenants.toml"
+    f.write_text(SAMPLE_TOML)
+    provider = FileTenantProvider(f)
+    provider.start()
+    try:
+        core_v1 = MagicMock()
+        core_v1.read_namespace.side_effect = ApiException(status=404)
+        with pytest.raises(ValueError, match="does not exist"):
+            validate_tenant_namespaces_on_startup(provider, core_v1)
+    finally:
+        provider.close()
+
+
+def test_startup_validation_http_provider_skipped_with_warning(monkeypatch):
+    cfg = HTTPTenantProviderConfig(endpoint="http://localhost:9999/tenants")
+    provider = HTTPTenantProvider(cfg)
+    provider.start()
+    try:
+        assert not provider.supports_enumeration
+        core_v1 = MagicMock()
+
+        warnings = []
+
+        def _capture_warning(message: str, *args) -> None:
+            warnings.append(message % args)
+
+        monkeypatch.setattr(
+            "opensandbox_server.tenants.logger.warning",
+            _capture_warning,
+        )
+        validate_tenant_namespaces_on_startup(provider, core_v1)
+        core_v1.read_namespace.assert_not_called()
+        assert any(
+            "Skipping tenant namespace startup validation" in message
+            for message in warnings
+        )
+    finally:
+        provider.close()
