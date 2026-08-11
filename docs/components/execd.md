@@ -18,6 +18,22 @@ cd components/execd
 make build
 ```
 
+On Linux, `make build` uses the native C compiler and static libc to produce
+`bin/opensandbox-session-gate`. The published execd image already installs
+this helper. If you run execd from a source build and need isolated sessions,
+install it at the fixed trusted runtime path first:
+
+```bash
+make build-session-gate
+sudo make install-session-gate
+# /opt/opensandbox/opensandbox-session-gate (mode 0555)
+```
+
+Compilation runs before privilege escalation; the install target only copies
+the built helper. Keep `/opt/opensandbox` and the helper root-owned and not
+group- or world-writable. Other execd APIs still work without it, but
+isolated-session capability probing and creation fail closed.
+
 ### 2) Start Jupyter Server
 
 ```bash
@@ -86,6 +102,13 @@ binary), while `userns` applies the UID/GID mapping and the setuid-aware
 execd's own is checked against a separate startup identity-switch probe and
 returns `503 NOT_SUPPORTED` before session side effects when that switch is not
 available.
+
+For a private-network Session (`share_net: false`), execd fixes the
+authenticated network namespace and its owning user namespace before the
+native workload gate is released. The two namespace bind mounts use an
+execd-owned, unpredictable directory below `/run/execd/namespaces` and stay
+owned by the Session until synchronous teardown. This applies to both UID
+modes; shared-network Sessions do not create namespace pins.
 
 ### Bind mounts
 

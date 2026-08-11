@@ -40,6 +40,22 @@ from opensandbox_server.tenants import (
     TenantProvider,
 )
 
+# The deployed package version, resolved at runtime from installed metadata.
+# Exposed via GET /version (not /openapi.json). Mirrors
+# cli/src/opensandbox_cli/__init__.py; falls back when the package metadata is
+# unavailable (e.g. running from a source checkout without install).
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("opensandbox-server")
+except Exception:
+    __version__ = "0.0.0-dev"
+
+# info.version in /openapi.json and /docs is the API *contract* version, not the
+# package/release version. Keep it in sync with specs/sandbox-lifecycle.yml
+# (info.version); specs/* are the public contract source of truth (AGENTS.md).
+API_CONTRACT_VERSION = "0.1.0"
+
 # Load configuration before initializing routers/middleware
 app_config = load_config()
 _log_config = configure_logging(app_config.log)
@@ -177,7 +193,7 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI application
 app = FastAPI(
     title="OpenSandbox Lifecycle API",
-    version="0.1.0",
+    version=API_CONTRACT_VERSION,
     description="The Sandbox Lifecycle API coordinates how untrusted workloads are created, "
                 "executed, paused, resumed, and finally disposed.",
     docs_url="/docs",
@@ -254,6 +270,17 @@ async def health_check():
         dict: Health status
     """
     return {"status": "healthy"}
+
+
+@app.get("/version")
+async def version_info():
+    """
+    Return the deployed server package version (resolved from installed metadata).
+
+    Returns:
+        dict: Package version
+    """
+    return {"version": __version__}
 
 
 if __name__ == "__main__":
