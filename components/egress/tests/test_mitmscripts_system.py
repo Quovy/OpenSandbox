@@ -103,7 +103,9 @@ class _Flow:
 
 def _load_system_module() -> Any:
     mitmproxy = types.ModuleType("mitmproxy")
-    mitmproxy.ctx = types.SimpleNamespace(log=_Log(), options=types.SimpleNamespace(ignore_hosts=[]))
+    mitmproxy.ctx = types.SimpleNamespace(
+        log=_Log(), options=types.SimpleNamespace(ignore_hosts=[], ssl_insecure=False)
+    )
     def _make_response(status: int, body: bytes = b"", headers: dict | None = None):
         resp = _Response()
         resp.status_code = status
@@ -879,6 +881,15 @@ class SystemAddonTlsClientHelloTest(unittest.TestCase):
         data = self._client_hello_data(None)
         system.tls_clienthello(data)
         self.assertTrue(data.ignore_connection)
+
+    def test_no_sni_keeps_mitm_when_ssl_insecure_enabled(self) -> None:
+        """The explicit insecure-MITM escape hatch (SSL_INSECURE) must keep
+        working for no-SNI clients, so pass-through is skipped."""
+        system = _load_system_module()
+        system.ctx.options.ssl_insecure = True
+        data = self._client_hello_data(None)
+        system.tls_clienthello(data)
+        self.assertFalse(data.ignore_connection)
 
     def test_sni_matching_ignore_hosts_passes_through(self) -> None:
         system = _load_system_module()

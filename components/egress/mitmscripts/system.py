@@ -37,6 +37,8 @@
 #      upstream hostname verification falls back to the destination IP, which
 #      fails for any public certificate lacking an IP SAN (hostname mismatch),
 #      so every no-SNI connection would otherwise become a broken MITM attempt.
+#      Pass-through is skipped when ssl_insecure is enabled, keeping the
+#      explicit insecure-MITM escape hatch working for no-SNI clients.
 #      TCP-layer enforcement (deny/allow rules) still applies to these flows.
 #
 # User-defined addons can be loaded alongside this script via
@@ -119,11 +121,15 @@ def tls_clienthello(data: ClientHelloData) -> None:
     verification falls back to the destination IP, which fails for any public
     certificate without an IP SAN (hostname mismatch), turning every no-SNI
     connection into a broken MITM attempt. Such connections are passed through
-    untouched; TCP-layer enforcement (deny/allow rules) still applies.
+    untouched, unless the operator explicitly opted into insecure upstream
+    verification (OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE), in which case
+    MITM remains possible and the escape hatch keeps working. TCP-layer
+    enforcement (deny/allow rules) still applies.
     """
     sni = data.client_hello.sni
     if not sni:
-        data.ignore_connection = True
+        if not ctx.options.ssl_insecure:
+            data.ignore_connection = True
         return
 
     patterns = ctx.options.ignore_hosts
