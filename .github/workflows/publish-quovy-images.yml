@@ -1,0 +1,178 @@
+name: Publish Quovy OpenSandbox images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-quovy-images.yml
+      - kubernetes/Dockerfile.image-committer
+      - kubernetes/cmd/image-committer/**
+      - kubernetes/go.mod
+      - kubernetes/go.sum
+      - server/Dockerfile
+      - server/egress/**
+      - server/pyproject.toml
+      - server/uv.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: publish-quovy-opensandbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, scan, and sign ${{ matrix.name }}
+    if: github.repository == 'Quovy/OpenSandbox'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            context: server
+            dockerfile: server/Dockerfile
+            repository: opensandbox-server
+          - name: egress
+            context: server/egress
+            dockerfile: server/egress/Dockerfile
+            repository: opensandbox-egress
+          - name: image-committer
+            context: kubernetes
+            dockerfile: kubernetes/Dockerfile.image-committer
+            repository: opensandbox-image-committer
+    env:
+      IMAGE_REF: ghcr.io/quovy/${{ matrix.repository }}
+      COSIGN_CERTIFICATE_IDENTITY: https://github.com/Quovy/OpenSandbox/.github/workflows/publish-quovy-images.yml@refs/heads/main
+      COSIGN_VERIFICATION_OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - name: Check out maintained source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and publish immutable candidate
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_REF }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan amd64 image and record High/Critical findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          version: v0.66.0
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: json
+          output: trivy-${{ matrix.name }}-amd64.json
+          exit-code: '0'
+
+      - name: Block Critical findings on amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          version: v0.66.0
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: CRITICAL
+          format: table
+          exit-code: '1'
+
+      - name: Scan arm64 image and record High/Critical findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          version: v0.66.0
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: json
+          output: trivy-${{ matrix.name }}-arm64.json
+          exit-code: '0'
+
+      - name: Block Critical findings on arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          version: v0.66.0
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: CRITICAL
+          format: table
+          exit-code: '1'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign and verify the scanned digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest_ref="${IMAGE_REF}@${IMAGE_DIGEST}"
+          cosign sign --yes "$digest_ref"
+          cosign verify \
+            --certificate-identity "$COSIGN_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_VERIFICATION_OIDC_ISSUER" \
+            "$digest_ref" > "cosign-${{ matrix.name }}.json"
+
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opensandbox-${{ matrix.name }}-${{ github.sha }}
+          path: |
+            trivy-${{ matrix.name }}-amd64.json
+            trivy-${{ matrix.name }}-arm64.json
+            cosign-${{ matrix.name }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize immutable publication
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Image: \`${IMAGE_REF}@${IMAGE_DIGEST}\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Critical gate: passed on both platforms"
+            echo "- Signature: verified against the exact main-branch workflow identity"
+            echo "- Full High/Critical reports: attached as workflow artifacts"
+          } >> "$GITHUB_STEP_SUMMARY"
