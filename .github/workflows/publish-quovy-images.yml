@@ -10,7 +10,7 @@ on:
       - kubernetes/go.mod
       - kubernetes/go.sum
       - server/Dockerfile
-      - server/egress/**
+      - components/egress/**
       - server/pyproject.toml
       - server/uv.lock
   workflow_dispatch:
@@ -38,8 +38,8 @@ jobs:
             dockerfile: server/Dockerfile
             repository: opensandbox-server
           - name: egress
-            context: server/egress
-            dockerfile: server/egress/Dockerfile
+            context: components/egress
+            dockerfile: components/egress/Dockerfile
             repository: opensandbox-egress
           - name: image-committer
             context: kubernetes
