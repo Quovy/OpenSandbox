@@ -674,7 +674,10 @@ func (p *DefaultSandboxPool) Snapshot(ctx context.Context) (*PoolSnapshot, error
 	var backoffActive bool
 	var lastError string
 	if recon != nil {
-		_, failureCount, backoffActive, lastError = recon.snapshot()
+		// Use the refreshed health state from the reconcile state machine (which prunes the
+		// failure window and runs recovery on read) instead of the cached p.healthState, so
+		// the snapshot never reports DEGRADED alongside a fresh failureCount/backoffActive.
+		hs, failureCount, backoffActive, lastError = recon.snapshot()
 	}
 
 	return &PoolSnapshot{

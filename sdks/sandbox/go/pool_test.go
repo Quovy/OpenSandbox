@@ -758,6 +758,56 @@ func TestPool_Snapshot(t *testing.T) {
 	}
 }
 
+func TestPool_SnapshotReflectsRefreshedHealth(t *testing.T) {
+	// Regression: Snapshot() must return the refreshed reconcile health state, not the
+	// cached p.healthState, so it never pairs stale DEGRADED with fresh failure/backoff.
+	execdSrv := newMockExecdServer(t)
+	lifecycleSrv := newMockLifecycleServer(t, execdSrv.URL)
+
+	pool := newTestPool(t, lifecycleSrv.URL)
+	ctx := context.Background()
+
+	err := pool.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer pool.Shutdown(ctx, false)
+
+	// Drive the reconcile state into DEGRADED without waiting for a reconcile tick.
+	pool.reconciler.recordFailures(3, errors.New("boom"))
+	snap, err := pool.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	if snap.HealthState != PoolDegraded {
+		t.Errorf("HealthState = %v, want DEGRADED", snap.HealthState)
+	}
+	if !snap.BackoffActive {
+		t.Errorf("BackoffActive = false, want true")
+	}
+
+	// Drain the failure window and expire the backoff: the snapshot read path must recover
+	// the pool by itself (no reconcile tick involved).
+	pool.reconciler.mu.Lock()
+	pool.reconciler.failureTimes = nil
+	pool.reconciler.backoffUntil = time.Now().Add(-time.Second)
+	pool.reconciler.mu.Unlock()
+
+	snap, err = pool.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	if snap.HealthState != PoolHealthy {
+		t.Errorf("HealthState = %v, want HEALTHY after window drain", snap.HealthState)
+	}
+	if snap.FailureCount != 0 {
+		t.Errorf("FailureCount = %d, want 0 after window drain", snap.FailureCount)
+	}
+	if snap.BackoffActive {
+		t.Errorf("BackoffActive = true, want false after window drain")
+	}
+}
+
 func TestPool_SnapshotIdleEntries(t *testing.T) {
 	execdSrv := newMockExecdServer(t)
 	lifecycleSrv := newMockLifecycleServer(t, execdSrv.URL)
