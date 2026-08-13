@@ -41,6 +41,7 @@ from opensandbox.pool import (
     PooledSandboxCreateReason,
     SandboxPoolAsync,
 )
+from opensandbox.pool_types import PoolState
 
 
 @pytest.mark.asyncio
@@ -210,9 +211,12 @@ async def test_async_reconcile_batch_failures_only_advance_backoff_once() -> Non
 
     assert state.failure_count == 10
     assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=29))
+    # The window is still hot when the 30s backoff expires, so the pool stays paused.
+    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=31))
     assert not state.is_backoff_active(
-        datetime.now(timezone.utc) + timedelta(seconds=31)
+        datetime.now(timezone.utc) + timedelta(seconds=92)
     )
+    assert state.state == PoolState.HEALTHY
 
 
 @pytest.mark.asyncio

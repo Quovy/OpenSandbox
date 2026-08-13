@@ -40,22 +40,28 @@ from opensandbox.pool import (
     PooledSandboxCreateContext,
     PooledSandboxCreateReason,
 )
+from opensandbox.pool_types import PoolState
 from opensandbox.sync.pool import SandboxPoolSync
 
 
-def test_degraded_backoff_caps_at_one_day() -> None:
+def test_sustained_failures_keep_backoff_active_until_drain() -> None:
     state = ReconcileState(degraded_threshold=1)
 
-    for _ in range(20):
+    for _ in range(5000):
         state.record_failure("boom")
 
-    assert state.failure_count == 20
-    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(hours=23))
+    assert state.state == PoolState.DEGRADED
+    assert state.is_backoff_active()
+    # Once failures stop, the pool stays paused until the failure window drains.
     assert not state.is_backoff_active(datetime.now(timezone.utc) + timedelta(hours=25))
+    assert state.state == PoolState.HEALTHY
+    assert state.failure_count == 0
 
 
 def test_degraded_backoff_starts_at_thirty_seconds() -> None:
-    state = ReconcileState(degraded_threshold=1)
+    state = ReconcileState(
+        degraded_threshold=1, failure_window=timedelta(milliseconds=1)
+    )
 
     state.record_failure("boom")
 
@@ -63,6 +69,22 @@ def test_degraded_backoff_starts_at_thirty_seconds() -> None:
     assert not state.is_backoff_active(
         datetime.now(timezone.utc) + timedelta(seconds=31)
     )
+
+
+def test_backoff_renews_while_window_hot_and_recovers_after_drain() -> None:
+    state = ReconcileState(degraded_threshold=1)
+
+    state.record_failure("boom")
+
+    # The 30s backoff expires at t=30, but the failure is still inside the 60s window,
+    # so the backoff is renewed (t=30 -> t=91) and the pool stays paused.
+    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=31))
+    assert not state.is_backoff_active(
+        datetime.now(timezone.utc) + timedelta(seconds=92)
+    )
+    assert state.state == PoolState.HEALTHY
+    assert state.failure_count == 0
+    assert state.last_error is None
 
 
 def test_reconcile_batch_failures_only_advance_backoff_once() -> None:
@@ -93,9 +115,52 @@ def test_reconcile_batch_failures_only_advance_backoff_once() -> None:
 
     assert state.failure_count == 10
     assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=29))
+    # The window is still hot when the 30s backoff expires, so the pool stays paused.
+    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=31))
     assert not state.is_backoff_active(
-        datetime.now(timezone.utc) + timedelta(seconds=31)
+        datetime.now(timezone.utc) + timedelta(seconds=92)
     )
+    assert state.state == PoolState.HEALTHY
+
+
+def test_interleaved_creates_trigger_degraded_backoff() -> None:
+    # Regression: with the old consecutive-failure counter, every successful warmup reset
+    # the failure count, so a pool with interleaved successes and failures never degraded.
+    # Detection must be rate-based over a sliding window instead.
+    store = InMemoryPoolStateStore()
+    config = PoolConfig(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=5,
+        warmup_concurrency=4,
+        state_store=store,
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        degraded_threshold=3,
+    )
+    state = ReconcileState(degraded_threshold=3)
+    attempts = {"count": 0}
+
+    def flaky_create() -> str:
+        n = attempts["count"]
+        attempts["count"] += 1
+        if n % 2 == 0:
+            raise RuntimeError("boom")
+        return f"sbx-{n}"
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for _ in range(3):
+            run_reconcile_tick(
+                config=config,
+                state_store=store,
+                create_one=flaky_create,
+                on_discard_sandbox=lambda _sandbox_id: None,
+                reconcile_state=state,
+                warmup_executor=executor,
+            )
+
+    assert state.state == PoolState.DEGRADED
+    assert state.is_backoff_active()
 
 
 def test_acquire_fail_fast_empty_raises_pool_empty() -> None:

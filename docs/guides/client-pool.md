@@ -49,10 +49,30 @@ because it is the only part of the pool that is gated by a distributed lock:
 ### Lifecycle model
 
 Each pool instance moves through `NOT_STARTED → STARTING → RUNNING → DRAINING → STOPPED`.
-Health is tracked separately as `HEALTHY | DEGRADED | DRAINING | STOPPED`; after
-`degraded_threshold` consecutive create failures the pool enters `DEGRADED` and applies
-exponential backoff before retrying warmup. Callers do not need to observe these states
-directly — `snapshot()` exposes them for diagnostics.
+Health is tracked separately as `HEALTHY | DEGRADED | DRAINING | STOPPED`. Create failures
+are counted inside a sliding time window (`failure_window`): once `degraded_threshold`
+failures fall inside the window, the pool enters `DEGRADED` and applies exponential backoff
+before retrying warmup. Detection is rate-based — a successful create never resets the
+window, so a pool with a sustained high failure rate stays paused even when successes are
+interleaved. The pool returns to `HEALTHY` only once the window drains and no backoff is
+active. Callers do not need to observe these states directly — `snapshot()` exposes them
+for diagnostics.
+
+::: warning Behavior change from the next release
+Starting with the next release after Kotlin `java/sandbox` v1.0.18, Go `sdks/sandbox/go`
+v1.0.5, and Python `opensandbox` v0.1.15, degraded detection changes from **consecutive**
+failures (any success reset the count) to **rate-based** detection over the sliding
+`failure_window` (default `60 s`). Concretely:
+
+- A successful warmup no longer resets the failure count or cancels an active backoff.
+- While `DEGRADED`, an expired backoff window is renewed automatically as long as the
+  failure window is still hot — the pool stays paused until the failure rate actually
+  drops below the threshold, instead of retrying every backoff step.
+- Recovery is time-based: the pool returns to `HEALTHY` when the failure window drains.
+- The new `failure_window` knob (default `60 s`) is added to all three SDKs; the existing
+  `degraded_threshold` semantics change from "consecutive failures" to "failures inside
+  the window".
+:::
 
 ![Client pool lifecycle state machine](/images/client-pool-lifecycle.svg)
 
@@ -97,7 +117,8 @@ canonical reference; refer to the per-language builder or constructor for exact 
 | `warmup_concurrency`                  | `max(1, ceil(max_idle * 0.2))`     | Warmup worker pool size                                                          |
 | `primary_lock_ttl`                    | `60 s`                             | Leader-lock TTL; must exceed `warmup_ready_timeout` + preparer time              |
 | `reconcile_interval`                  | `30 s`                             | Interval between reconcile ticks                                                 |
-| `degraded_threshold`                  | `3`                                | Consecutive create failures before entering `DEGRADED` with backoff              |
+| `degraded_threshold`                  | `3`                                | Create failures inside `failure_window` before entering `DEGRADED` with backoff |
+| `failure_window`                      | `60 s`                             | Sliding time window over which create failures are counted for degraded detection |
 | `acquire_ready_timeout`               | `30 s`                             | Max wait for the returned sandbox to become ready                                |
 | `acquire_health_check_polling_interval` | `200 ms`                         | Ready-poll interval during acquire                                               |
 | `acquire_health_check`                | `null`                             | Custom readiness predicate for acquire                                           |
@@ -277,7 +298,7 @@ _ = result
 Every SDK exposes read-only accessors:
 
 - `snapshot()` — pool phase, health, counters (idle size, in-flight warmups,
-  consecutive failures, last error).
+  failures inside the sliding window, last error).
 - `snapshot_idle_entries()` — the current idle sandbox IDs with expiry timestamps.
 - `resize(max_idle)` — change the target buffer size at runtime.
 - `release_all_idle()` — drain the currently visible idle buffer and best-effort kill

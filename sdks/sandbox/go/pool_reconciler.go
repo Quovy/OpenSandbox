@@ -24,36 +24,45 @@ import (
 const (
 	reconcileBackoffBase = 30 * time.Second
 	reconcileMaxBackoff  = 24 * time.Hour
+	// defaultFailureWindow is the default sliding time window over which create
+	// failures are counted for degraded detection.
+	defaultFailureWindow = 60 * time.Second
 )
 
 // reconcileState tracks the health and backoff state of the reconcile loop.
+//
+// Degradation is detected by failure *rate* rather than consecutive failures: every failure is
+// recorded with a timestamp and ages out of failureWindow. The pool enters PoolDegraded and opens
+// an exponential backoff window once degradedThreshold failures are present inside the window.
+// Successful creates never reset the window (recovery is time-based, not success-based), and an
+// active backoff window is never cancelled by a success.
+//
+// While PoolDegraded, an expired backoff window is renewed automatically whenever the failure
+// window is still hot, so the pool stays paused until the failure rate actually drops below the
+// threshold. The pool returns to PoolHealthy only once the failure window drains and no backoff
+// is active.
 type reconcileState struct {
 	mu                sync.Mutex
 	degradedThreshold int
+	failureWindow     time.Duration
 	failureCount      int
+	failureTimes      []time.Time
 	backoffAttempts   int
 	backoffUntil      time.Time
 	lastError         string
 	healthState       PoolHealthState
+	now               func() time.Time
 }
 
-// newReconcileState creates a new reconcileState with the given degraded threshold.
+// newReconcileState creates a new reconcileState with the given degraded threshold and the
+// default failure window.
 func newReconcileState(degradedThreshold int) *reconcileState {
 	return &reconcileState{
 		degradedThreshold: degradedThreshold,
+		failureWindow:     defaultFailureWindow,
 		healthState:       PoolHealthy,
+		now:               time.Now,
 	}
-}
-
-// recordSuccess resets the failure state and marks the pool as healthy.
-func (s *reconcileState) recordSuccess() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.failureCount = 0
-	s.backoffAttempts = 0
-	s.backoffUntil = time.Time{}
-	s.lastError = ""
-	s.healthState = PoolHealthy
 }
 
 // recordFailure records a single failure. Delegates to recordFailures.
@@ -61,49 +70,100 @@ func (s *reconcileState) recordFailure(err error) {
 	s.recordFailures(1, err)
 }
 
-// recordFailures records count failures in one call. If the cumulative count
-// reaches or exceeds the degraded threshold, the pool transitions to degraded
-// state and backoffAttempts is incremented (escalating the backoff duration).
-// In production, this is called once per reconcile tick, so backoff escalates
-// per failing tick, not per individual failed sandbox creation.
+// recordFailures records count failures in one call. Failures are recorded with the current
+// timestamp and age out of the sliding failureWindow; the pool transitions to degraded and opens
+// an exponential backoff window when the windowed count reaches or exceeds the degraded
+// threshold. Failures recorded while a backoff window is already active do not advance the
+// exponential delay (only the counter and last error are updated).
 func (s *reconcileState) recordFailures(count int, err error) {
 	if count <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.failureCount += count
+	now := s.now()
+	for i := 0; i < count; i++ {
+		s.failureTimes = append(s.failureTimes, now)
+	}
+	s.pruneExpired(now)
 	if err != nil {
 		s.lastError = err.Error()
 	}
-	if s.failureCount >= s.degradedThreshold {
-		s.healthState = PoolDegraded
-		s.backoffAttempts++
-		shift := s.backoffAttempts - 1
-		if shift > 15 {
-			shift = 15
-		}
-		backoff := reconcileBackoffBase * (1 << shift)
-		if backoff > reconcileMaxBackoff {
-			backoff = reconcileMaxBackoff
-		}
-		s.backoffUntil = time.Now().Add(backoff)
+	if s.failureCount < s.degradedThreshold {
+		return
 	}
+	if s.healthState == PoolDegraded && !s.backoffUntil.IsZero() && now.Before(s.backoffUntil) {
+		return
+	}
+	s.activateNextBackoff(now)
 }
 
 // shouldBackoff returns true if the reconciler is in a backoff period.
+//
+// Advances the state machine on the read path: while PoolDegraded, an expired backoff window is
+// renewed when the failure window is still hot, so the pool stays paused until the failure rate
+// falls below the threshold; once the failure window drains and no backoff is active, the pool
+// recovers to PoolHealthy.
 func (s *reconcileState) shouldBackoff() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return time.Now().Before(s.backoffUntil)
+	now := s.now()
+	s.pruneExpired(now)
+	if s.healthState != PoolDegraded || s.backoffUntil.IsZero() {
+		return false
+	}
+	if now.Before(s.backoffUntil) {
+		return true
+	}
+	if s.failureCount >= s.degradedThreshold {
+		s.activateNextBackoff(now)
+		return true
+	}
+	s.recover()
+	return false
 }
 
 // snapshot returns a point-in-time view of the reconcile health state.
 func (s *reconcileState) snapshot() (PoolHealthState, int, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	backoffActive := time.Now().Before(s.backoffUntil)
+	backoffActive := s.healthState == PoolDegraded &&
+		!s.backoffUntil.IsZero() && s.now().Before(s.backoffUntil)
 	return s.healthState, s.failureCount, backoffActive, s.lastError
+}
+
+func (s *reconcileState) activateNextBackoff(now time.Time) {
+	s.healthState = PoolDegraded
+	s.backoffAttempts++
+	shift := s.backoffAttempts - 1
+	if shift > 30 {
+		shift = 30
+	}
+	backoff := reconcileBackoffBase * (1 << shift)
+	if backoff > reconcileMaxBackoff {
+		backoff = reconcileMaxBackoff
+	}
+	s.backoffUntil = now.Add(backoff)
+}
+
+func (s *reconcileState) recover() {
+	s.healthState = PoolHealthy
+	s.backoffUntil = time.Time{}
+	s.backoffAttempts = 0
+	s.lastError = ""
+}
+
+func (s *reconcileState) pruneExpired(now time.Time) {
+	cutoff := now.Add(-s.failureWindow)
+	kept := 0
+	for _, ts := range s.failureTimes {
+		if !ts.Before(cutoff) {
+			s.failureTimes[kept] = ts
+			kept++
+		}
+	}
+	s.failureTimes = s.failureTimes[:kept]
+	s.failureCount = kept
 }
 
 // reconcileTick performs a single reconciliation pass. It is designed to be
@@ -207,7 +267,9 @@ func reconcileTick(
 			removedCount++
 		}
 		if !shrinkErr && removedCount > 0 {
-			state.recordSuccess()
+			logger.Debug("reconcile: shrunk excess idle",
+				"pool_name", poolName,
+				"removed", removedCount)
 		}
 		return
 	}
@@ -282,7 +344,8 @@ func reconcileTick(
 		state.recordFailures(failCount, lastCreateErr)
 	}
 
-	// Place created sandboxes into idle pool; record success per-putIdle.
+	// Place created sandboxes into idle pool. Successful puts do not reset the failure
+	// window; recovery is time-based (see reconcileState).
 	for i, id := range createdIDs {
 		renewed, renewErr := store.RenewPrimaryLock(ctx, poolName, ownerID, lockTTL)
 		if renewErr != nil || !renewed {
@@ -309,7 +372,6 @@ func reconcileTick(
 				"orphan_count", len(createdIDs)-i)
 			return
 		}
-		state.recordSuccess()
 	}
 
 	if len(createdIDs) > 0 {

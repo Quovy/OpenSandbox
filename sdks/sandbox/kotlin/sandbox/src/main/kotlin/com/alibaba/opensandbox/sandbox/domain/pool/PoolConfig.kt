@@ -37,7 +37,12 @@ import kotlin.math.ceil
  * @property sandboxCreator Optional custom creator for pool-created sandboxes. When absent, the pool uses
  * [creationSpec] and the standard sandbox lifecycle API.
  * @property reconcileInterval Interval between reconcile ticks (default: 30s).
- * @property degradedThreshold Consecutive create failures required to transition to DEGRADED (default: 3).
+ * @property degradedThreshold Create failures inside [failureWindow] required to transition to DEGRADED
+ * (default: 3). Failures are counted in a sliding time window, not consecutively, so interleaved
+ * successful creates do not reset the count.
+ * @property failureWindow Sliding time window over which create failures are counted for degraded
+ * detection (default: 60s). A pool enters DEGRADED when at least [degradedThreshold] failures fall
+ * inside the window, and remains paused until the window no longer contains that many failures.
  * @property acquireReadyTimeout Max time to wait for a sandbox returned by acquire to become ready (default: 30s).
  * @property acquireHealthCheckPollingInterval Poll interval while waiting for a sandbox returned by acquire to become
  * ready (default: 200ms).
@@ -81,6 +86,7 @@ class PoolConfig private constructor(
     val sandboxCreator: PooledSandboxCreator?,
     val reconcileInterval: Duration,
     val degradedThreshold: Int,
+    val failureWindow: Duration,
     val acquireReadyTimeout: Duration,
     val acquireHealthCheckPollingInterval: Duration,
     val acquireHealthCheck: ((Sandbox) -> Boolean)?,
@@ -101,6 +107,7 @@ class PoolConfig private constructor(
         require(maxIdle >= 0) { "maxIdle must be >= 0" }
         require(warmupConcurrency > 0) { "warmupConcurrency must be positive" }
         require(degradedThreshold > 0) { "degradedThreshold must be positive" }
+        require(!failureWindow.isNegative && !failureWindow.isZero) { "failureWindow must be positive" }
         require(!reconcileInterval.isNegative && !reconcileInterval.isZero) { "reconcileInterval must be positive" }
         require(!primaryLockTtl.isNegative && !primaryLockTtl.isZero) { "primaryLockTtl must be positive" }
         require(!acquireReadyTimeout.isNegative && !acquireReadyTimeout.isZero) {
@@ -127,6 +134,7 @@ class PoolConfig private constructor(
         private val DEFAULT_RECONCILE_INTERVAL = Duration.ofSeconds(30)
         private val DEFAULT_PRIMARY_LOCK_TTL = Duration.ofSeconds(60)
         private const val DEFAULT_DEGRADED_THRESHOLD = 3
+        private val DEFAULT_FAILURE_WINDOW = Duration.ofSeconds(60)
         private val DEFAULT_ACQUIRE_READY_TIMEOUT = Duration.ofSeconds(30)
         private val DEFAULT_ACQUIRE_HEALTH_CHECK_POLLING_INTERVAL = Duration.ofMillis(200)
         private val DEFAULT_ACQUIRE_MIN_REMAINING_TTL_CAP: Duration = Duration.ofSeconds(60)
@@ -168,6 +176,7 @@ class PoolConfig private constructor(
             sandboxCreator = sandboxCreator,
             reconcileInterval = reconcileInterval,
             degradedThreshold = degradedThreshold,
+            failureWindow = failureWindow,
             acquireReadyTimeout = acquireReadyTimeout,
             acquireHealthCheckPollingInterval = acquireHealthCheckPollingInterval,
             acquireHealthCheck = acquireHealthCheck,
@@ -196,6 +205,7 @@ class PoolConfig private constructor(
         private var sandboxCreator: PooledSandboxCreator? = null
         private var reconcileInterval: Duration = DEFAULT_RECONCILE_INTERVAL
         private var degradedThreshold: Int = DEFAULT_DEGRADED_THRESHOLD
+        private var failureWindow: Duration = DEFAULT_FAILURE_WINDOW
         private var acquireReadyTimeout: Duration = DEFAULT_ACQUIRE_READY_TIMEOUT
         private var acquireHealthCheckPollingInterval: Duration = DEFAULT_ACQUIRE_HEALTH_CHECK_POLLING_INTERVAL
         private var acquireHealthCheck: ((Sandbox) -> Boolean)? = null
@@ -262,6 +272,16 @@ class PoolConfig private constructor(
 
         fun degradedThreshold(degradedThreshold: Int): Builder {
             this.degradedThreshold = degradedThreshold
+            return this
+        }
+
+        /**
+         * Sets the sliding time window over which create failures are counted for degraded
+         * detection. A pool enters DEGRADED when at least `degradedThreshold` failures fall inside
+         * the window. Must be positive. Default: 60s.
+         */
+        fun failureWindow(failureWindow: Duration): Builder {
+            this.failureWindow = failureWindow
             return this
         }
 
@@ -374,6 +394,7 @@ class PoolConfig private constructor(
                 sandboxCreator = sandboxCreator,
                 reconcileInterval = reconcileInterval,
                 degradedThreshold = degradedThreshold,
+                failureWindow = failureWindow,
                 acquireReadyTimeout = acquireReadyTimeout,
                 acquireHealthCheckPollingInterval = acquireHealthCheckPollingInterval,
                 acquireHealthCheck = acquireHealthCheck,

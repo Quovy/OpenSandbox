@@ -122,7 +122,6 @@ async def _run_primary_replenish_once(
         try:
             await state_store.put_idle(pool_name, sandbox_id)
             created += 1
-            reconcile_state.record_success()
         except Exception as exc:
             reconcile_state.record_failure(str(exc))
             for orphaned_id in created_ids[index:]:

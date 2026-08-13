@@ -127,6 +127,9 @@ func (p *DefaultSandboxPool) Start(ctx context.Context) error {
 			"warmup_ready_timeout", p.config.WarmupReadyTimeout)
 	}
 	p.reconciler = newReconcileState(p.config.DegradedThreshold)
+	if p.config.FailureWindow > 0 {
+		p.reconciler.failureWindow = p.config.FailureWindow
+	}
 	p.ticker = time.NewTicker(p.config.ReconcileInterval)
 	p.done = make(chan struct{})
 	p.doneClosed = false

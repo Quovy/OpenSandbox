@@ -30,51 +30,104 @@ import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 
 class PoolReconcilerStateTest {
+    private class MutableClock(var now: Instant) {
+        fun advance(amount: Duration) {
+            now = now.plus(amount)
+        }
+    }
+
     @Test
-    fun `recordFailure transitions to DEGRADED when failure count reaches threshold`() {
-        val state = ReconcileState(degradedThreshold = 3, backoffBase = Duration.ofMillis(10), backoffMax = Duration.ofSeconds(1))
+    fun `recordFailures transitions to DEGRADED when windowed count reaches threshold`() {
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state =
+            ReconcileState(
+                degradedThreshold = 3,
+                failureWindow = Duration.ofSeconds(60),
+                backoffBase = Duration.ofMillis(10),
+                backoffMax = Duration.ofSeconds(1),
+                clock = { clock.now },
+            )
         state.recordFailure("boom-1")
+        clock.advance(Duration.ofSeconds(1))
         state.recordFailure("boom-2")
         assertEquals(PoolState.HEALTHY, state.state)
         assertFalse(state.isBackoffActive())
 
+        clock.advance(Duration.ofSeconds(1))
         state.recordFailure("boom-3")
         assertEquals(PoolState.DEGRADED, state.state)
         assertEquals(3, state.failureCount)
     }
 
     @Test
-    fun `default degraded backoff caps at one day`() {
-        val state = ReconcileState(degradedThreshold = 1)
+    fun `windowed failures trigger DEGRADED even when spread across the window`() {
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state = ReconcileState(degradedThreshold = 3, clock = { clock.now })
 
-        repeat(20) { state.recordFailure("boom") }
+        state.recordAsyncFailure("boom-1")
+        clock.advance(Duration.ofSeconds(2))
+        state.recordAsyncFailure("boom-2")
+        assertEquals(PoolState.HEALTHY, state.state)
 
+        // The detection window counts failures by rate, not consecutively: a gap of healthy
+        // operation between failures (interleaved successes) does not reset the count.
+        clock.advance(Duration.ofSeconds(2))
+        state.recordAsyncFailure("boom-3")
         assertEquals(PoolState.DEGRADED, state.state)
-        assertEquals(20, state.failureCount)
-        assertEquals(true, state.isBackoffActive(Instant.now().plus(Duration.ofHours(23))))
-        assertFalse(state.isBackoffActive(Instant.now().plus(Duration.ofHours(25))))
+        assertEquals(3, state.failureCount)
     }
 
     @Test
     fun `default degraded backoff starts at thirty seconds`() {
-        val state = ReconcileState(degradedThreshold = 1)
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state = ReconcileState(degradedThreshold = 1, clock = { clock.now })
 
         state.recordFailure("boom")
 
-        assertEquals(true, state.isBackoffActive(Instant.now().plus(Duration.ofSeconds(29))))
-        assertFalse(state.isBackoffActive(Instant.now().plus(Duration.ofSeconds(31))))
+        assertEquals(true, state.isBackoffActive(clock.now.plus(Duration.ofSeconds(29))))
+        // The 30s backoff expires at t=30, but the failure is still inside the 60s window, so
+        // the backoff is renewed (t=30 -> t=91) and the pool stays paused.
+        assertEquals(true, state.isBackoffActive(clock.now.plus(Duration.ofSeconds(31))))
+        assertFalse(state.isBackoffActive(clock.now.plus(Duration.ofSeconds(92))))
+        assertEquals(PoolState.HEALTHY, state.state)
+        assertEquals(0, state.failureCount)
+        assertEquals(null, state.lastError)
     }
 
     @Test
-    fun `rolling failures advance backoff once while current window is active`() {
-        val state = ReconcileState(degradedThreshold = 3)
+    fun `sustained failures keep backoff active and recovery follows window drain`() {
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state = ReconcileState(degradedThreshold = 1, clock = { clock.now })
 
-        repeat(10) { state.recordAsyncFailure("boom-$it") }
+        repeat(5_000) {
+            clock.advance(Duration.ofSeconds(30))
+            state.recordFailure("boom")
+        }
 
-        assertEquals(10, state.failureCount)
         assertEquals(PoolState.DEGRADED, state.state)
-        assertEquals(true, state.isBackoffActive(Instant.now().plus(Duration.ofSeconds(29))))
-        assertFalse(state.isBackoffActive(Instant.now().plus(Duration.ofSeconds(31))))
+        assertEquals(true, state.isBackoffActive())
+        // Once failures stop, the pool stays paused until the failure window drains.
+        assertFalse(state.isBackoffActive(clock.now.plus(Duration.ofHours(25))))
+        assertEquals(PoolState.HEALTHY, state.state)
+        assertEquals(0, state.failureCount)
+    }
+
+    @Test
+    fun `in-window failures do not advance backoff per completion`() {
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state = ReconcileState(degradedThreshold = 3, clock = { clock.now })
+
+        repeat(3) { state.recordAsyncFailure("boom") }
+        repeat(6) {
+            clock.advance(Duration.ofSeconds(5))
+            state.recordAsyncFailure("boom")
+        }
+
+        assertEquals(9, state.failureCount)
+        // Exactly one escalation: the 30s window opened at t=0 and was renewed once at expiry
+        // (t=30 -> t=90), not once per in-window failure completion.
+        assertEquals(true, state.isBackoffActive(clock.now.plus(Duration.ofSeconds(59))))
+        assertFalse(state.isBackoffActive(clock.now.plus(Duration.ofSeconds(61))))
     }
 
     @Test

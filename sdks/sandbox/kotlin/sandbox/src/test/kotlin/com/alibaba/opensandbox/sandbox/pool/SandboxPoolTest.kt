@@ -323,6 +323,50 @@ class SandboxPoolTest {
     }
 
     @Test
+    fun `interleaved warmup successes and failures still trigger degraded backoff`() {
+        // Regression: with the old consecutive-failure counter, every successful warmup reset
+        // the failure count, so a pool with interleaved successes and failures never degraded.
+        // Detection must be rate-based over a sliding window instead.
+        val store = AlternatingPutIdleFailureStore()
+        val manager = mockk<SandboxManager>(relaxed = true)
+        val createAttempts = AtomicInteger(0)
+        val pool =
+            SandboxPool(
+                config =
+                    PoolConfig.builder()
+                        .poolName("mixed-outcome-pool")
+                        .ownerId("mixed-owner")
+                        .maxIdle(5)
+                        .warmupConcurrency(3)
+                        .degradedThreshold(3)
+                        .stateStore(store)
+                        .connectionConfig(ConnectionConfig.builder().build())
+                        .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                        .sandboxCreator(
+                            PooledSandboxCreator {
+                                val attempt = createAttempts.getAndIncrement()
+                                mockk<Sandbox>(relaxed = true).apply {
+                                    every { id } returns "sandbox-$attempt"
+                                }
+                            },
+                        ).warmupSkipHealthCheck()
+                        .reconcileInterval(Duration.ofSeconds(30))
+                        .build(),
+                sandboxManagerFactory = { manager },
+            )
+
+        pool.start()
+        try {
+            awaitCondition { pool.snapshot().backoffActive }
+            assertEquals(PoolState.DEGRADED, pool.snapshot().state)
+            // Successful warmups were interleaved with the failures; the rate detector still fired.
+            assertTrue(store.succeededIds.isNotEmpty())
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
     fun `shutdown graceful waits for in-flight warmup without interrupting it`() {
         val store = InMemoryPoolStateStore()
         val sandbox = mockk<Sandbox>(relaxed = true)
@@ -2204,6 +2248,24 @@ class SandboxPoolTest {
             sandboxId: String,
         ) {
             throw RuntimeException("put failed")
+        }
+    }
+
+    private class AlternatingPutIdleFailureStore : PoolStateStore by InMemoryPoolStateStore() {
+        val succeededIds: List<String> = java.util.Collections.synchronizedList(mutableListOf())
+        private val putIdleCalls = AtomicInteger(0)
+        private val delegate = InMemoryPoolStateStore()
+
+        override fun putIdle(
+            poolName: String,
+            sandboxId: String,
+        ) {
+            if (putIdleCalls.getAndIncrement() % 2 == 0) {
+                (succeededIds as MutableList<String>).add(sandboxId)
+                delegate.putIdle(poolName, sandboxId)
+            } else {
+                throw RuntimeException("put failed")
+            }
         }
     }
 

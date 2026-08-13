@@ -21,14 +21,28 @@ import java.time.Duration
 import java.time.Instant
 
 /**
- * Mutable state for reconcile loop: failure count, pool state, and exponential backoff.
+ * Mutable state for reconcile loop: sliding-window failure detection, pool state, and exponential
+ * backoff.
+ *
+ * Degradation is detected by failure *rate* rather than consecutive failures: every failure is
+ * recorded with a timestamp and ages out of [failureWindow]. The pool enters DEGRADED and opens an
+ * exponential backoff window once [degradedThreshold] failures are present inside the window.
+ * Successful creates never reset the window (recovery is time-based, not success-based), and an
+ * active backoff window is never cancelled by a success.
+ *
+ * While DEGRADED, an expired backoff window is renewed automatically whenever the failure window
+ * is still hot, so the pool stays paused until the failure rate actually drops below the
+ * threshold. The pool returns to HEALTHY only once the failure window drains and no backoff is
+ * active.
  *
  * Thread-safe for use from reconcile worker and from pool snapshot.
  */
 internal class ReconcileState(
     private val degradedThreshold: Int,
+    private val failureWindow: Duration = Duration.ofSeconds(60),
     private val backoffBase: Duration = Duration.ofSeconds(30),
     private val backoffMax: Duration = Duration.ofDays(1),
+    private val clock: () -> Instant = Instant::now,
 ) {
     @Volatile
     var failureCount: Int = 0
@@ -47,35 +61,24 @@ internal class ReconcileState(
 
     private var backoffAttempts: Int = 0
 
-    @Synchronized
-    fun recordSuccess() {
-        failureCount = 0
-        if (state == PoolState.DEGRADED) state = PoolState.HEALTHY
-        backoffUntil = null
-        backoffAttempts = 0
-        lastError = null
-    }
-
-    @Synchronized
-    fun recordFailure(errorMessage: String?) {
-        recordFailures(1, errorMessage)
-    }
+    private val failureTimestamps: ArrayDeque<Instant> = ArrayDeque()
 
     /**
-     * Records one independently completed rolling-window warmup failure.
+     * Records one independently completed warmup failure.
      *
-     * Unlike batch failure accounting, multiple tasks that finish while the same backoff window
-     * is active must not advance the exponential delay once per completion. The first failure
-     * that reaches the threshold opens (or, after expiry, advances) one backoff window; remaining
-     * in-flight failures only update counters and the last error.
+     * Multiple tasks that finish while the same backoff window is active must not advance the
+     * exponential delay once per completion: the first failure that reaches the threshold opens
+     * (or, after expiry, advances) one backoff window; remaining in-flight failures only update
+     * counters and the last error.
      */
     @Synchronized
     fun recordAsyncFailure(errorMessage: String?) {
-        failureCount++
+        val now = clock()
+        failureTimestamps.addLast(now)
+        pruneExpired(now)
         lastError = errorMessage
         if (failureCount < degradedThreshold) return
 
-        val now = Instant.now()
         val activeUntil = backoffUntil
         if (state == PoolState.DEGRADED && activeUntil != null && now.isBefore(activeUntil)) {
             return
@@ -84,15 +87,49 @@ internal class ReconcileState(
     }
 
     @Synchronized
+    fun recordFailure(errorMessage: String?) {
+        recordFailures(1, errorMessage)
+    }
+
+    @Synchronized
     fun recordFailures(
         count: Int,
         errorMessage: String?,
     ) {
         if (count <= 0) return
-        failureCount += count
+        val now = clock()
+        repeat(count) { failureTimestamps.addLast(now) }
+        pruneExpired(now)
         lastError = errorMessage
-        if (failureCount >= degradedThreshold) {
-            activateNextBackoff(Instant.now())
+        if (failureCount < degradedThreshold) return
+
+        val activeUntil = backoffUntil
+        if (state == PoolState.DEGRADED && activeUntil != null && now.isBefore(activeUntil)) {
+            return
+        }
+        activateNextBackoff(now)
+    }
+
+    /**
+     * True if the reconciler should skip create attempts this tick (in backoff window).
+     *
+     * Advances the state machine on the read path: while DEGRADED, an expired backoff window is
+     * renewed when the failure window is still hot, so the pool stays paused until the failure
+     * rate falls below the threshold; once the failure window drains and no backoff is active,
+     * the pool recovers to HEALTHY.
+     */
+    @Synchronized
+    fun isBackoffActive(now: Instant = clock()): Boolean {
+        pruneExpired(now)
+        val until = backoffUntil
+        if (state != PoolState.DEGRADED || until == null) return false
+        if (now.isBefore(until)) return true
+        return if (failureCount >= degradedThreshold) {
+            activateNextBackoff(now)
+            true
+        } else {
+            recover()
+            false
         }
     }
 
@@ -109,9 +146,18 @@ internal class ReconcileState(
         backoffUntil = now.plusMillis(delayMs)
     }
 
-    /** True if reconciler should skip create attempts this tick (in backoff window). */
-    fun isBackoffActive(now: Instant = Instant.now()): Boolean {
-        val until = backoffUntil ?: return false
-        return state == PoolState.DEGRADED && now.isBefore(until)
+    private fun recover() {
+        state = PoolState.HEALTHY
+        backoffUntil = null
+        backoffAttempts = 0
+        lastError = null
+    }
+
+    private fun pruneExpired(now: Instant) {
+        val cutoff = now.minus(failureWindow)
+        while (failureTimestamps.isNotEmpty() && failureTimestamps.first().isBefore(cutoff)) {
+            failureTimestamps.removeFirst()
+        }
+        failureCount = failureTimestamps.size
     }
 }

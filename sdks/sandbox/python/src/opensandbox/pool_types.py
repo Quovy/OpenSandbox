@@ -340,6 +340,7 @@ class PoolConfig:
     primary_lock_ttl: timedelta = timedelta(seconds=60)
     reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
+    failure_window: timedelta = timedelta(seconds=60)
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[SandboxSync], bool] | None = None
@@ -371,6 +372,7 @@ class PoolConfig:
             raise ValueError("warmup_concurrency must be positive")
         if self.degraded_threshold <= 0:
             raise ValueError("degraded_threshold must be positive")
+        _require_positive(self.failure_window, "failure_window must be positive")
         _require_positive(self.primary_lock_ttl, "primary_lock_ttl must be positive")
         _require_positive(
             self.reconcile_interval, "reconcile_interval must be positive"
@@ -418,6 +420,7 @@ class AsyncPoolConfig:
     primary_lock_ttl: timedelta = timedelta(seconds=60)
     reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
+    failure_window: timedelta = timedelta(seconds=60)
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None
@@ -449,6 +452,7 @@ class AsyncPoolConfig:
             raise ValueError("warmup_concurrency must be positive")
         if self.degraded_threshold <= 0:
             raise ValueError("degraded_threshold must be positive")
+        _require_positive(self.failure_window, "failure_window must be positive")
         _require_positive(self.primary_lock_ttl, "primary_lock_ttl must be positive")
         _require_positive(
             self.reconcile_interval, "reconcile_interval must be positive"

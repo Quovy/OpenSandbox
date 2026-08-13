@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from concurrent.futures import Executor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from opensandbox.pool_types import (
@@ -37,7 +37,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReconcileState:
+    """Sliding-window failure detection, pool state, and exponential backoff.
+
+    Degradation is detected by failure *rate* rather than consecutive failures: every failure is
+    recorded with a timestamp and ages out of ``failure_window``. The pool enters DEGRADED and
+    opens an exponential backoff window once ``degraded_threshold`` failures are present inside
+    the window. Successful creates never reset the window (recovery is time-based, not
+    success-based), and an active backoff window is never cancelled by a success.
+
+    While DEGRADED, an expired backoff window is renewed automatically whenever the failure
+    window is still hot, so the pool stays paused until the failure rate actually drops below the
+    threshold. The pool returns to HEALTHY only once the failure window drains and no backoff is
+    active.
+    """
+
     degraded_threshold: int
+    failure_window: timedelta = timedelta(seconds=60)
     backoff_base: timedelta = timedelta(seconds=30)
     backoff_max: timedelta = timedelta(days=1)
     failure_count: int = 0
@@ -45,14 +60,7 @@ class ReconcileState:
     last_error: str | None = None
     backoff_until: datetime | None = None
     backoff_attempts: int = 0
-
-    def record_success(self) -> None:
-        self.failure_count = 0
-        if self.state == PoolState.DEGRADED:
-            self.state = PoolState.HEALTHY
-        self.backoff_until = None
-        self.backoff_attempts = 0
-        self.last_error = None
+    _failure_timestamps: list[datetime] = field(default_factory=list, repr=False)
 
     def record_failure(self, error_message: str | None) -> None:
         self.record_failures(1, error_message)
@@ -60,26 +68,56 @@ class ReconcileState:
     def record_failures(self, count: int, error_message: str | None) -> None:
         if count <= 0:
             return
-        self.failure_count += count
+        now = datetime.now(timezone.utc)
+        self._failure_timestamps.extend([now] * count)
+        self._prune_expired(now)
         self.last_error = error_message
-        if self.failure_count >= self.degraded_threshold:
-            self.state = PoolState.DEGRADED
-            self.backoff_attempts += 1
-            exponent = min(self.backoff_attempts - 1, 30)
-            delay = min(
-                self.backoff_base.total_seconds() * (1 << exponent),
-                self.backoff_max.total_seconds(),
-            )
-            self.backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        if self.failure_count < self.degraded_threshold:
+            return
+        if (
+            self.state == PoolState.DEGRADED
+            and self.backoff_until is not None
+            and now < self.backoff_until
+        ):
+            return
+        self._activate_next_backoff(now)
 
     def is_backoff_active(self, now: datetime | None = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        self._prune_expired(now)
         until = self.backoff_until
-        if until is None:
+        if self.state != PoolState.DEGRADED or until is None:
             return False
-        return (
-            self.state == PoolState.DEGRADED
-            and (now or datetime.now(timezone.utc)) < until
+        if now < until:
+            return True
+        if self.failure_count >= self.degraded_threshold:
+            self._activate_next_backoff(now)
+            return True
+        self._recover()
+        return False
+
+    def _activate_next_backoff(self, now: datetime) -> None:
+        self.state = PoolState.DEGRADED
+        self.backoff_attempts += 1
+        exponent = min(self.backoff_attempts - 1, 30)
+        delay = min(
+            self.backoff_base.total_seconds() * (1 << exponent),
+            self.backoff_max.total_seconds(),
         )
+        self.backoff_until = now + timedelta(seconds=delay)
+
+    def _recover(self) -> None:
+        self.state = PoolState.HEALTHY
+        self.backoff_until = None
+        self.backoff_attempts = 0
+        self.last_error = None
+
+    def _prune_expired(self, now: datetime) -> None:
+        cutoff = now - self.failure_window
+        self._failure_timestamps = [
+            ts for ts in self._failure_timestamps if not ts < cutoff
+        ]
+        self.failure_count = len(self._failure_timestamps)
 
 
 def run_reconcile_tick(
@@ -175,7 +213,6 @@ def _run_primary_replenish_once(
         try:
             state_store.put_idle(pool_name, sandbox_id)
             created += 1
-            reconcile_state.record_success()
         except Exception as exc:
             reconcile_state.record_failure(str(exc))
             for orphaned_id in created_ids[index:]:

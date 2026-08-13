@@ -37,6 +37,7 @@ func NewSandboxPoolBuilder() *SandboxPoolBuilder {
 			PrimaryLockTTL:                    60 * time.Second,
 			ReconcileInterval:                 30 * time.Second,
 			DegradedThreshold:                 3,
+			FailureWindow:                     60 * time.Second,
 			AcquireReadyTimeout:               30 * time.Second,
 			WarmupReadyTimeout:                30 * time.Second,
 			AcquireHealthCheckPollingInterval: 200 * time.Millisecond,
@@ -104,10 +105,17 @@ func (b *SandboxPoolBuilder) PrimaryLockTTL(d time.Duration) *SandboxPoolBuilder
 	return b
 }
 
-// DegradedThreshold sets the number of consecutive failures before the pool
-// is considered degraded.
+// DegradedThreshold sets the number of failures inside the failure window
+// before the pool is considered degraded.
 func (b *SandboxPoolBuilder) DegradedThreshold(n int) *SandboxPoolBuilder {
 	b.config.DegradedThreshold = n
+	return b
+}
+
+// FailureWindow sets the sliding time window over which create failures are
+// counted for degraded detection. Must be positive. Default: 60s.
+func (b *SandboxPoolBuilder) FailureWindow(d time.Duration) *SandboxPoolBuilder {
+	b.config.FailureWindow = d
 	return b
 }
 
@@ -227,6 +235,9 @@ func (b *SandboxPoolBuilder) Build() (*DefaultSandboxPool, error) {
 	}
 	if b.config.DegradedThreshold <= 0 {
 		return nil, fmt.Errorf("opensandbox: pool builder: DegradedThreshold must be positive")
+	}
+	if b.config.FailureWindow <= 0 {
+		return nil, fmt.Errorf("opensandbox: pool builder: FailureWindow must be positive")
 	}
 	if b.config.SandboxCreator == nil && b.config.CreationSpec.Image == "" && b.config.CreationSpec.SnapshotID == "" {
 		return nil, fmt.Errorf("opensandbox: pool builder: CreationSpec (with Image or SnapshotID) is required when no SandboxCreator is set")

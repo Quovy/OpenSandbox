@@ -112,7 +112,7 @@ class SandboxPool internal constructor(
     private val connectionConfig: ConnectionConfig = config.connectionConfig
     private val creationSpec: PoolCreationSpec = config.creationSpec
     private val sandboxCreator: PooledSandboxCreator? = config.sandboxCreator
-    private val reconcileState = ReconcileState(config.degradedThreshold)
+    private val reconcileState = ReconcileState(config.degradedThreshold, config.failureWindow)
 
     @Volatile
     private var currentMaxIdle: Int = config.maxIdle
@@ -1136,7 +1136,6 @@ class SandboxPool internal constructor(
                         cleanupSource = "warmup-lock-lost"
                     } else {
                         stateStore.putIdle(config.poolName, sandboxId)
-                        reconcileState.recordSuccess()
                         logger.debug(
                             "Pool warmup sandbox entered idle: pool_name={} sandbox_id={} run={}",
                             config.poolName,

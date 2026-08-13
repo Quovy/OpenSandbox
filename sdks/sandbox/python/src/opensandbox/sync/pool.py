@@ -76,6 +76,7 @@ class SandboxPoolSync:
         primary_lock_ttl: timedelta = timedelta(seconds=60),
         reconcile_interval: timedelta = timedelta(seconds=30),
         degraded_threshold: int = 3,
+        failure_window: timedelta = timedelta(seconds=60),
         acquire_ready_timeout: timedelta = timedelta(seconds=30),
         acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200),
         acquire_health_check: Callable[[SandboxSync], bool] | None = None,
@@ -106,6 +107,7 @@ class SandboxPoolSync:
             creation_spec=creation_spec,
             reconcile_interval=reconcile_interval,
             degraded_threshold=degraded_threshold,
+            failure_window=failure_window,
             acquire_ready_timeout=acquire_ready_timeout,
             acquire_health_check_polling_interval=acquire_health_check_polling_interval,
             acquire_health_check=acquire_health_check,
@@ -126,7 +128,7 @@ class SandboxPoolSync:
         self._creation_spec = creation_spec
         self._sandbox_manager_factory = sandbox_manager_factory
         self._sandbox_factory = sandbox_factory
-        self._reconcile_state = ReconcileState(degraded_threshold)
+        self._reconcile_state = ReconcileState(degraded_threshold, failure_window)
         self._current_max_idle = max_idle
         self._lifecycle_state = PoolLifecycleState.NOT_STARTED
         self._lifecycle_lock = threading.RLock()

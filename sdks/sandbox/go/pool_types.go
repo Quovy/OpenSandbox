@@ -124,10 +124,11 @@ type ReapResult struct {
 
 // PoolSnapshot is a point-in-time snapshot of the pool state.
 type PoolSnapshot struct {
-	LifecycleState     PoolLifecycleState
-	HealthState        PoolHealthState
-	IdleCount          int
-	MaxIdle            int
+	LifecycleState PoolLifecycleState
+	HealthState    PoolHealthState
+	IdleCount      int
+	MaxIdle        int
+	// FailureCount is the number of create failures currently inside the sliding failure window.
 	FailureCount       int
 	BackoffActive      bool
 	LastError          string
@@ -217,10 +218,15 @@ type PoolConfig struct {
 	PrimaryLockTTL    time.Duration
 	ReconcileInterval time.Duration
 	DegradedThreshold int
-	EmptyBehavior     AcquirePolicy
-	StateStore        PoolStateStore
-	ConnectionConfig  ConnectionConfig
-	CreationSpec      PoolCreationSpec
+	// FailureWindow is the sliding time window over which create failures are counted for
+	// degraded detection. A pool enters degraded when at least DegradedThreshold failures fall
+	// inside the window, and stays paused until the window no longer contains that many
+	// failures. Default: 60s.
+	FailureWindow    time.Duration
+	EmptyBehavior    AcquirePolicy
+	StateStore       PoolStateStore
+	ConnectionConfig ConnectionConfig
+	CreationSpec     PoolCreationSpec
 
 	AcquireReadyTimeout               time.Duration
 	WarmupReadyTimeout                time.Duration

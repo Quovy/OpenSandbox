@@ -210,10 +210,14 @@ func TestReconciler_ExponentialBackoff(t *testing.T) {
 
 	// Escalation via recordFailures with batch count:
 	// threshold=1, recordFailures(1) => backoffAttempts=1 (30s)
-	// Then recordFailures(1) again => backoffAttempts=2 (60s)
+	// Then, once the first window expires while the failure window is still hot,
+	// recordFailures(1) again => backoffAttempts=2 (60s).
 	// This simulates two consecutive failing ticks (each calling recordFailures once).
 	state3 := newReconcileState(1)
 	state3.recordFailures(1, errors.New("tick-1-fail")) // backoffAttempts=1, backoff=30s
+	state3.mu.Lock()
+	state3.backoffUntil = time.Now().Add(-time.Second) // first backoff window expired
+	state3.mu.Unlock()
 	state3.recordFailures(1, errors.New("tick-2-fail")) // backoffAttempts=2, backoff=60s
 	state3.mu.Lock()
 	backoffDuration2 := state3.backoffUntil.Sub(time.Now())
@@ -223,8 +227,11 @@ func TestReconciler_ExponentialBackoff(t *testing.T) {
 	}
 }
 
-func TestReconciler_RecoveryAfterSuccess(t *testing.T) {
+func TestReconciler_RecoveryAfterWindowDrain(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	state := newReconcileState(2)
+	state.now = func() time.Time { return now }
+	state.failureWindow = time.Minute
 
 	// Drive into degraded state
 	state.recordFailure(errors.New("fail-1"))
@@ -235,12 +242,23 @@ func TestReconciler_RecoveryAfterSuccess(t *testing.T) {
 		assert.Fail(t, fmt.Sprintf("expected PoolDegraded before recovery, got %v", healthState))
 	}
 
-	// Record success: should recover
-	state.recordSuccess()
+	// The 30s backoff expires while the failure window is still hot: the pool stays
+	// paused (renewed), not recovered. Successes do not reset anything.
+	now = now.Add(31 * time.Second)
+	if !state.shouldBackoff() {
+		assert.Fail(t, "expected backoff to stay active while the failure window is hot")
+	}
+
+	// Once the failure window drains and the renewed backoff window (t=31+60s) expires,
+	// the pool recovers to healthy.
+	now = now.Add(70 * time.Second)
+	if state.shouldBackoff() {
+		assert.Fail(t, "expected shouldBackoff() to be false after window drain")
+	}
 
 	healthState, failureCount, backoffActive, lastError := state.snapshot()
 	if healthState != PoolHealthy {
-		assert.Fail(t, fmt.Sprintf("expected PoolHealthy after recovery, got %v", healthState))
+		assert.Fail(t, fmt.Sprintf("expected PoolHealthy after window drain, got %v", healthState))
 	}
 	if failureCount != 0 {
 		assert.Fail(t, fmt.Sprintf("expected failureCount 0 after recovery, got %d", failureCount))
@@ -251,8 +269,72 @@ func TestReconciler_RecoveryAfterSuccess(t *testing.T) {
 	if lastError != "" {
 		assert.Fail(t, fmt.Sprintf("expected empty lastError after recovery, got %q", lastError))
 	}
-	if state.shouldBackoff() {
-		assert.Fail(t, "expected shouldBackoff() to be false after recovery")
+}
+
+func TestReconciler_WindowedFailuresTriggerDegraded(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	state := newReconcileState(3)
+	state.now = func() time.Time { return now }
+	state.failureWindow = time.Minute
+
+	state.recordFailure(errors.New("boom-1"))
+	now = now.Add(2 * time.Second)
+	state.recordFailure(errors.New("boom-2"))
+	healthState, _, _, _ := state.snapshot()
+	if healthState != PoolHealthy {
+		assert.Fail(t, fmt.Sprintf("expected PoolHealthy after two failures, got %v", healthState))
+	}
+
+	// Failures spread across the window count by rate, not consecutively: gaps of
+	// healthy operation between failures do not reset the count.
+	now = now.Add(2 * time.Second)
+	state.recordFailure(errors.New("boom-3"))
+	healthState, failureCount, _, _ := state.snapshot()
+	if healthState != PoolDegraded {
+		assert.Fail(t, fmt.Sprintf("expected PoolDegraded after three windowed failures, got %v", healthState))
+	}
+	if failureCount != 3 {
+		assert.Fail(t, fmt.Sprintf("expected failureCount 3, got %d", failureCount))
+	}
+}
+
+func TestReconciler_InterleavedCreatesTriggerDegraded(t *testing.T) {
+	// Regression: with the old consecutive-failure counter, every successful warmup reset
+	// the failure count, so a pool with interleaved successes and failures never degraded.
+	// Detection must be rate-based over a sliding window instead.
+	store := NewInMemoryPoolStateStore()
+	_ = store.SetMaxIdle(context.Background(), "test-pool", 5)
+	cfg := defaultTestPoolConfig(store)
+	cfg.WarmupConcurrency = 4
+	cfg.DegradedThreshold = 3
+	state := newReconcileState(cfg.DegradedThreshold)
+
+	var createCount atomic.Int32
+	createFn := func(ctx context.Context, reason PooledSandboxCreateReason) (string, error) {
+		n := createCount.Add(1)
+		if n%2 == 0 {
+			return "", errors.New("create boom")
+		}
+		return fmt.Sprintf("sbx-%d", n), nil
+	}
+	deleteFn := func(sandboxID string) {}
+
+	// Tick 1: 2 successes + 2 failures (batch count reaches 2). Tick 2 adds failures
+	// while successful creates are interleaved; the windowed count crosses the threshold
+	// and degrades the pool. Tick 3 must skip creation due to backoff.
+	reconcileTick(context.Background(), cfg, store, state, testLogger, createFn, deleteFn)
+	reconcileTick(context.Background(), cfg, store, state, testLogger, createFn, deleteFn)
+	reconcileTick(context.Background(), cfg, store, state, testLogger, createFn, deleteFn)
+
+	healthState, failureCount, backoffActive, _ := state.snapshot()
+	if healthState != PoolDegraded {
+		assert.Fail(t, fmt.Sprintf("expected PoolDegraded with interleaved successes, got %v", healthState))
+	}
+	if failureCount < 3 {
+		assert.Fail(t, fmt.Sprintf("expected windowed failureCount >= 3, got %d", failureCount))
+	}
+	if !backoffActive {
+		assert.Fail(t, "expected backoff to be active")
 	}
 }
 
