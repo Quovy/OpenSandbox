@@ -340,7 +340,6 @@ class PoolConfig:
     primary_lock_ttl: timedelta = timedelta(seconds=60)
     reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
-    failure_window: timedelta = timedelta(seconds=60)
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[SandboxSync], bool] | None = None
@@ -355,6 +354,9 @@ class PoolConfig:
     acquire_min_remaining_ttl: timedelta | None = None
     sandbox_creator: PooledSandboxCreator | None = None
     max_acquire_retries: int = 3
+    # Appended after all pre-existing fields so positional construction stays backward
+    # compatible (exported dataclass constructors accept positional arguments).
+    failure_window: timedelta = timedelta(seconds=60)
 
     def __post_init__(self) -> None:
         owner_id = self.owner_id or f"pool-owner-{uuid4()}"
@@ -420,7 +422,6 @@ class AsyncPoolConfig:
     primary_lock_ttl: timedelta = timedelta(seconds=60)
     reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
-    failure_window: timedelta = timedelta(seconds=60)
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None
@@ -435,6 +436,9 @@ class AsyncPoolConfig:
     acquire_min_remaining_ttl: timedelta | None = None
     sandbox_creator: AsyncPooledSandboxCreator | None = None
     max_acquire_retries: int = 3
+    # Appended after all pre-existing fields so positional construction stays backward
+    # compatible (exported dataclass constructors accept positional arguments).
+    failure_window: timedelta = timedelta(seconds=60)
 
     def __post_init__(self) -> None:
         owner_id = self.owner_id or f"pool-owner-{uuid4()}"

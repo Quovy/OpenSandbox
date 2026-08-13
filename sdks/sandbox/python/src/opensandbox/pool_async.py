@@ -77,7 +77,6 @@ class SandboxPoolAsync:
         primary_lock_ttl: timedelta = timedelta(seconds=60),
         reconcile_interval: timedelta = timedelta(seconds=30),
         degraded_threshold: int = 3,
-        failure_window: timedelta = timedelta(seconds=60),
         acquire_ready_timeout: timedelta = timedelta(seconds=30),
         acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200),
         acquire_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None,
@@ -96,6 +95,9 @@ class SandboxPoolAsync:
         ] = SandboxManager.create,
         sandbox_factory: type[Sandbox] = Sandbox,
         sandbox_creator: AsyncPooledSandboxCreator | None = None,
+        # Appended after all pre-existing parameters so positional calls stay backward
+        # compatible.
+        failure_window: timedelta = timedelta(seconds=60),
     ) -> None:
         self._config = AsyncPoolConfig(
             pool_name=pool_name,

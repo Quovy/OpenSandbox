@@ -338,6 +338,31 @@ func TestReconciler_InterleavedCreatesTriggerDegraded(t *testing.T) {
 	}
 }
 
+func TestReconciler_BackoffCapDoesNotOverflow(t *testing.T) {
+	state := newReconcileState(1)
+	state.failureWindow = 100 * 24 * time.Hour
+
+	// Sustained renewals grow backoffAttempts without bound; the delay must be capped at
+	// one day instead of overflowing time.Duration (which wraps negative and moves
+	// backoffUntil into the past).
+	for i := 0; i < 40; i++ {
+		state.mu.Lock()
+		state.backoffUntil = time.Now().Add(-time.Second) // previous window expired
+		state.mu.Unlock()
+		state.recordFailures(1, errors.New("boom"))
+	}
+
+	state.mu.Lock()
+	delay := state.backoffUntil.Sub(time.Now())
+	state.mu.Unlock()
+	if delay <= 0 || delay > reconcileMaxBackoff {
+		assert.Fail(t, fmt.Sprintf("expected backoff capped at 24h in the future, got %v", delay))
+	}
+	if !state.shouldBackoff() {
+		assert.Fail(t, "expected backoff to be active")
+	}
+}
+
 func TestReconciler_ShrinkExcess(t *testing.T) {
 	store := NewInMemoryPoolStateStore()
 	_ = store.SetMaxIdle(context.Background(), "test-pool", 2)

@@ -24,6 +24,7 @@ import com.alibaba.opensandbox.sandbox.domain.pool.PoolStateStore
 import com.alibaba.opensandbox.sandbox.domain.pool.StoreCounters
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.time.Duration
 import java.time.Instant
@@ -110,6 +111,28 @@ class PoolReconcilerStateTest {
         assertFalse(state.isBackoffActive(clock.now.plus(Duration.ofHours(25))))
         assertEquals(PoolState.HEALTHY, state.state)
         assertEquals(0, state.failureCount)
+    }
+
+    @Test
+    fun `backoff escalation stays capped at one day under sustained renewals`() {
+        val clock = MutableClock(Instant.parse("2025-01-01T00:00:00Z"))
+        val state =
+            ReconcileState(
+                degradedThreshold = 1,
+                failureWindow = Duration.ofDays(100),
+                clock = { clock.now },
+            )
+
+        // Each failure lands just after the previous backoff window (at most one day), forcing
+        // a new escalation. The 31st activation must not overflow Duration's nanosecond
+        // capacity and must stay capped at backoffMax.
+        repeat(40) {
+            clock.advance(Duration.ofSeconds(86_401))
+            state.recordAsyncFailure("boom")
+        }
+
+        assertEquals(PoolState.DEGRADED, state.state)
+        assertTrue(state.isBackoffActive())
     }
 
     @Test

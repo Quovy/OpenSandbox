@@ -156,19 +156,47 @@ def test_async_pool_config_positional_owner_id_stays_compatible() -> None:
     assert config.sandbox_creator is None
 
 
+def test_sync_pool_config_positional_after_degraded_threshold_stays_compatible() -> None:
+    # failure_window is appended after all pre-existing fields: positional calls that reach
+    # the acquire/warmup options must keep their meaning.
+    kwargs = _sync_kwargs()
+    config = PoolConfig(
+        kwargs["pool_name"],  # type: ignore[arg-type]
+        kwargs["max_idle"],  # type: ignore[arg-type]
+        kwargs["state_store"],  # type: ignore[arg-type]
+        kwargs["connection_config"],  # type: ignore[arg-type]
+        kwargs["creation_spec"],  # type: ignore[arg-type]
+        "owner-1",
+        4,  # warmup_concurrency
+        timedelta(seconds=60),  # primary_lock_ttl
+        timedelta(seconds=30),  # reconcile_interval
+        3,  # degraded_threshold
+        timedelta(seconds=15),  # acquire_ready_timeout
+    )
+
+    assert config.warmup_concurrency == 4
+    assert config.degraded_threshold == 3
+    assert config.acquire_ready_timeout == timedelta(seconds=15)
+    assert config.failure_window == timedelta(seconds=60)
+
+
 def test_pool_facade_sandbox_creator_is_appended_after_factories() -> None:
     sync_params = list(inspect.signature(SandboxPoolSync).parameters)
     async_params = list(inspect.signature(SandboxPoolAsync).parameters)
 
-    assert sync_params[-3:] == [
+    # New optional params must be appended after the factories so positional calls stay
+    # backward compatible; failure_window is the newest one.
+    assert sync_params[-4:] == [
         "sandbox_manager_factory",
         "sandbox_factory",
         "sandbox_creator",
+        "failure_window",
     ]
-    assert async_params[-3:] == [
+    assert async_params[-4:] == [
         "sandbox_manager_factory",
         "sandbox_factory",
         "sandbox_creator",
+        "failure_window",
     ]
 
 

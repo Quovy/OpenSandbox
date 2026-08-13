@@ -139,11 +139,16 @@ func (s *reconcileState) activateNextBackoff(now time.Time) {
 	if shift > 30 {
 		shift = 30
 	}
-	backoff := reconcileBackoffBase * (1 << shift)
-	if backoff > reconcileMaxBackoff {
-		backoff = reconcileMaxBackoff
+	// Cap the delay in seconds before constructing the duration: with sustained
+	// renewals backoffAttempts grows without bound, and 30s << 29 already overflows
+	// the int64 nanosecond range of time.Duration (wrapping negative and defeating
+	// the max check below).
+	maxSeconds := int64(reconcileMaxBackoff / time.Second)
+	delaySeconds := int64(reconcileBackoffBase/time.Second) << shift
+	if delaySeconds > maxSeconds {
+		delaySeconds = maxSeconds
 	}
-	s.backoffUntil = now.Add(backoff)
+	s.backoffUntil = now.Add(time.Duration(delaySeconds) * time.Second)
 }
 
 func (s *reconcileState) recover() {

@@ -123,6 +123,20 @@ def test_reconcile_batch_failures_only_advance_backoff_once() -> None:
     assert state.state == PoolState.HEALTHY
 
 
+def test_backoff_escalation_stays_capped_at_one_day() -> None:
+    state = ReconcileState(degraded_threshold=1, failure_window=timedelta(days=100))
+
+    # Sustained renewals grow backoff_attempts without bound; the delay must stay capped
+    # at backoff_max instead of growing with each renewal.
+    for _ in range(40):
+        state.backoff_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        state.record_failure("boom")
+
+    delay = state.backoff_until - datetime.now(timezone.utc)
+    assert timedelta(0) < delay <= timedelta(days=1)
+    assert state.is_backoff_active()
+
+
 def test_interleaved_creates_trigger_degraded_backoff() -> None:
     # Regression: with the old consecutive-failure counter, every successful warmup reset
     # the failure count, so a pool with interleaved successes and failures never degraded.

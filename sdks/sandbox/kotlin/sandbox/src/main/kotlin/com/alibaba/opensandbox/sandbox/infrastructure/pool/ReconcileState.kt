@@ -137,13 +137,12 @@ internal class ReconcileState(
         state = PoolState.DEGRADED
         backoffAttempts++
         val exponent = (backoffAttempts - 1).coerceAtMost(30)
-        val delaySeconds = backoffBase.seconds * (1L shl exponent)
-        val delayMs =
-            minOf(
-                Duration.ofSeconds(delaySeconds).toMillis(),
-                backoffMax.toMillis(),
-            )
-        backoffUntil = now.plusMillis(delayMs)
+        // Cap the delay in seconds before constructing a Duration: with sustained renewals
+        // backoffAttempts grows without bound, and Duration.ofSeconds on the raw product
+        // (30s << 30) overflows its nanosecond capacity and throws ArithmeticException,
+        // defeating the max check below.
+        val delaySeconds = (backoffBase.seconds * (1L shl exponent)).coerceAtMost(backoffMax.seconds)
+        backoffUntil = now.plusSeconds(delaySeconds)
     }
 
     private fun recover() {
