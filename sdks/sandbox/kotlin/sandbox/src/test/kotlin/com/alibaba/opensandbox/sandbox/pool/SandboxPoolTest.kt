@@ -2009,6 +2009,28 @@ class SandboxPoolTest {
     }
 
     @Test
+    fun `sandbox pool builder forwards degraded detection settings into config`() {
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(2)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .degradedThreshold(5)
+                .failureWindow(Duration.ofMinutes(2))
+                .build()
+
+        val configField = pool.javaClass.getDeclaredField("config")
+        configField.isAccessible = true
+        val config = configField.get(pool) as com.alibaba.opensandbox.sandbox.domain.pool.PoolConfig
+
+        assertEquals(5, config.degradedThreshold)
+        assertEquals(Duration.ofMinutes(2), config.failureWindow)
+    }
+
+    @Test
     fun `start aligns state store idle ttl hook with idleTimeout`() {
         val store = InMemoryPoolStateStore()
         val pool =

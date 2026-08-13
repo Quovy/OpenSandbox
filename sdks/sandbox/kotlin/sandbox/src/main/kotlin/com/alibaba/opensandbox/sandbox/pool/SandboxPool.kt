@@ -1803,6 +1803,11 @@ class SandboxPool internal constructor(
             return this
         }
 
+        fun failureWindow(failureWindow: Duration): Builder {
+            configBuilder.failureWindow(failureWindow)
+            return this
+        }
+
         fun acquireReadyTimeout(acquireReadyTimeout: Duration): Builder {
             configBuilder.acquireReadyTimeout(acquireReadyTimeout)
             return this
