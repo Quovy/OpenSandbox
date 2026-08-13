@@ -10,8 +10,6 @@ This repository uses tag-driven publish workflows. The script below standardizes
 - canonical tag creation for each release target
 - release note generation from previous release to current commit
 - GitHub Release create/update
-- signed source archive upload and provenance attestation in the Generic
-  Release workflow
 
 Script path:
 
@@ -73,10 +71,6 @@ This implements two-person control: one person initiates the release and a
 different Project Maintainer approves it. GitHub environments require one of
 the configured reviewers; they do not natively support requiring two reviewer
 approvals in addition to the initiator.
-
-The hosted Generic Release workflow does not create or push release tags. An
-authorized release manager must create the tag from a commit on `main` before
-running a non-dry-run Generic Release.
 
 ## Release Notes Format
 
@@ -231,36 +225,25 @@ If `--dry-run` is enabled, the script never creates/pushes tags and never create
 
 ## GitHub Actions Entry
 
-You can trigger the same flow in GitHub Actions from:
+Releases are published by tag-driven workflows. After the script creates a tag,
+push it to origin to trigger the matching publish workflow (e.g.
+`.github/workflows/publish-server.yml` for a `server/v*` tag), which runs the
+shared release preflight and publishes the signed artifacts.
 
-- `.github/workflows/release-generic.yml`
+Dry-run locally with the script before pushing a tag:
 
-Inputs exposed in the workflow dispatch form:
-
-- `target`
-- `version`
-- `from_tag` (optional)
-- `initial_release` (boolean)
-- `dry_run` (boolean, default `true`)
-
-Dry-run in GitHub Actions:
-
-- set `dry_run=true`
-- check logs for:
+- run `scripts/release/create-release.sh --target <target> --version <version> --dry-run`
+- check the output for:
   - computed tag (`New tag`)
   - range (`Computed range`)
   - preview body (`Generated release notes preview`)
 
-Recommended first run in UI:
+Recommended flow:
 
-- set `dry_run=true`
-- verify the generated release notes preview in logs
+- run the dry-run and verify the generated release notes preview
 - have an authorized release manager create and push the release tag from
   `main`
-- select that tag as the workflow ref and rerun with `dry_run=false`
+- the tag-triggered publish workflow uploads and signs the release artifacts
 
-When `dry_run=false`, `.github/workflows/release-generic.yml` uploads an
-explicit `opensandbox-<tag>.tar.gz` source archive and `SHA256SUMS` file to the
-GitHub Release, then signs both files with GitHub/Sigstore provenance
-attestations. See [Release Verification](release-verification.md) for user
-verification commands and release signing coverage.
+See [Release Verification](release-verification.md) for user verification
+commands and release signing coverage.

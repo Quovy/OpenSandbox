@@ -373,7 +373,7 @@ case "$TARGET" in
     TARGET="sdks/sandbox/go"
     TAG_NEEDS_V=true
     DISPLAY_NAME="Go Sandbox SDK"
-    WORKFLOW_HINT=".github/workflows/release-generic.yml"
+    WORKFLOW_HINT=""
     TARGET_PATH_FILTERS=("sdks/sandbox/go" "specs/sandbox-lifecycle.yml")
     ;;
   cli)

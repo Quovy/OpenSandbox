@@ -16,9 +16,6 @@ introduced. Older releases may not have attestations or signatures.
 
 OpenSandbox uses these signing paths:
 
-- Source code releases: the Generic Release workflow uploads an explicit
-  `opensandbox-<tag>.tar.gz` source archive and `SHA256SUMS` file to the GitHub
-  Release, then creates GitHub/Sigstore provenance attestations for both files.
 - Container images: the component and server image workflows sign Docker Hub,
   GitHub Container Registry (GHCR), and Alibaba Cloud Container Registry (ACR)
   image digests with `cosign` keyless signing, and publish provenance
@@ -28,8 +25,6 @@ OpenSandbox uses these signing paths:
 - JavaScript packages: the workflow runs `pnpm pack`, attests the generated npm
   tarball, and publishes that same tarball.
 - C# packages: NuGet `.nupkg` files are attested before publication.
-- Go SDK modules: the `sdks/sandbox/go/v<version>` source release archive is
-  attested by the Generic Release workflow.
 - Helm charts: packaged chart `.tgz` files are attested before upload to the
   GitHub Release.
 - Java/Kotlin packages: Maven Central publications are signed by the Gradle
@@ -54,7 +49,6 @@ Expected identity values:
 
 - Repository: `opensandbox-group/OpenSandbox`
 - OIDC issuer: `https://token.actions.githubusercontent.com`
-- Source release workflow: `opensandbox-group/OpenSandbox/.github/workflows/release-generic.yml`
 - Component image workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-components.yml`
 - Server image workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-server.yml`
 - CLI package workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-cli.yml`
@@ -87,50 +81,6 @@ If you run the release workflows from a downstream fork, replace
 Private signing material is not stored in GitHub Releases, Docker Hub, GHCR,
 ACR, PyPI, npm, Maven Central, NuGet, or Helm chart downloads. Java/Kotlin
 Maven Central signing keys are held only in GitHub Actions secrets.
-
-## Verify Source Releases
-
-Set the release tag first:
-
-```bash
-TAG="server/v0.1.13"
-SAFE_TAG="${TAG//\//-}"
-```
-
-Download the signed source archive and checksum file:
-
-```bash
-gh release download "$TAG" \
-  --repo "$REPOSITORY" \
-  --pattern "opensandbox-${SAFE_TAG}.tar.gz" \
-  --pattern "SHA256SUMS"
-```
-
-Check the archive digest:
-
-```bash
-sha256sum -c SHA256SUMS
-```
-
-Verify the source archive attestation:
-
-```bash
-gh attestation verify "opensandbox-${SAFE_TAG}.tar.gz" \
-  --repo "$REPOSITORY" \
-  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/release-generic.yml"
-```
-
-Verify the checksum file attestation:
-
-```bash
-gh attestation verify SHA256SUMS \
-  --repo "$REPOSITORY" \
-  --signer-workflow "${WORKFLOW_REPOSITORY}/.github/workflows/release-generic.yml"
-```
-
-The Generic Release workflow is started with `workflow_dispatch`, so its
-provenance `source-ref` is the ref selected when the workflow was dispatched
-(normally `refs/heads/main`), not the release tag created by the job.
 
 ## Verify Container Images
 
