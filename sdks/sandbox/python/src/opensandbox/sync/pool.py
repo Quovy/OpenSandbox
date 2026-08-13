@@ -462,6 +462,9 @@ class SandboxPoolSync:
         return len(sandbox_ids)
 
     def snapshot(self) -> PoolSnapshot:
+        # Advance the reconcile state machine first (prune/renew/recover) so readers never
+        # observe a stale DEGRADED state, failure count, or last error after the window drained.
+        backoff_active = self._reconcile_state.is_backoff_active()
         lifecycle_state = self._lifecycle_state
         if lifecycle_state in (
             PoolLifecycleState.NOT_STARTED,
@@ -479,7 +482,7 @@ class SandboxPoolSync:
             idle_count=counters.idle_count,
             max_idle=self._resolve_max_idle(),
             failure_count=self._reconcile_state.failure_count,
-            backoff_active=self._reconcile_state.is_backoff_active(),
+            backoff_active=backoff_active,
             last_error=self._reconcile_state.last_error,
             in_flight_operations=self._in_flight,
         )

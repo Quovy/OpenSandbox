@@ -107,7 +107,14 @@ func (s *reconcileState) recordFailures(count int, err error) {
 func (s *reconcileState) shouldBackoff() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
+	return s.refreshLocked(s.now())
+}
+
+// refreshLocked advances the state machine at the current time and reports whether create
+// attempts should be suppressed: prunes the sliding failure window, renews an expired backoff
+// window while the window is still hot, and recovers to healthy once the window drains.
+// Callers must hold s.mu.
+func (s *reconcileState) refreshLocked(now time.Time) bool {
 	s.pruneExpired(now)
 	if s.healthState != PoolDegraded || s.backoffUntil.IsZero() {
 		return false
@@ -123,12 +130,13 @@ func (s *reconcileState) shouldBackoff() bool {
 	return false
 }
 
-// snapshot returns a point-in-time view of the reconcile health state.
+// snapshot returns a point-in-time view of the reconcile health state. It advances the state
+// machine first (prune/renew/recover) so readers never observe a stale DEGRADED state or stale
+// failure count after the window has drained.
 func (s *reconcileState) snapshot() (PoolHealthState, int, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	backoffActive := s.healthState == PoolDegraded &&
-		!s.backoffUntil.IsZero() && s.now().Before(s.backoffUntil)
+	backoffActive := s.refreshLocked(s.now())
 	return s.healthState, s.failureCount, backoffActive, s.lastError
 }
 

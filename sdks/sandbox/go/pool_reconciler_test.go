@@ -363,6 +363,38 @@ func TestReconciler_BackoffCapDoesNotOverflow(t *testing.T) {
 	}
 }
 
+func TestReconciler_SnapshotAdvancesStateMachine(t *testing.T) {
+	// Regression: snapshot() must prune the failure window and run recovery on the read
+	// path. Otherwise a DEGRADED pool with no deficit (idle full) would keep reporting a
+	// stale DEGRADED state and failure count long after the window drained, because
+	// reconcileTick returns before shouldBackoff() in that case.
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	state := newReconcileState(2)
+	state.now = func() time.Time { return now }
+	state.failureWindow = time.Minute
+
+	state.recordFailure(errors.New("fail-1"))
+	state.recordFailure(errors.New("fail-2"))
+
+	// The 60s window drains and the 30s backoff expires; only a snapshot is taken (no
+	// shouldBackoff call). The snapshot itself must recover the pool.
+	now = now.Add(61 * time.Second)
+
+	healthState, failureCount, backoffActive, lastError := state.snapshot()
+	if healthState != PoolHealthy {
+		assert.Fail(t, fmt.Sprintf("expected PoolHealthy after window drain via snapshot, got %v", healthState))
+	}
+	if failureCount != 0 {
+		assert.Fail(t, fmt.Sprintf("expected failureCount 0 after window drain, got %d", failureCount))
+	}
+	if backoffActive {
+		assert.Fail(t, "expected backoff to be inactive after window drain")
+	}
+	if lastError != "" {
+		assert.Fail(t, fmt.Sprintf("expected empty lastError after window drain, got %q", lastError))
+	}
+}
+
 func TestReconciler_ShrinkExcess(t *testing.T) {
 	store := NewInMemoryPoolStateStore()
 	_ = store.SetMaxIdle(context.Background(), "test-pool", 2)

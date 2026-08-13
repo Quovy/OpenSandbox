@@ -583,6 +583,9 @@ class SandboxPool internal constructor(
      */
     fun snapshot(): PoolSnapshot {
         val lifecycleState = lifecycleState.get()
+        // Advance the reconcile state machine first (prune/renew/recover) so readers never
+        // observe a stale DEGRADED state, failure count, or last error after the window drained.
+        val backoffActive = reconcileState.isBackoffActive()
         val state =
             when (lifecycleState) {
                 LifecycleState.NOT_STARTED,
@@ -598,7 +601,7 @@ class SandboxPool internal constructor(
             idleCount = counters.idleCount,
             maxIdle = resolveMaxIdle(),
             failureCount = reconcileState.failureCount,
-            backoffActive = reconcileState.isBackoffActive(),
+            backoffActive = backoffActive,
             lastError = reconcileState.lastError,
             inFlightOperations = currentRun?.inFlightOperations?.get() ?: 0,
         )
