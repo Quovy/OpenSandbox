@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build the manager binary
-FROM golang:1.25.12-alpine AS builder
+FROM golang:1.25.12-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG GOFLAGS=
@@ -62,7 +62,7 @@ RUN if [ -n "${CC}" ]; then export CC; fi; \
 
 # Use golang image as base to ensure nsenter (util-linux) is available
 # distroless does not contain shell or nsenter
-FROM golang:1.25.12-alpine
+FROM golang:1.25.12-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587
 ARG USERID=65532
 WORKDIR /workspace
 COPY --from=builder /workspace/server .
