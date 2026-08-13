@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.9 AS builder
+FROM golang:1.25.12@sha256:dbeddb5e728ea4b5ba7920574413e311025ffa42d196793857e4d160e8dfe60d AS builder
 
 WORKDIR /build
 
@@ -74,7 +74,7 @@ RUN CGO_ENABLED=0 GOOS=windows go build ${GOFLAGS} -trimpath -buildvcs=false \
     -o /build/execd.exe ./main.go
 
 # Build static bubblewrap with musl.
-FROM alpine:latest AS bwrap-builder
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS bwrap-builder
 RUN apk add --no-cache git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
 COPY components/execd/native/session-gate.c /build/session-gate.c
 RUN gcc -Os -static -s -Wall -Wextra -Werror \
@@ -93,7 +93,7 @@ RUN rm /usr/lib/libcap.so /usr/lib/libcap.so.2 && \
     ninja -C builddir && \
     cp builddir/bwrap /build/bwrap/bwrap
 
-FROM alpine:latest
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 COPY --from=bwrap-builder /build/bwrap/bwrap /usr/local/bin/bwrap
 COPY --from=bwrap-builder --chown=0:0 --chmod=0555 /build/opensandbox-session-gate /usr/local/libexec/opensandbox-session-gate
