@@ -319,6 +319,8 @@ class TestEgressSidecarViaApply:
         security_context = container["securityContext"]
         assert security_context.get("privileged") is not True
         assert "NET_ADMIN" in security_context.get("capabilities", {}).get("add", [])
+        assert security_context["runAsNonRoot"] is False
+        assert security_context["runAsUser"] == 0
 
     def test_no_command_uses_image_entrypoint(self):
         container = _egress_container(
@@ -813,7 +815,11 @@ class TestPrepExecdInitForEgress:
 
         assert result.returncode == 0
         assert install_marker.read_text() == "installed"
-        assert security_context == {"privileged": True}
+        assert security_context == {
+            "privileged": True,
+            "runAsNonRoot": False,
+            "runAsUser": 0,
+        }
 
     def test_existing_ipv6_path_is_disabled_before_execd_install(self, tmp_path, monkeypatch):
         ipv6_disable_path = tmp_path / "disable_ipv6"
