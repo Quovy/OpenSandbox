@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.9-bookworm AS builder
+FROM golang:1.26.5-alpine3.23 AS builder
 
 WORKDIR /workspace
 
@@ -85,58 +85,35 @@ RUN go build ${GOFLAGS} -trimpath -buildvcs=false \
     -ldflags "-s -w -buildid= -B none" \
     -o /out/egress-trace ./tools/egress-trace
 
-FROM debian:bookworm-slim
+FROM cgr.dev/chainguard/wolfi-base@sha256:8acb3a7694eda954b3ad4256aec3291bdd92715d7a8c030abd1a21546337b4e4
 
-# Optional Debian mirror host for restricted build networks (e.g.
-# mirrors.aliyun.com); empty keeps the default deb.debian.org sources.
-ARG APT_MIRROR=
-
-# iptables is needed for DNS REDIRECT; ca-certificates for TLS to upstream resolvers
-RUN if [ -n "${APT_MIRROR}" ]; then \
-        set --; \
-        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
-            if [ -f "$source" ]; then set -- "$@" "$source"; fi; \
-        done; \
-        if [ "$#" -eq 0 ]; then \
-            echo "APT_MIRROR requires a supported APT source file" >&2; exit 1; \
-        fi; \
-        sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
-            "$@"; \
-    fi \
-    && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        iptables \
-        iproute2 \
-        nftables \
+# Keep only the packages required by the egress runtime. The prior diagnostic
+# toolbelt materially expanded the image's vulnerability surface and is not
+# used by the entrypoint or enforcement code. curl stays because the image
+# regression tests in egress-test.yml probe the sidecar through `docker exec
+# ... curl`. Python is pinned to 3.11: the H2 adapter gate below rejects
+# CPython >= 3.12 (mitmproxy enables eager tasks there).
+RUN apk add --no-cache \
         ca-certificates \
-        sudo \
         curl \
-        wget \
-        net-tools \
-        dnsutils \
-        netcat-openbsd \
-        iputils-ping \
-        traceroute \
-        telnet \
-        tcpdump \
-        nmap \
-        htop \
+        iproute2 \
+        iptables \
+        nftables \
         procps \
-        strace \
-        lsof \
-        python3 \
-        python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+        py3.11-pip \
+        python-3.11 \
+        sudo
 
 # Python mitmproxy (transparent mode): mitmdump runs as user mitmproxy; iptables skips this uid.
 # /var/lib/mitmproxy is mitm's home, used as the confdir (CA + config.yaml live under .mitmproxy/).
 COPY components/egress/requirements-mitmproxy.txt /tmp/requirements-mitmproxy.txt
-RUN useradd -r -u 10042 -d /var/lib/mitmproxy -s /usr/sbin/nologin mitmproxy \
+RUN addgroup -S -g 10042 mitmproxy \
+    && adduser -S -D -H -u 10042 -G mitmproxy -h /var/lib/mitmproxy -s /sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
-    && pip3 install --no-cache-dir --break-system-packages \
-        -r /tmp/requirements-mitmproxy.txt \
+    && pip3.11 install --no-cache-dir -r /tmp/requirements-mitmproxy.txt \
     && (command -v mitmdump && mitmdump --version) \
+    && rm -rf /root/.cache \
     && mkdir -p /var/egress/mitmscripts
 
 # Static mitmproxy options (mode, listen_host, connection_strategy, stream_large_bodies,
