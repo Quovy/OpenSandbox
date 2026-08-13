@@ -5,10 +5,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/publish-quovy-images.yml
-      - kubernetes/Dockerfile.image-committer
-      - kubernetes/cmd/image-committer/**
-      - kubernetes/go.mod
-      - kubernetes/go.sum
+      - kubernetes/**
+      - components/execd/**
+      - components/internal/**
       - server/Dockerfile
       - components/egress/**
       - server/pyproject.toml
@@ -33,12 +32,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: controller
+            context: kubernetes
+            dockerfile: kubernetes/Dockerfile
+            repository: opensandbox-controller
           - name: server
             context: server
             dockerfile: server/Dockerfile
             repository: opensandbox-server
+          - name: execd
+            context: .
+            dockerfile: components/execd/Dockerfile
+            repository: opensandbox-execd
           - name: egress
-            context: components/egress
+            context: .
             dockerfile: components/egress/Dockerfile
             repository: opensandbox-egress
           - name: image-committer
