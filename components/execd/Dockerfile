@@ -75,7 +75,9 @@ RUN CGO_ENABLED=0 GOOS=windows go build ${GOFLAGS} -trimpath -buildvcs=false \
 
 # Build static bubblewrap with musl.
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS bwrap-builder
-RUN apk add --no-cache git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
+# The bundle floor keeps the bubblewrap clone below from trusting the
+# compromised emSign ECC Root CA - G3.
+RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0' git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
 COPY components/execd/native/session-gate.c /build/session-gate.c
 RUN gcc -Os -static -s -Wall -Wextra -Werror \
     -o /build/opensandbox-session-gate /build/session-gate.c
