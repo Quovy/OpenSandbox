@@ -62,8 +62,8 @@ RUN rm -rf \
     /usr/local/lib/python3.10/site-packages/setuptools \
     /usr/local/lib/python3.10/site-packages/setuptools-*.dist-info
 
-# The base image's root store and pip 23.0.1 (vendored certifi) still trust
-# the compromised emSign ECC Root CA - G3.
+# The base image's root store and its pip (vendored certifi) still trust the
+# compromised emSign ECC Root CA - G3.
 RUN apk add --no-cache \
         'ca-certificates>=20261020-r0' \
         'ca-certificates-bundle>=20261020-r0' \

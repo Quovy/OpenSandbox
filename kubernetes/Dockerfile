@@ -63,8 +63,8 @@ RUN if [ -n "${CC}" ]; then export CC; fi; \
 # Use golang image as base to ensure nsenter (util-linux) is available
 # distroless does not contain shell or nsenter
 FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca
-# The base image predates the Alpine root store that drops the compromised
-# emSign ECC Root CA - G3; the explicit floor also forces a layer-cache miss.
+# golang:1.26.10-alpine ships a root store that still trusts the compromised
+# emSign ECC Root CA - G3; 20261020-r0 removes it.
 RUN apk add --no-cache \
     'ca-certificates>=20261020-r0' \
     'ca-certificates-bundle>=20261020-r0'

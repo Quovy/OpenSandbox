@@ -80,9 +80,9 @@ FROM cgr.dev/chainguard/wolfi-base@sha256:07e60ff6586b56f03c625e27b604f9f7d29498
 # Keep only the packages required by the egress runtime. The prior diagnostic
 # toolbelt materially expanded the image's vulnerability surface and is not
 # used by the entrypoint or enforcement code.
-# mitmproxy verifies upstream TLS against /etc/ssl/certs, so the version floors
-# keep out the compromised emSign ECC Root CA - G3 (also in pip's vendored
-# certifi) and force a layer-cache miss.
+# The version floors keep the compromised emSign ECC Root CA - G3 out of
+# /etc/ssl/certs, which mitmproxy uses for upstream TLS, and out of pip's
+# vendored certifi.
 RUN apk add --no-cache \
         'ca-certificates>=20260909-r3' \
         'ca-certificates-bundle>=20260909-r3' \
