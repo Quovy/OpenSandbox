@@ -30,7 +30,7 @@ WORKDIR /app
 
 RUN apk add --no-cache curl ca-certificates
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/0.13.4/install.sh | sh
 ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
 COPY pyproject.toml uv.lock ./
@@ -61,6 +61,13 @@ RUN rm -rf \
     /usr/local/lib/python3.10/site-packages/pkg_resources \
     /usr/local/lib/python3.10/site-packages/setuptools \
     /usr/local/lib/python3.10/site-packages/setuptools-*.dist-info
+
+# The base image's root store and pip 23.0.1 (vendored certifi) still trust
+# the compromised emSign ECC Root CA - G3.
+RUN apk add --no-cache \
+        'ca-certificates>=20261020-r0' \
+        'ca-certificates-bundle>=20261020-r0' \
+    && python -m pip install --no-cache-dir 'pip==26.2.2'
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server
