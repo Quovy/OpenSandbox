@@ -12,7 +12,7 @@ executes `echo hello world` via the OpenSandbox Python SDK.
 
 - A Kubernetes cluster with the agent-sandbox controller and CRDs installed.
 - OpenSandbox server configured with Kubernetes runtime and `workload_provider = "agent-sandbox"`.
-- Sandbox image should include `bash` (default example uses `ubuntu:22.04`).
+- Sandbox image should include `bash` (default example uses `ubuntu:24.04`).
 
 ## Start OpenSandbox server
 

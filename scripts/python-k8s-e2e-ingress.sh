@@ -51,7 +51,7 @@ SERVER_RELEASE="${SERVER_RELEASE:-opensandbox-server}"
 SERVER_VALUES_FILE="${SERVER_VALUES_FILE:-/tmp/opensandbox-server-values-ingress.yaml}"
 PORT_FORWARD_LOG="${PORT_FORWARD_LOG:-/tmp/opensandbox-server-port-forward.log}"
 GATEWAY_PORT_FORWARD_LOG="${GATEWAY_PORT_FORWARD_LOG:-/tmp/opensandbox-ingress-gateway-port-forward.log}"
-SANDBOX_TEST_IMAGE="${SANDBOX_TEST_IMAGE:-ubuntu:latest}"
+SANDBOX_TEST_IMAGE="${SANDBOX_TEST_IMAGE:-ubuntu:24.04}"
 
 GATEWAY_LOCAL_PORT="${GATEWAY_LOCAL_PORT:-8081}"
 INGRESS_GATEWAY_ADDRESS="${INGRESS_GATEWAY_ADDRESS:-127.0.0.1:${GATEWAY_LOCAL_PORT}}"
