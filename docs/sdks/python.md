@@ -45,7 +45,7 @@ async def main():
     # 2. Create a Sandbox
     try:
         sandbox = await Sandbox.create(
-            "ubuntu",
+            "ubuntu:24.04",
             connection_config=config
         )
         try:
@@ -88,7 +88,7 @@ config = ConnectionConfigSync(
     transport=httpx.HTTPTransport(limits=httpx.Limits(max_connections=20)),
 )
 
-sandbox = SandboxSync.create("ubuntu", connection_config=config)
+sandbox = SandboxSync.create("ubuntu:24.04", connection_config=config)
 try:
     execution = sandbox.commands.run("echo 'Hello Sandbox!'")
     print(execution.logs.stdout[0].text)
@@ -124,7 +124,7 @@ pool = SandboxPoolSync(
     max_idle=2,
     state_store=InMemoryPoolStateStore(),  # single-process only
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
-    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    creation_spec=PoolCreationSpec(image="ubuntu:24.04"),
     reconcile_interval=timedelta(seconds=5),
 )
 
@@ -163,7 +163,7 @@ pool = SandboxPoolAsync(
     max_idle=2,
     state_store=InMemoryAsyncPoolStateStore(),  # single-event-loop only
     connection_config=ConnectionConfig(domain="api.opensandbox.io"),
-    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    creation_spec=PoolCreationSpec(image="ubuntu:24.04"),
 )
 
 await pool.start()
@@ -222,7 +222,7 @@ pool = SandboxPoolSync(
     max_idle=10,
     state_store=RedisPoolStateStore(redis_client, key_prefix="opensandbox:pool:prod"),
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
-    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    creation_spec=PoolCreationSpec(image="ubuntu:24.04"),
     primary_lock_ttl=timedelta(seconds=60),
 )
 ```
@@ -289,7 +289,7 @@ Create a non-expiring sandbox by omitting `timeout`:
 
 ```python
 manual = await Sandbox.create(
-    "ubuntu",
+    "ubuntu:24.04",
     connection_config=config,
 )
 ```

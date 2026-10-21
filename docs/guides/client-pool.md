@@ -157,7 +157,7 @@ pool = SandboxPoolSync(
     max_idle=2,
     state_store=InMemoryPoolStateStore(),
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
-    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    creation_spec=PoolCreationSpec(image="ubuntu:24.04"),
     reconcile_interval=timedelta(seconds=5),
 )
 
@@ -197,7 +197,7 @@ async with SandboxPoolAsync(
     max_idle=2,
     state_store=InMemoryAsyncPoolStateStore(),
     connection_config=ConnectionConfig(domain="api.opensandbox.io"),
-    creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    creation_spec=PoolCreationSpec(image="ubuntu:24.04"),
 ) as pool:
     sandbox = await pool.acquire(
         sandbox_timeout=timedelta(minutes=30),
@@ -219,7 +219,7 @@ SandboxPool pool = SandboxPool.builder()
     .stateStore(new InMemoryPoolStateStore())
     .connectionConfig(config)
     .creationSpec(PoolCreationSpec.builder()
-        .image("ubuntu:22.04")
+        .image("ubuntu:24.04")
         .entrypoint(List.of("tail", "-f", "/dev/null"))
         .build())
     .warmupReadyTimeout(Duration.ofSeconds(45))
@@ -247,7 +247,7 @@ pool, err := opensandbox.NewSandboxPoolBuilder().
     OwnerID("worker-1").
     MaxIdle(3).
     ConnectionConfig(opensandbox.ConnectionConfig{Domain: "api.opensandbox.io"}).
-    CreationSpec(opensandbox.PoolCreationSpec{Image: "ubuntu:22.04"}).
+    CreationSpec(opensandbox.PoolCreationSpec{Image: "ubuntu:24.04"}).
     StateStore(opensandbox.NewInMemoryPoolStateStore()).
     Build()
 if err != nil {

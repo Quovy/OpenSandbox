@@ -319,7 +319,7 @@ This mode is intended for executing tasks within containers managed by the CRI r
   "name": "my-container-task",
   "spec": {
     "container": {
-      "image": "ubuntu:latest",
+      "image": "ubuntu:24.04",
       "command": ["/bin/bash", "-c"],
       "args": ["apt update && apt install -y curl"],
       "env": [

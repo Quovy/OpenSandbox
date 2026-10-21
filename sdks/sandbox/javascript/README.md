@@ -42,7 +42,7 @@ const config = new ConnectionConfig({
 try {
   const sandbox = await Sandbox.create({
     connectionConfig: config,
-    image: "ubuntu",
+    image: "ubuntu:24.04",
     timeoutSeconds: 10 * 60,
   });
 
@@ -90,7 +90,7 @@ Create a non-expiring sandbox by passing `timeoutSeconds: null`:
 ```ts
 const manual = await Sandbox.create({
   connectionConfig: config,
-  image: "ubuntu",
+  image: "ubuntu:24.04",
   timeoutSeconds: null,
 });
 ```
@@ -171,7 +171,7 @@ const url = await sandbox.getEndpointUrl(44772);
 ```ts
 const sandbox = await Sandbox.create({
   connectionConfig: config,
-  image: "ubuntu",
+  image: "ubuntu:24.04",
   volumes: [
     {
       name: "oss-data",

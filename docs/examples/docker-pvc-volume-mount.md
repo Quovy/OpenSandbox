@@ -60,7 +60,7 @@ uv pip install opensandbox
 ### 4. Pull the Sandbox Image
 
 ```shell
-docker pull ubuntu:latest
+docker pull ubuntu:24.04
 ```
 
 ## Run
@@ -72,14 +72,14 @@ uv run python examples/docker-pvc-volume-mount/main.py
 The script automatically creates the named volume and seeds it with test data. You can also specify a custom volume name or image:
 
 ```shell
-SANDBOX_IMAGE=ubuntu SANDBOX_DOMAIN=localhost:8080 uv run python examples/docker-pvc-volume-mount/main.py
+SANDBOX_IMAGE=ubuntu:24.04 SANDBOX_DOMAIN=localhost:8080 uv run python examples/docker-pvc-volume-mount/main.py
 ```
 
 ## Expected Output
 
 ```text
 OpenSandbox server : localhost:8080
-Sandbox image      : ubuntu
+Sandbox image      : ubuntu:24.04
 Docker volume      : opensandbox-pvc-demo
   Ensuring Docker named volume 'opensandbox-pvc-demo' exists...
   Created volume 'opensandbox-pvc-demo' with marker.txt
@@ -118,7 +118,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import PVC, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu",
+    image="ubuntu:24.04",
     volumes=[
         Volume(
             name="my-data",
@@ -138,7 +138,7 @@ from opensandbox import SandboxSync
 from opensandbox.models.sandboxes import PVC, Volume
 
 sandbox = SandboxSync.create(
-    image="ubuntu",
+    image="ubuntu:24.04",
     volumes=[
         Volume(
             name="my-data",
@@ -156,7 +156,7 @@ sandbox = SandboxSync.create(
 import { Sandbox } from "@alibaba-group/opensandbox";
 
 const sandbox = await Sandbox.create({
-  image: "ubuntu",
+  image: "ubuntu:24.04",
   volumes: [
     {
       name: "my-data",
@@ -181,7 +181,7 @@ Volume volume = Volume.builder()
     .build();
 
 Sandbox sandbox = Sandbox.builder()
-    .image("ubuntu")
+    .image("ubuntu:24.04")
     .volume(volume)
     .build();
 ```

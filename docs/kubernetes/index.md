@@ -430,7 +430,7 @@ spec:
       shareProcessNamespace: true
       containers:
       - name: sandbox-container
-        image: ubuntu:latest
+        image: ubuntu:24.04
         command: ["sleep", "3600"]
       - name: task-executor
         image: <task-executor-image>:<tag>

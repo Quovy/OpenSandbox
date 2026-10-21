@@ -47,7 +47,7 @@ try
     await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
     {
         ConnectionConfig = config,
-        Image = "ubuntu",
+        Image = "ubuntu:24.04",
         TimeoutSeconds = 10 * 60,
     });
 
@@ -91,7 +91,7 @@ Create a non-expiring sandbox by setting `ManualCleanup = true`:
 var manual = await Sandbox.CreateAsync(new SandboxCreateOptions
 {
     ConnectionConfig = config,
-    Image = "ubuntu",
+    Image = "ubuntu:24.04",
     ManualCleanup = true,
 });
 ```
