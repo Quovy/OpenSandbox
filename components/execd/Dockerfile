@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.12@sha256:dbeddb5e728ea4b5ba7920574413e311025ffa42d196793857e4d160e8dfe60d AS builder
+FROM golang:1.26.10@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS builder
 
 WORKDIR /build
 
@@ -94,6 +94,10 @@ RUN rm /usr/lib/libcap.so /usr/lib/libcap.so.2 && \
     cp builddir/bwrap /build/bwrap/bwrap
 
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+# The pinned base still trusts the compromised emSign ECC Root CA - G3;
+# 20261020-r0 drops it.
+RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0'
 
 COPY --from=bwrap-builder /build/bwrap/bwrap /usr/local/bin/bwrap
 COPY --from=bwrap-builder --chown=0:0 --chmod=0555 /build/opensandbox-session-gate /usr/local/libexec/opensandbox-session-gate
