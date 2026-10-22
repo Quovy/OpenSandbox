@@ -61,7 +61,7 @@ pip install -e sdks/sandbox/python
 ```bash
 export SANDBOX_DOMAIN=localhost:8080
 export SANDBOX_API_KEY=your-api-key
-export SANDBOX_IMAGE=ubuntu
+export SANDBOX_IMAGE=ubuntu:24.04
 
 export OSS_BUCKET=your-bucket
 export OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
@@ -82,7 +82,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import OSSFS, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu",
+    image="ubuntu:24.04",
     volumes=[
         Volume(
             name="oss-data",

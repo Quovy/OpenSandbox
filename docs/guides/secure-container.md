@@ -362,7 +362,7 @@ Create a sandbox and verify it's running in a VM by checking the kernel:
 curl --location 'http://127.0.0.1:8080/v1/sandboxes' \
   --header 'Content-Type: application/json' \
   --data '{
-    "image": {"uri": "ubuntu:latest"},
+    "image": {"uri": "ubuntu:24.04"},
     "timeout": 3600,
     "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
     "entrypoint": ["/bin/bash", "-c", "while true; do uname -a; sleep 1; done"],

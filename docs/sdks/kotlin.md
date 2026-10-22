@@ -52,7 +52,7 @@ public class QuickStart {
         // 2. Create a Sandbox using try-with-resources
         try (Sandbox sandbox = Sandbox.builder()
                 .connectionConfig(config)
-                .image("ubuntu")
+                .image("ubuntu:24.04")
                 .build()) {
 
             // 3. Execute a shell command
@@ -105,7 +105,7 @@ Create a non-expiring sandbox by passing `timeout(null)`:
 ```java
 Sandbox manual = Sandbox.builder()
     .connectionConfig(config)
-    .image("ubuntu")
+    .image("ubuntu:24.04")
     .timeout(null)
     .build();
 ```
@@ -245,7 +245,7 @@ SandboxPool pool = SandboxPool.builder()
     .connectionConfig(config)
     .creationSpec(
         PoolCreationSpec.builder()
-            .image("ubuntu:22.04")
+            .image("ubuntu:24.04")
             .entrypoint(java.util.List.of("tail", "-f", "/dev/null"))
             .extension("storage.id", "dataset-001")
             .build()

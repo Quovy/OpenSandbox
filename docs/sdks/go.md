@@ -198,7 +198,7 @@ func main() {
             Domain: "api.opensandbox.io",
         }).
         CreationSpec(opensandbox.PoolCreationSpec{
-            Image: "ubuntu:22.04",
+            Image: "ubuntu:24.04",
         }).
         StateStore(opensandbox.NewInMemoryPoolStateStore()). // single-process only
         Build()
@@ -276,7 +276,7 @@ pool, err := opensandbox.NewSandboxPoolBuilder().
         Domain: "api.opensandbox.io",
     }).
     CreationSpec(opensandbox.PoolCreationSpec{
-        Image: "ubuntu:22.04",
+        Image: "ubuntu:24.04",
     }).
     PrimaryLockTTL(60 * time.Second).
     Build()

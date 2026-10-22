@@ -42,7 +42,7 @@ SandboxPool pool = SandboxPool.builder()
     .connectionConfig(config)
     .creationSpec(
         PoolCreationSpec.builder()
-            .image("ubuntu:22.04")
+            .image("ubuntu:24.04")
             .build()
     )
     .build();

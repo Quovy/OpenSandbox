@@ -173,10 +173,10 @@ wait_for_sidecar_gone() {
   done
 }
 
-docker pull ubuntu:latest
+docker pull ubuntu:24.04
 
 create_payload='{
-  "image": { "uri": "ubuntu" },
+  "image": { "uri": "ubuntu:24.04" },
   "env": { "HELLO": "WORLD" },
   "metadata": { "hello": "world" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -373,7 +373,7 @@ echo "Sandbox ${SANDBOX_ID} deleted."
 
 step "Create sandbox with networkPolicy (egress sidecar)"
 egress_payload='{
-  "image": { "uri": "ubuntu" },
+  "image": { "uri": "ubuntu:24.04" },
   "env": {},
   "metadata": { "egress": "on" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -433,7 +433,7 @@ echo "opensandbox-e2e-marker" > /tmp/opensandbox-e2e/host-volume-test/marker.txt
 chmod -R 755 /tmp/opensandbox-e2e
 
 volume_payload='{
-  "image": { "uri": "ubuntu" },
+  "image": { "uri": "ubuntu:24.04" },
   "env": {},
   "metadata": { "volume": "host-test" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -519,7 +519,7 @@ fi
 
 step "Create short-lived sandbox (60s TTL) for auto-expiration"
 create_payload_short='{
-  "image": { "uri": "ubuntu" },
+  "image": { "uri": "ubuntu:24.04" },
   "env": {},
   "metadata": { "lifecycle": "short" },
   "entrypoint": ["tail", "-f", "/dev/null"],

@@ -70,7 +70,7 @@ uv pip install -e sdks/sandbox/python
 ### 5. Pull the Sandbox Image
 
 ```shell
-docker pull ubuntu:latest
+docker pull ubuntu:24.04
 ```
 
 ## Run
@@ -85,7 +85,7 @@ HOST_VOLUME_PATH=/tmp/opensandbox-data uv run python examples/host-volume-mount/
 Using HOST_VOLUME_PATH: /tmp/opensandbox-data
 
 OpenSandbox server : localhost:8080
-Sandbox image      : ubuntu
+Sandbox image      : ubuntu:24.04
 Host volume path   : /tmp/opensandbox-data
 
 ============================================================
@@ -129,7 +129,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import Host, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu",
+    image="ubuntu:24.04",
     volumes=[
         Volume(
             name="my-data",
@@ -149,7 +149,7 @@ from opensandbox import SandboxSync
 from opensandbox.models.sandboxes import Host, Volume
 
 sandbox = SandboxSync.create(
-    image="ubuntu",
+    image="ubuntu:24.04",
     volumes=[
         Volume(
             name="my-data",
@@ -166,7 +166,7 @@ sandbox = SandboxSync.create(
 import { Sandbox } from "@alibaba-group/opensandbox";
 
 const sandbox = await Sandbox.create({
-  image: "ubuntu",
+  image: "ubuntu:24.04",
   volumes: [
     {
       name: "my-data",
@@ -189,7 +189,7 @@ Volume volume = Volume.builder()
     .build();
 
 Sandbox sandbox = Sandbox.builder()
-    .image("ubuntu")
+    .image("ubuntu:24.04")
     .volume(volume)
     .build();
 ```

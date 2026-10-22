@@ -320,7 +320,7 @@ curl http://localhost:5758/health
   "name": "my-container-task",
   "spec": {
     "container": {
-      "image": "ubuntu:latest",
+      "image": "ubuntu:24.04",
       "command": ["/bin/bash", "-c"],
       "args": ["apt update && apt install -y curl"],
       "env": [
