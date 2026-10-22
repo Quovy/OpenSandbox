@@ -23,7 +23,7 @@ from opensandbox.config import ConnectionConfig
 async def main() -> None:
     domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
     api_key = os.getenv("SANDBOX_API_KEY")
-    image = os.getenv("SANDBOX_IMAGE", "ubuntu:22.04")
+    image = os.getenv("SANDBOX_IMAGE", "ubuntu:24.04")
 
     config = ConnectionConfig(
         domain=domain,

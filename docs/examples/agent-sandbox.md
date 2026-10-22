@@ -11,7 +11,7 @@ This example creates a sandbox backed by `kubernetes-sigs/agent-sandbox` and exe
 
 - A Kubernetes cluster with agent-sandbox >= v0.5.0 controller and CRDs installed, serving `agents.x-k8s.io/v1beta1`.
 - OpenSandbox server configured with Kubernetes runtime and `workload_provider = "agent-sandbox"`.
-- Sandbox image should include `bash` (default example uses `ubuntu:22.04`).
+- Sandbox image should include `bash` (default example uses `ubuntu:24.04`).
 
 ## Compatibility and migration
 
