@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.25.12@sha256:dbeddb5e728ea4b5ba7920574413e311025ffa42d196793857e4d160e8dfe60d AS builder
+FROM golang:1.26.10@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS builder
 
 WORKDIR /build
 
@@ -75,7 +75,9 @@ RUN CGO_ENABLED=0 GOOS=windows go build ${GOFLAGS} -trimpath -buildvcs=false \
 
 # Build static bubblewrap with musl.
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS bwrap-builder
-RUN apk add --no-cache git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
+# The bundle floor keeps the bubblewrap clone below from trusting the
+# compromised emSign ECC Root CA - G3.
+RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0' git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
 COPY components/execd/native/session-gate.c /build/session-gate.c
 RUN gcc -Os -static -s -Wall -Wextra -Werror \
     -o /build/opensandbox-session-gate /build/session-gate.c
@@ -108,7 +110,7 @@ RUN rm /usr/lib/libcap.so /usr/lib/libcap.so.2 && \
 # touch (resolved by name against the target kernel BTF at load time), so
 # no per-arch vmlinux.h or host kernel BTF is needed — this stage is fully
 # hermetic and cross-compiles for every TARGETARCH.
-FROM golang:1.25.12@sha256:dbeddb5e728ea4b5ba7920574413e311025ffa42d196793857e4d160e8dfe60d AS ebpf-builder
+FROM golang:1.26.10@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS ebpf-builder
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
@@ -141,7 +143,9 @@ RUN CGO_ENABLED=0 go build -tags ebpf -trimpath -buildvcs=false \
 
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-RUN apk add --no-cache nss-tools
+# The pinned base still trusts the compromised emSign ECC Root CA - G3;
+# 20261020-r0 drops it.
+RUN apk add --no-cache nss-tools 'ca-certificates-bundle>=20261020-r0'
 
 COPY --from=bwrap-builder --chown=0:0 /build/bwrap/bwrap /usr/local/bin/bwrap
 COPY --from=bwrap-builder --chown=0:0 /build/opensandbox-session-gate /usr/local/libexec/opensandbox-session-gate

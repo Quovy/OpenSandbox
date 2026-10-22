@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build the manager binary
-FROM golang:1.25.12-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS builder
+FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder
 ARG TARGETOS
 ARG TARGETARCH
 ARG GOFLAGS=
@@ -62,7 +62,12 @@ RUN if [ -n "${CC}" ]; then export CC; fi; \
 
 # Use golang image as base to ensure nsenter (util-linux) is available
 # distroless does not contain shell or nsenter
-FROM golang:1.25.12-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587
+FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca
+# golang:1.26.10-alpine ships a root store that still trusts the compromised
+# emSign ECC Root CA - G3; 20261020-r0 removes it.
+RUN apk add --no-cache \
+    'ca-certificates>=20261020-r0' \
+    'ca-certificates-bundle>=20261020-r0'
 ARG USERID=65532
 WORKDIR /workspace
 COPY --from=builder /workspace/server .

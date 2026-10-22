@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.26.5-alpine3.23 AS builder
+FROM golang:1.26.10-alpine3.23 AS builder
 
 WORKDIR /workspace
 
@@ -93,14 +93,18 @@ FROM cgr.dev/chainguard/wolfi-base@sha256:8acb3a7694eda954b3ad4256aec3291bdd9271
 # regression tests in egress-test.yml probe the sidecar through `docker exec
 # ... curl`. Python is pinned to 3.11: the H2 adapter gate below rejects
 # CPython >= 3.12 (mitmproxy enables eager tasks there).
+# The version floors keep the compromised emSign ECC Root CA - G3 out of
+# /etc/ssl/certs, which mitmproxy uses for upstream TLS, and out of pip's
+# vendored certifi.
 RUN apk add --no-cache \
-        ca-certificates \
+        'ca-certificates>=20260909-r3' \
+        'ca-certificates-bundle>=20260909-r3' \
         curl \
         iproute2 \
         iptables \
         nftables \
         procps \
-        py3.11-pip \
+        'py3.11-pip>=26.2.2' \
         python-3.11 \
         sudo
 
@@ -111,7 +115,7 @@ RUN addgroup -S -g 10042 mitmproxy \
     && adduser -S -D -H -u 10042 -G mitmproxy -h /var/lib/mitmproxy -s /sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
-    && pip3.11 install --no-cache-dir -r /tmp/requirements-mitmproxy.txt \
+    && pip3.11 install --no-cache-dir -r /tmp/requirements-mitmproxy.txt 'certifi>=2026.10.19' \
     && (command -v mitmdump && mitmdump --version) \
     && rm -rf /root/.cache \
     && mkdir -p /var/egress/mitmscripts
