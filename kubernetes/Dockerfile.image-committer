@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Build stage
-FROM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS builder
+FROM golang:1.26.10-alpine3.23@sha256:a07f231c19b03e6106cf442f02a5bcf262147e744d15b7b5e4b6d81d420c70a0 AS builder
 
 WORKDIR /workspace
 
@@ -35,7 +35,10 @@ ARG TARGETARCH
 # Install nerdctl for container operations
 # nerdctl is used to find containers, commit rootfs, and push images.
 # We use nerdctl directly (not crictl or ctr) to avoid CRI API version issues.
+# curl and nerdctl verify TLS against this bundle; 20261020-r0 drops the
+# compromised emSign ECC Root CA - G3 that the pinned base image still trusts.
 RUN apk add --no-cache \
+    'ca-certificates-bundle>=20261020-r0' \
     curl \
     jq
 

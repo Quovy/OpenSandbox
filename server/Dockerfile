@@ -28,9 +28,13 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /app
 
-RUN apk add --no-cache curl ca-certificates
+# The floors keep curl from trusting the compromised emSign ECC Root CA - G3
+# while it fetches the uv installer.
+RUN apk add --no-cache curl \
+        'ca-certificates>=20261020-r0' \
+        'ca-certificates-bundle>=20261020-r0'
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/0.13.4/install.sh | sh
 ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
 COPY pyproject.toml uv.lock ./
@@ -61,6 +65,15 @@ RUN rm -rf \
     /usr/local/lib/python3.10/site-packages/pkg_resources \
     /usr/local/lib/python3.10/site-packages/setuptools \
     /usr/local/lib/python3.10/site-packages/setuptools-*.dist-info
+
+# The base image's root store and its pip (vendored certifi) still trust the
+# compromised emSign ECC Root CA - G3. --cert makes the old pip download its
+# replacement through the fixed store.
+RUN apk add --no-cache \
+        'ca-certificates>=20261020-r0' \
+        'ca-certificates-bundle>=20261020-r0' \
+    && python -m pip install --no-cache-dir \
+        --cert /etc/ssl/certs/ca-certificates.crt 'pip==26.2.2'
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server

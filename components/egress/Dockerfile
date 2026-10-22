@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.26.5-alpine3.23 AS builder
+FROM golang:1.26.10-alpine3.23 AS builder
 
 WORKDIR /workspace
 
@@ -80,13 +80,18 @@ FROM cgr.dev/chainguard/wolfi-base@sha256:07e60ff6586b56f03c625e27b604f9f7d29498
 # Keep only the packages required by the egress runtime. The prior diagnostic
 # toolbelt materially expanded the image's vulnerability surface and is not
 # used by the entrypoint or enforcement code.
+# The version floors keep the compromised emSign ECC Root CA - G3 out of
+# /etc/ssl/certs, which mitmproxy uses for upstream TLS, and out of pip's
+# vendored certifi.
 RUN apk add --no-cache \
-        ca-certificates \
+        'ca-certificates>=20260909-r3' \
+        'ca-certificates-bundle>=20260909-r3' \
         iproute2 \
         iptables \
         nftables \
         procps \
-        py3.12-pip \
+        'py3.12-pip>=26.2.2' \
+        'py3.12-pip-base>=26.2.2' \
         python-3.12 \
         sudo
 
@@ -96,7 +101,7 @@ RUN addgroup -S -g 10042 mitmproxy \
     && adduser -S -D -H -u 10042 -G mitmproxy -h /var/lib/mitmproxy -s /sbin/nologin mitmproxy \
     && mkdir -p /var/lib/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /var/lib/mitmproxy \
-    && pip3.12 install --no-cache-dir 'mitmproxy==12.2.3' \
+    && pip3.12 install --no-cache-dir 'mitmproxy==12.2.3' 'certifi>=2026.10.19' \
     && (command -v mitmdump && mitmdump --version) \
     && rm -rf /root/.cache \
     && mkdir -p /var/egress/mitmscripts
