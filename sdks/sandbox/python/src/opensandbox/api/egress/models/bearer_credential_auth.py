@@ -71,7 +71,7 @@ class BearerCredentialAuth:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_substitution import CredentialSubstitution  # noqa: PLC0415
+        from ..models.credential_substitution import CredentialSubstitution
 
         d = dict(src_dict)
         type_ = BearerCredentialAuthType(d.pop("type"))

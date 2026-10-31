@@ -111,15 +111,15 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: PatchSandboxMetadataRequest,
 ) -> Response[ErrorResponse | Sandbox]:
-    """Patch sandbox metadata
+    r"""Patch sandbox metadata
 
      Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
 
     **Merge Patch rules:**
     | Request body key/value | Behavior |
     |---|---|
-    | `"key": "value"` | Add or replace the key |
-    | `"key": null` | Delete the key (silently ignored if key does not exist) |
+    | `\"key\": \"value\"` | Add or replace the key |
+    | `\"key\": null` | Delete the key (silently ignored if key does not exist) |
     | key absent | Keep current value (no change) |
     | Empty `{}` | No-op, returns current metadata |
 
@@ -174,15 +174,15 @@ def sync(
     client: AuthenticatedClient | Client,
     body: PatchSandboxMetadataRequest,
 ) -> ErrorResponse | Sandbox | None:
-    """Patch sandbox metadata
+    r"""Patch sandbox metadata
 
      Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
 
     **Merge Patch rules:**
     | Request body key/value | Behavior |
     |---|---|
-    | `"key": "value"` | Add or replace the key |
-    | `"key": null` | Delete the key (silently ignored if key does not exist) |
+    | `\"key\": \"value\"` | Add or replace the key |
+    | `\"key\": null` | Delete the key (silently ignored if key does not exist) |
     | key absent | Keep current value (no change) |
     | Empty `{}` | No-op, returns current metadata |
 
@@ -232,15 +232,15 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: PatchSandboxMetadataRequest,
 ) -> Response[ErrorResponse | Sandbox]:
-    """Patch sandbox metadata
+    r"""Patch sandbox metadata
 
      Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
 
     **Merge Patch rules:**
     | Request body key/value | Behavior |
     |---|---|
-    | `"key": "value"` | Add or replace the key |
-    | `"key": null` | Delete the key (silently ignored if key does not exist) |
+    | `\"key\": \"value\"` | Add or replace the key |
+    | `\"key\": null` | Delete the key (silently ignored if key does not exist) |
     | key absent | Keep current value (no change) |
     | Empty `{}` | No-op, returns current metadata |
 
@@ -293,15 +293,15 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: PatchSandboxMetadataRequest,
 ) -> ErrorResponse | Sandbox | None:
-    """Patch sandbox metadata
+    r"""Patch sandbox metadata
 
      Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
 
     **Merge Patch rules:**
     | Request body key/value | Behavior |
     |---|---|
-    | `"key": "value"` | Add or replace the key |
-    | `"key": null` | Delete the key (silently ignored if key does not exist) |
+    | `\"key\": \"value\"` | Add or replace the key |
+    | `\"key\": null` | Delete the key (silently ignored if key does not exist) |
     | key absent | Keep current value (no change) |
     | Empty `{}` | No-op, returns current metadata |
 

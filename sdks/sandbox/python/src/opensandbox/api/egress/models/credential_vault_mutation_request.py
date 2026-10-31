@@ -69,8 +69,8 @@ class CredentialVaultMutationRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_binding_mutation_set import CredentialBindingMutationSet  # noqa: PLC0415
-        from ..models.credential_mutation_set import CredentialMutationSet  # noqa: PLC0415
+        from ..models.credential_binding_mutation_set import CredentialBindingMutationSet
+        from ..models.credential_mutation_set import CredentialMutationSet
 
         d = dict(src_dict)
         expected_revision = d.pop("expectedRevision", UNSET)

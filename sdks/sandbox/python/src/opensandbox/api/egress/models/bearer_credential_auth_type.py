@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class BearerCredentialAuthType(StrEnum):
+class BearerCredentialAuthType(str, Enum):
     BEARER = "bearer"
 
     def __str__(self) -> str:

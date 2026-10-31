@@ -57,7 +57,7 @@ class Credential:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.inline_credential_source import InlineCredentialSource  # noqa: PLC0415
+        from ..models.inline_credential_source import InlineCredentialSource
 
         d = dict(src_dict)
         name = d.pop("name")

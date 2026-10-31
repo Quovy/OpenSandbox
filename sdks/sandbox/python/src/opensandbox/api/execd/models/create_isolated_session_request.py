@@ -132,9 +132,9 @@ class CreateIsolatedSessionRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.bind_mount import BindMount  # noqa: PLC0415
-        from ..models.env_passthrough_spec import EnvPassthroughSpec  # noqa: PLC0415
-        from ..models.isolated_workspace_spec import IsolatedWorkspaceSpec  # noqa: PLC0415
+        from ..models.bind_mount import BindMount
+        from ..models.env_passthrough_spec import EnvPassthroughSpec
+        from ..models.isolated_workspace_spec import IsolatedWorkspaceSpec
 
         d = dict(src_dict)
         workspace = IsolatedWorkspaceSpec.from_dict(d.pop("workspace"))

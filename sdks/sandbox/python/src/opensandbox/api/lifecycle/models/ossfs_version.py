@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class OSSFSVersion(StrEnum):
+class OSSFSVersion(str, Enum):
     VALUE_0 = "1.0"
     VALUE_1 = "2.0"
 

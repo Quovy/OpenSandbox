@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class NetworkPolicyDefaultAction(StrEnum):
+class NetworkPolicyDefaultAction(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
 

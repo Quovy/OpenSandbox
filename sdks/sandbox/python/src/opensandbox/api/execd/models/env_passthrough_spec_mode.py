@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class EnvPassthroughSpecMode(StrEnum):
+class EnvPassthroughSpecMode(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
 

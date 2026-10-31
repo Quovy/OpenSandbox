@@ -66,7 +66,7 @@ class Endpoint:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.endpoint_headers import EndpointHeaders  # noqa: PLC0415
+        from ..models.endpoint_headers import EndpointHeaders
 
         d = dict(src_dict)
         endpoint = d.pop("endpoint")

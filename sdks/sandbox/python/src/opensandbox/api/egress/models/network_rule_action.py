@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class NetworkRuleAction(StrEnum):
+class NetworkRuleAction(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
 

@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class InlineCredentialSourceType(StrEnum):
+class InlineCredentialSourceType(str, Enum):
     INLINE = "inline"
 
     def __str__(self) -> str:

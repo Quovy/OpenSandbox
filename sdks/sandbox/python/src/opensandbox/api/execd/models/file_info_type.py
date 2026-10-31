@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class FileInfoType(StrEnum):
+class FileInfoType(str, Enum):
     DIRECTORY = "directory"
     FILE = "file"
     OTHER = "other"

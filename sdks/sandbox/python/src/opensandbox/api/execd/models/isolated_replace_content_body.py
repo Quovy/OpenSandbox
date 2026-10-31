@@ -31,6 +31,8 @@ T = TypeVar("T", bound="IsolatedReplaceContentBody")
 
 @_attrs_define
 class IsolatedReplaceContentBody:
+    """ """
+
     additional_properties: dict[str, ReplaceFileContentItem] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,7 +44,7 @@ class IsolatedReplaceContentBody:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.replace_file_content_item import ReplaceFileContentItem  # noqa: PLC0415
+        from ..models.replace_file_content_item import ReplaceFileContentItem
 
         d = dict(src_dict)
         isolated_replace_content_body = cls()

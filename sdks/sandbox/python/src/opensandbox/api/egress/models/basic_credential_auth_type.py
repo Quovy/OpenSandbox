@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class BasicCredentialAuthType(StrEnum):
+class BasicCredentialAuthType(str, Enum):
     BASIC = "basic"
 
     def __str__(self) -> str:

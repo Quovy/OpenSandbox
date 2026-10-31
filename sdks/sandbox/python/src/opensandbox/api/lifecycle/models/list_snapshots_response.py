@@ -63,8 +63,8 @@ class ListSnapshotsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.pagination_info import PaginationInfo  # noqa: PLC0415
-        from ..models.snapshot import Snapshot  # noqa: PLC0415
+        from ..models.pagination_info import PaginationInfo
+        from ..models.snapshot import Snapshot
 
         d = dict(src_dict)
         items = []

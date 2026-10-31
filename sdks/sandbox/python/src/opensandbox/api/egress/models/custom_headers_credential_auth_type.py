@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class CustomHeadersCredentialAuthType(StrEnum):
+class CustomHeadersCredentialAuthType(str, Enum):
     CUSTOMHEADERS = "customHeaders"
 
     def __str__(self) -> str:

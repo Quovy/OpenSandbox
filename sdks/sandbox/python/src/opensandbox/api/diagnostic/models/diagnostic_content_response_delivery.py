@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class DiagnosticContentResponseDelivery(StrEnum):
+class DiagnosticContentResponseDelivery(str, Enum):
     INLINE = "inline"
     URL = "url"
 

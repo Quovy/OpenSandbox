@@ -22,6 +22,7 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from dateutil.parser import isoparse
 
 from ..models.file_info_type import FileInfoType
 from ..types import UNSET, Unset
@@ -98,9 +99,9 @@ class FileInfo:
 
         size = d.pop("size")
 
-        modified_at = datetime.datetime.fromisoformat(d.pop("modified_at"))
+        modified_at = isoparse(d.pop("modified_at"))
 
-        created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
+        created_at = isoparse(d.pop("created_at"))
 
         owner = d.pop("owner")
 

@@ -76,8 +76,8 @@ class CredentialBindingMetadata:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_auth_metadata import CredentialAuthMetadata  # noqa: PLC0415
-        from ..models.credential_match import CredentialMatch  # noqa: PLC0415
+        from ..models.credential_auth_metadata import CredentialAuthMetadata
+        from ..models.credential_match import CredentialMatch
 
         d = dict(src_dict)
         name = d.pop("name")

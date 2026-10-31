@@ -31,6 +31,8 @@ T = TypeVar("T", bound="ChmodFilesBody")
 
 @_attrs_define
 class ChmodFilesBody:
+    """ """
+
     additional_properties: dict[str, Permission] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,7 +44,7 @@ class ChmodFilesBody:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.permission import Permission  # noqa: PLC0415
+        from ..models.permission import Permission
 
         d = dict(src_dict)
         chmod_files_body = cls()

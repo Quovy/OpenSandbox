@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class DiagnosticContentResponseKind(StrEnum):
+class DiagnosticContentResponseKind(str, Enum):
     EVENTS = "events"
     LOGS = "logs"
 

@@ -80,7 +80,7 @@ class PolicyStatusResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.network_policy import NetworkPolicy  # noqa: PLC0415
+        from ..models.network_policy import NetworkPolicy
 
         d = dict(src_dict)
         status = d.pop("status", UNSET)

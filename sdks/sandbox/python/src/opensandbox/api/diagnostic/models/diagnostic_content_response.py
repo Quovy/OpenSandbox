@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
+from dateutil.parser import isoparse
 
 from ..models.diagnostic_content_response_delivery import DiagnosticContentResponseDelivery
 from ..models.diagnostic_content_response_kind import DiagnosticContentResponseKind
@@ -148,7 +149,7 @@ class DiagnosticContentResponse:
         if isinstance(_expires_at, Unset):
             expires_at = UNSET
         else:
-            expires_at = datetime.datetime.fromisoformat(_expires_at)
+            expires_at = isoparse(_expires_at)
 
         warnings = cast(list[str], d.pop("warnings", UNSET))
 

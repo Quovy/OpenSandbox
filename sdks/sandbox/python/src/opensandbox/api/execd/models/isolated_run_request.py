@@ -57,7 +57,6 @@ class IsolatedRunRequest:
             a read-only (`ro`) workspace reject them with 400: there is no
             host-visible writable location for the run's log and exit-code
             files. rw and overlay workspaces are supported.
-             Example: False.
     """
 
     code: str
@@ -95,7 +94,7 @@ class IsolatedRunRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.isolated_run_request_envs import IsolatedRunRequestEnvs  # noqa: PLC0415
+        from ..models.isolated_run_request_envs import IsolatedRunRequestEnvs
 
         d = dict(src_dict)
         code = d.pop("code")

@@ -70,7 +70,7 @@ class NetworkPolicy:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.network_rule import NetworkRule  # noqa: PLC0415
+        from ..models.network_rule import NetworkRule
 
         d = dict(src_dict)
         _default_action = d.pop("defaultAction", UNSET)

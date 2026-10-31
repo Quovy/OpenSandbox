@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class SessionStateStatus(StrEnum):
+class SessionStateStatus(str, Enum):
     ACTIVE = "active"
     DEAD = "dead"
     DESTROYED = "destroyed"

@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class CreateIsolatedSessionRequestProfile(StrEnum):
+class CreateIsolatedSessionRequestProfile(str, Enum):
     BALANCED = "balanced"
     STRICT = "strict"
 

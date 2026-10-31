@@ -275,15 +275,15 @@ class CreateSandboxRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.create_sandbox_request_env import CreateSandboxRequestEnv  # noqa: PLC0415
-        from ..models.create_sandbox_request_extensions import CreateSandboxRequestExtensions  # noqa: PLC0415
-        from ..models.create_sandbox_request_metadata import CreateSandboxRequestMetadata  # noqa: PLC0415
-        from ..models.credential_proxy_config import CredentialProxyConfig  # noqa: PLC0415
-        from ..models.image_spec import ImageSpec  # noqa: PLC0415
-        from ..models.network_policy import NetworkPolicy  # noqa: PLC0415
-        from ..models.platform_spec import PlatformSpec  # noqa: PLC0415
-        from ..models.resource_limits import ResourceLimits  # noqa: PLC0415
-        from ..models.volume import Volume  # noqa: PLC0415
+        from ..models.create_sandbox_request_env import CreateSandboxRequestEnv
+        from ..models.create_sandbox_request_extensions import CreateSandboxRequestExtensions
+        from ..models.create_sandbox_request_metadata import CreateSandboxRequestMetadata
+        from ..models.credential_proxy_config import CredentialProxyConfig
+        from ..models.image_spec import ImageSpec
+        from ..models.network_policy import NetworkPolicy
+        from ..models.platform_spec import PlatformSpec
+        from ..models.resource_limits import ResourceLimits
+        from ..models.volume import Volume
 
         d = dict(src_dict)
         _image = d.pop("image", UNSET)

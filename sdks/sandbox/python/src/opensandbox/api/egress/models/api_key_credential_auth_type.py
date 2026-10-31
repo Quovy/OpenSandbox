@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class ApiKeyCredentialAuthType(StrEnum):
+class ApiKeyCredentialAuthType(str, Enum):
     APIKEY = "apiKey"
 
     def __str__(self) -> str:

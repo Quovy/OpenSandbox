@@ -31,6 +31,8 @@ T = TypeVar("T", bound="IsolatedChmodFilesBody")
 
 @_attrs_define
 class IsolatedChmodFilesBody:
+    """ """
+
     additional_properties: dict[str, Permission] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,7 +44,7 @@ class IsolatedChmodFilesBody:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.permission import Permission  # noqa: PLC0415
+        from ..models.permission import Permission
 
         d = dict(src_dict)
         isolated_chmod_files_body = cls()

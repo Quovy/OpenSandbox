@@ -101,8 +101,8 @@ class ServerStreamEvent:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.server_stream_event_error import ServerStreamEventError  # noqa: PLC0415
-        from ..models.server_stream_event_results import ServerStreamEventResults  # noqa: PLC0415
+        from ..models.server_stream_event_error import ServerStreamEventError
+        from ..models.server_stream_event_results import ServerStreamEventResults
 
         d = dict(src_dict)
         _type_ = d.pop("type", UNSET)

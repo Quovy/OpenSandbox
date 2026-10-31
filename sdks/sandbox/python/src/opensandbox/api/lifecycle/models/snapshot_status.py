@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
+from dateutil.parser import isoparse
 
 from ..types import UNSET, Unset
 
@@ -94,7 +95,7 @@ class SnapshotStatus:
         if isinstance(_last_transition_at, Unset):
             last_transition_at = UNSET
         else:
-            last_transition_at = datetime.datetime.fromisoformat(_last_transition_at)
+            last_transition_at = isoparse(_last_transition_at)
 
         snapshot_status = cls(
             state=state,

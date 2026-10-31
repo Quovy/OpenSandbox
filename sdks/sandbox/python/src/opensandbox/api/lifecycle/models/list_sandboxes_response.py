@@ -63,8 +63,8 @@ class ListSandboxesResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.pagination_info import PaginationInfo  # noqa: PLC0415
-        from ..models.sandbox import Sandbox  # noqa: PLC0415
+        from ..models.pagination_info import PaginationInfo
+        from ..models.sandbox import Sandbox
 
         d = dict(src_dict)
         items = []

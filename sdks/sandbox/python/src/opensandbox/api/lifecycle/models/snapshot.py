@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
+from dateutil.parser import isoparse
 
 from ..types import UNSET, Unset
 
@@ -77,7 +78,7 @@ class Snapshot:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.snapshot_status import SnapshotStatus  # noqa: PLC0415
+        from ..models.snapshot_status import SnapshotStatus
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -86,7 +87,7 @@ class Snapshot:
 
         status = SnapshotStatus.from_dict(d.pop("status"))
 
-        created_at = datetime.datetime.fromisoformat(d.pop("createdAt"))
+        created_at = isoparse(d.pop("createdAt"))
 
         name = d.pop("name", UNSET)
 

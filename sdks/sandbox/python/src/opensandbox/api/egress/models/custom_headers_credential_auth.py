@@ -75,8 +75,8 @@ class CustomHeadersCredentialAuth:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_substitution import CredentialSubstitution  # noqa: PLC0415
-        from ..models.custom_header_entry import CustomHeaderEntry  # noqa: PLC0415
+        from ..models.credential_substitution import CredentialSubstitution
+        from ..models.custom_header_entry import CustomHeaderEntry
 
         d = dict(src_dict)
         type_ = CustomHeadersCredentialAuthType(d.pop("type"))

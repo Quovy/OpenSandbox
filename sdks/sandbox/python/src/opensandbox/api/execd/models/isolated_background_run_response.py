@@ -23,6 +23,7 @@ from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from dateutil.parser import isoparse
 
 T = TypeVar("T", bound="IsolatedBackgroundRunResponse")
 
@@ -68,7 +69,7 @@ class IsolatedBackgroundRunResponse:
 
         run_id = UUID(d.pop("run_id"))
 
-        started_at = datetime.datetime.fromisoformat(d.pop("started_at"))
+        started_at = isoparse(d.pop("started_at"))
 
         isolated_background_run_response = cls(
             session_id=session_id,

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from dateutil.parser import isoparse
 
 from ..types import UNSET, Unset
 
@@ -123,17 +124,17 @@ class CreateSandboxResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.create_sandbox_response_extensions import CreateSandboxResponseExtensions  # noqa: PLC0415
-        from ..models.create_sandbox_response_metadata import CreateSandboxResponseMetadata  # noqa: PLC0415
-        from ..models.platform_spec import PlatformSpec  # noqa: PLC0415
-        from ..models.sandbox_status import SandboxStatus  # noqa: PLC0415
+        from ..models.create_sandbox_response_extensions import CreateSandboxResponseExtensions
+        from ..models.create_sandbox_response_metadata import CreateSandboxResponseMetadata
+        from ..models.platform_spec import PlatformSpec
+        from ..models.sandbox_status import SandboxStatus
 
         d = dict(src_dict)
         id = d.pop("id")
 
         status = SandboxStatus.from_dict(d.pop("status"))
 
-        created_at = datetime.datetime.fromisoformat(d.pop("createdAt"))
+        created_at = isoparse(d.pop("createdAt"))
 
         entrypoint = cast(list[str], d.pop("entrypoint"))
 
@@ -163,7 +164,7 @@ class CreateSandboxResponse:
         if isinstance(_expires_at, Unset):
             expires_at = UNSET
         else:
-            expires_at = datetime.datetime.fromisoformat(_expires_at)
+            expires_at = isoparse(_expires_at)
 
         create_sandbox_response = cls(
             id=id,

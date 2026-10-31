@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import StrEnum
+from enum import Enum
 
 
-class PassthroughCredentialAuthType(StrEnum):
+class PassthroughCredentialAuthType(str, Enum):
     PASSTHROUGH = "passthrough"
 
     def __str__(self) -> str:

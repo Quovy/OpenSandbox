@@ -121,9 +121,9 @@ class Volume:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.host import Host  # noqa: PLC0415
-        from ..models.ossfs import OSSFS  # noqa: PLC0415
-        from ..models.pvc import PVC  # noqa: PLC0415
+        from ..models.host import Host
+        from ..models.ossfs import OSSFS
+        from ..models.pvc import PVC
 
         d = dict(src_dict)
         name = d.pop("name")

@@ -71,7 +71,7 @@ class ImageSpec:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.image_spec_auth import ImageSpecAuth  # noqa: PLC0415
+        from ..models.image_spec_auth import ImageSpecAuth
 
         d = dict(src_dict)
         uri = d.pop("uri")
