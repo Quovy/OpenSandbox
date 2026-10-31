@@ -23,7 +23,6 @@ from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-from dateutil.parser import isoparse
 
 from ..models.isolated_session_summary_status import IsolatedSessionSummaryStatus
 from ..types import UNSET, Unset
@@ -86,9 +85,9 @@ class IsolatedSessionSummary:
 
         status = IsolatedSessionSummaryStatus(d.pop("status"))
 
-        created_at = isoparse(d.pop("created_at"))
+        created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
 
-        last_run_at = isoparse(d.pop("last_run_at"))
+        last_run_at = datetime.datetime.fromisoformat(d.pop("last_run_at"))
 
         def _parse_idle_remaining_seconds(data: object) -> int | None | Unset:
             if data is None:

@@ -54,10 +54,10 @@ class CredentialBinding:
     )
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.api_key_credential_auth import ApiKeyCredentialAuth
-        from ..models.basic_credential_auth import BasicCredentialAuth
-        from ..models.bearer_credential_auth import BearerCredentialAuth
-        from ..models.custom_headers_credential_auth import CustomHeadersCredentialAuth
+        from ..models.api_key_credential_auth import ApiKeyCredentialAuth  # noqa: PLC0415
+        from ..models.basic_credential_auth import BasicCredentialAuth  # noqa: PLC0415
+        from ..models.bearer_credential_auth import BearerCredentialAuth  # noqa: PLC0415
+        from ..models.custom_headers_credential_auth import CustomHeadersCredentialAuth  # noqa: PLC0415
 
         name = self.name
 
@@ -89,12 +89,12 @@ class CredentialBinding:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.api_key_credential_auth import ApiKeyCredentialAuth
-        from ..models.basic_credential_auth import BasicCredentialAuth
-        from ..models.bearer_credential_auth import BearerCredentialAuth
-        from ..models.credential_match import CredentialMatch
-        from ..models.custom_headers_credential_auth import CustomHeadersCredentialAuth
-        from ..models.passthrough_credential_auth import PassthroughCredentialAuth
+        from ..models.api_key_credential_auth import ApiKeyCredentialAuth  # noqa: PLC0415
+        from ..models.basic_credential_auth import BasicCredentialAuth  # noqa: PLC0415
+        from ..models.bearer_credential_auth import BearerCredentialAuth  # noqa: PLC0415
+        from ..models.credential_match import CredentialMatch  # noqa: PLC0415
+        from ..models.custom_headers_credential_auth import CustomHeadersCredentialAuth  # noqa: PLC0415
+        from ..models.passthrough_credential_auth import PassthroughCredentialAuth  # noqa: PLC0415
 
         d = dict(src_dict)
         name = d.pop("name")

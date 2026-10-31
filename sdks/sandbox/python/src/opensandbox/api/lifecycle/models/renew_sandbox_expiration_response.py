@@ -21,7 +21,6 @@ from collections.abc import Mapping
 from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
-from dateutil.parser import isoparse
 
 T = TypeVar("T", bound="RenewSandboxExpirationResponse")
 
@@ -53,7 +52,7 @@ class RenewSandboxExpirationResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        expires_at = isoparse(d.pop("expiresAt"))
+        expires_at = datetime.datetime.fromisoformat(d.pop("expiresAt"))
 
         renew_sandbox_expiration_response = cls(
             expires_at=expires_at,

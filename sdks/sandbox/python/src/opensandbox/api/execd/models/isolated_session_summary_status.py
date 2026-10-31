@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class IsolatedSessionSummaryStatus(str, Enum):
+class IsolatedSessionSummaryStatus(StrEnum):
     ACTIVE = "active"
     DEAD = "dead"
     DESTROYED = "destroyed"

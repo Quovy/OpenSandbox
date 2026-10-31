@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class CreateIsolatedSessionRequestUidMode(str, Enum):
+class CreateIsolatedSessionRequestUidMode(StrEnum):
     SETPRIV = "setpriv"
     USERNS = "userns"
 

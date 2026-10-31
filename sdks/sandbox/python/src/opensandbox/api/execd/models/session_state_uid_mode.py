@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class SessionStateUidMode(str, Enum):
+class SessionStateUidMode(StrEnum):
     SETPRIV = "setpriv"
     USERNS = "userns"
 

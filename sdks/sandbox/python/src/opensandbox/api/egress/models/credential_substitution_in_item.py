@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class CredentialSubstitutionInItem(str, Enum):
+class CredentialSubstitutionInItem(StrEnum):
     BODY = "body"
     HEADER = "header"
     PATH = "path"

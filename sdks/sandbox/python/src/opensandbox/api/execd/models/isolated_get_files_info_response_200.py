@@ -31,8 +31,6 @@ T = TypeVar("T", bound="IsolatedGetFilesInfoResponse200")
 
 @_attrs_define
 class IsolatedGetFilesInfoResponse200:
-    """ """
-
     additional_properties: dict[str, FileInfo] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,7 +42,7 @@ class IsolatedGetFilesInfoResponse200:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.file_info import FileInfo
+        from ..models.file_info import FileInfo  # noqa: PLC0415
 
         d = dict(src_dict)
         isolated_get_files_info_response_200 = cls()

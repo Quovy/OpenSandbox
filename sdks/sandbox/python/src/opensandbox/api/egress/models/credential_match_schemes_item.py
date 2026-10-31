@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class CredentialMatchSchemesItem(str, Enum):
+class CredentialMatchSchemesItem(StrEnum):
     HTTP = "http"
     HTTPS = "https"
 

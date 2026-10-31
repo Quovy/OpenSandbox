@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class ServerStreamEventType(str, Enum):
+class ServerStreamEventType(StrEnum):
     ERROR = "error"
     EXECUTION_COMPLETE = "execution_complete"
     EXECUTION_COUNT = "execution_count"

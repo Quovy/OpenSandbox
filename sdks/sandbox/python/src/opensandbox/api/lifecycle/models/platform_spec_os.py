@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class PlatformSpecOs(str, Enum):
+class PlatformSpecOs(StrEnum):
     LINUX = "linux"
     WINDOWS = "windows"
 

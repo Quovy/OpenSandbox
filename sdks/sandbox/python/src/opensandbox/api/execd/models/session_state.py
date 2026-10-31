@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-from dateutil.parser import isoparse
 
 from ..models.session_state_profile import SessionStateProfile
 from ..models.session_state_status import SessionStateStatus
@@ -169,9 +168,9 @@ class SessionState:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.bind_mount import BindMount
-        from ..models.env_passthrough_spec import EnvPassthroughSpec
-        from ..models.isolated_workspace_spec import IsolatedWorkspaceSpec
+        from ..models.bind_mount import BindMount  # noqa: PLC0415
+        from ..models.env_passthrough_spec import EnvPassthroughSpec  # noqa: PLC0415
+        from ..models.isolated_workspace_spec import IsolatedWorkspaceSpec  # noqa: PLC0415
 
         d = dict(src_dict)
         _status = d.pop("status", UNSET)
@@ -186,14 +185,14 @@ class SessionState:
         if isinstance(_created_at, Unset):
             created_at = UNSET
         else:
-            created_at = isoparse(_created_at)
+            created_at = datetime.datetime.fromisoformat(_created_at)
 
         _last_run_at = d.pop("last_run_at", UNSET)
         last_run_at: datetime.datetime | Unset
         if isinstance(_last_run_at, Unset):
             last_run_at = UNSET
         else:
-            last_run_at = isoparse(_last_run_at)
+            last_run_at = datetime.datetime.fromisoformat(_last_run_at)
 
         def _parse_idle_remaining_seconds(data: object) -> int | None | Unset:
             if data is None:

@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class IsolatedWorkspaceSpecMode(str, Enum):
+class IsolatedWorkspaceSpecMode(StrEnum):
     OVERLAY = "overlay"
     RO = "ro"
     RW = "rw"

@@ -96,7 +96,7 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: CreateSandboxRequest,
 ) -> Response[CreateSandboxResponse | ErrorResponse]:
-    r"""Create a sandbox
+    """Create a sandbox
 
      Creates a new sandbox from a container image or restores one from a
     persistent sandbox snapshot with optional resource limits, environment
@@ -108,7 +108,7 @@ def sync_detailed(
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
     provided, `entrypoint` is optional. If omitted, the server defaults the
-    sandbox entrypoint to `[\"tail\", \"-f\", \"/dev/null\"]`.
+    sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
     ## Authentication
 
@@ -159,7 +159,7 @@ def sync(
     client: AuthenticatedClient | Client,
     body: CreateSandboxRequest,
 ) -> CreateSandboxResponse | ErrorResponse | None:
-    r"""Create a sandbox
+    """Create a sandbox
 
      Creates a new sandbox from a container image or restores one from a
     persistent sandbox snapshot with optional resource limits, environment
@@ -171,7 +171,7 @@ def sync(
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
     provided, `entrypoint` is optional. If omitted, the server defaults the
-    sandbox entrypoint to `[\"tail\", \"-f\", \"/dev/null\"]`.
+    sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
     ## Authentication
 
@@ -217,7 +217,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: CreateSandboxRequest,
 ) -> Response[CreateSandboxResponse | ErrorResponse]:
-    r"""Create a sandbox
+    """Create a sandbox
 
      Creates a new sandbox from a container image or restores one from a
     persistent sandbox snapshot with optional resource limits, environment
@@ -229,7 +229,7 @@ async def asyncio_detailed(
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
     provided, `entrypoint` is optional. If omitted, the server defaults the
-    sandbox entrypoint to `[\"tail\", \"-f\", \"/dev/null\"]`.
+    sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
     ## Authentication
 
@@ -278,7 +278,7 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: CreateSandboxRequest,
 ) -> CreateSandboxResponse | ErrorResponse | None:
-    r"""Create a sandbox
+    """Create a sandbox
 
      Creates a new sandbox from a container image or restores one from a
     persistent sandbox snapshot with optional resource limits, environment
@@ -290,7 +290,7 @@ async def asyncio(
 
     When `image` is provided, `entrypoint` is required. When `snapshotId` is
     provided, `entrypoint` is optional. If omitted, the server defaults the
-    sandbox entrypoint to `[\"tail\", \"-f\", \"/dev/null\"]`.
+    sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
     ## Authentication
 

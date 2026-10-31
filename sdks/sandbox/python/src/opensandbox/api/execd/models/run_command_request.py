@@ -38,7 +38,7 @@ class RunCommandRequest:
     Attributes:
         command (str): Shell command to execute Example: ls -la /workspace.
         cwd (str | Unset): Working directory for command execution Example: /workspace.
-        background (bool | Unset): Whether to run command in detached mode Default: False.
+        background (bool | Unset): Whether to run command in detached mode Default: False. Example: False.
         timeout (int | Unset): Maximum allowed execution time in milliseconds before the command is forcefully
             terminated by the server. If omitted, the server will not enforce any timeout. Example: 60000.
         uid (int | Unset): Unix user ID used to run the command. If `gid` is provided, `uid` is required.
@@ -99,7 +99,7 @@ class RunCommandRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.run_command_request_envs import RunCommandRequestEnvs
+        from ..models.run_command_request_envs import RunCommandRequestEnvs  # noqa: PLC0415
 
         d = dict(src_dict)
         command = d.pop("command")

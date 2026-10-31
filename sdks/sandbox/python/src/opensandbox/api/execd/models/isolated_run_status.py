@@ -23,7 +23,6 @@ from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-from dateutil.parser import isoparse
 
 from ..types import UNSET, Unset
 
@@ -37,9 +36,9 @@ class IsolatedRunStatus:
     Attributes:
         session_id (UUID):
         run_id (UUID):
-        running (bool): Whether the run is still executing
+        running (bool): Whether the run is still executing Example: False.
         started_at (datetime.datetime): Run start time in RFC3339 format Example: 2025-12-22T09:08:05Z.
-        exit_code (int | None | Unset): Exit code of the code if the run has finished
+        exit_code (int | None | Unset): Exit code of the code if the run has finished Example: 0.
         error (str | Unset): Error message if the run failed (e.g. session terminated) Example: session terminated.
         finished_at (datetime.datetime | None | Unset): Run finish time in RFC3339 format (null if still running)
             Example: 2025-12-22T09:08:09Z.
@@ -107,7 +106,7 @@ class IsolatedRunStatus:
 
         running = d.pop("running")
 
-        started_at = isoparse(d.pop("started_at"))
+        started_at = datetime.datetime.fromisoformat(d.pop("started_at"))
 
         def _parse_exit_code(data: object) -> int | None | Unset:
             if data is None:
@@ -128,7 +127,7 @@ class IsolatedRunStatus:
             try:
                 if not isinstance(data, str):
                     raise TypeError()
-                finished_at_type_0 = isoparse(data)
+                finished_at_type_0 = datetime.datetime.fromisoformat(data)
 
                 return finished_at_type_0
             except (TypeError, ValueError, AttributeError, KeyError):

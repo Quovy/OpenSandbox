@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
-from dateutil.parser import isoparse
 
 from ..types import UNSET, Unset
 
@@ -143,11 +142,11 @@ class Sandbox:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.image_spec import ImageSpec
-        from ..models.platform_spec import PlatformSpec
-        from ..models.sandbox_extensions import SandboxExtensions
-        from ..models.sandbox_metadata import SandboxMetadata
-        from ..models.sandbox_status import SandboxStatus
+        from ..models.image_spec import ImageSpec  # noqa: PLC0415
+        from ..models.platform_spec import PlatformSpec  # noqa: PLC0415
+        from ..models.sandbox_extensions import SandboxExtensions  # noqa: PLC0415
+        from ..models.sandbox_metadata import SandboxMetadata  # noqa: PLC0415
+        from ..models.sandbox_status import SandboxStatus  # noqa: PLC0415
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -156,7 +155,7 @@ class Sandbox:
 
         entrypoint = cast(list[str], d.pop("entrypoint"))
 
-        created_at = isoparse(d.pop("createdAt"))
+        created_at = datetime.datetime.fromisoformat(d.pop("createdAt"))
 
         _image = d.pop("image", UNSET)
         image: ImageSpec | Unset
@@ -193,7 +192,7 @@ class Sandbox:
         if isinstance(_expires_at, Unset):
             expires_at = UNSET
         else:
-            expires_at = isoparse(_expires_at)
+            expires_at = datetime.datetime.fromisoformat(_expires_at)
 
         sandbox = cls(
             id=id,

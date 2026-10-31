@@ -57,7 +57,7 @@ class ListIsolatedSessionsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.isolated_session_summary import IsolatedSessionSummary
+        from ..models.isolated_session_summary import IsolatedSessionSummary  # noqa: PLC0415
 
         d = dict(src_dict)
         sessions = []

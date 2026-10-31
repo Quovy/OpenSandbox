@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class SessionStateProfile(str, Enum):
+class SessionStateProfile(StrEnum):
     BALANCED = "balanced"
     STRICT = "strict"
 

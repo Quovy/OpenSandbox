@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class MetricsEventEventType(str, Enum):
+class MetricsEventEventType(StrEnum):
     SANDBOX_CREATE = "sandbox.create"
 
     def __str__(self) -> str:

@@ -14,10 +14,10 @@
 # limitations under the License.
 #
 
-from enum import Enum
+from enum import StrEnum
 
 
-class PlatformSpecArch(str, Enum):
+class PlatformSpecArch(StrEnum):
     AMD64 = "amd64"
     ARM64 = "arm64"
 

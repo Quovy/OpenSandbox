@@ -31,8 +31,6 @@ T = TypeVar("T", bound="IsolatedMakeDirsBody")
 
 @_attrs_define
 class IsolatedMakeDirsBody:
-    """ """
-
     additional_properties: dict[str, Permission] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,7 +42,7 @@ class IsolatedMakeDirsBody:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.permission import Permission
+        from ..models.permission import Permission  # noqa: PLC0415
 
         d = dict(src_dict)
         isolated_make_dirs_body = cls()

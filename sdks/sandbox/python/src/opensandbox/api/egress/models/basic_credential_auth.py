@@ -71,7 +71,7 @@ class BasicCredentialAuth:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_substitution import CredentialSubstitution
+        from ..models.credential_substitution import CredentialSubstitution  # noqa: PLC0415
 
         d = dict(src_dict)
         type_ = BasicCredentialAuthType(d.pop("type"))

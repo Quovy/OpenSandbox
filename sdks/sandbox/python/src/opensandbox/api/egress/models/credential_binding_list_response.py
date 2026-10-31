@@ -60,7 +60,7 @@ class CredentialBindingListResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.credential_binding_metadata import CredentialBindingMetadata
+        from ..models.credential_binding_metadata import CredentialBindingMetadata  # noqa: PLC0415
 
         d = dict(src_dict)
         revision = d.pop("revision")
