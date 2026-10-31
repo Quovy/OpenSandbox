@@ -52,7 +52,7 @@ dependencies = [
 [project.optional-dependencies]
 pool-redis = [
     "redis>=5.0,<6.0",
-    "pyjwt>=2.13.0",
+    "pyjwt>=2.15.0",
 ]
 
 [project.urls]
@@ -140,7 +140,7 @@ asyncio_mode = "auto"
 
 [tool.uv]
 constraint-dependencies = [
-    "pyjwt>=2.13.0",
+    "pyjwt>=2.15.0",
 ]
 
 [tool.coverage.run]
