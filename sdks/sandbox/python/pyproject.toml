@@ -155,5 +155,6 @@ dev = [
     "pytest-cov>=4.0.0",
     "ruff>=0.14.8",
     "pyright>=1.1.0",
-    "openapi-python-client>=0.28.0",
+    # 0.29.1 fixes GHSA-5293-mq8x-g3xj and needs Python 3.11+; the SDK itself still supports 3.10.
+    "openapi-python-client>=0.29.1; python_version >= '3.11'",
 ]
