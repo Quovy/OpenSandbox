@@ -73,7 +73,7 @@ RUN apk add --no-cache \
         'ca-certificates>=20261020-r0' \
         'ca-certificates-bundle>=20261020-r0' \
     && python -m pip install --no-cache-dir \
-        --cert /etc/ssl/certs/ca-certificates.crt 'pip==26.2.2'
+        --cert /etc/ssl/certs/ca-certificates.crt 'pip==26.3'
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server

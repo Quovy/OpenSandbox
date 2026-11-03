@@ -74,7 +74,7 @@ RUN CGO_ENABLED=0 GOOS=windows go build ${GOFLAGS} -trimpath -buildvcs=false \
     -o /build/execd.exe ./main.go
 
 # Build static bubblewrap with musl.
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS bwrap-builder
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS bwrap-builder
 # The bundle floor keeps the bubblewrap clone below from trusting the
 # compromised emSign ECC Root CA - G3.
 RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0' git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
@@ -95,10 +95,10 @@ RUN rm /usr/lib/libcap.so /usr/lib/libcap.so.2 && \
     ninja -C builddir && \
     cp builddir/bwrap /build/bwrap/bwrap
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
-# The pinned base still trusts the compromised emSign ECC Root CA - G3;
-# 20261020-r0 drops it.
+# 20261020-r0 drops the compromised emSign ECC Root CA - G3. The floor keeps
+# an older base pin from bringing it back.
 RUN apk add --no-cache 'ca-certificates-bundle>=20261020-r0'
 
 COPY --from=bwrap-builder /build/bwrap/bwrap /usr/local/bin/bwrap

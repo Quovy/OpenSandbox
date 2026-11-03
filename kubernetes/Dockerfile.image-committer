@@ -28,7 +28,7 @@ COPY cmd/image-committer/ cmd/image-committer/
 RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/image-committer ./cmd/image-committer/
 
 # Runtime stage
-FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
+FROM alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63
 
 ARG TARGETARCH
 
@@ -36,7 +36,8 @@ ARG TARGETARCH
 # nerdctl is used to find containers, commit rootfs, and push images.
 # We use nerdctl directly (not crictl or ctr) to avoid CRI API version issues.
 # curl and nerdctl verify TLS against this bundle; 20261020-r0 drops the
-# compromised emSign ECC Root CA - G3 that the pinned base image still trusts.
+# compromised emSign ECC Root CA - G3, and the floor keeps an older base pin
+# from bringing it back.
 RUN apk add --no-cache \
     'ca-certificates-bundle>=20261020-r0' \
     curl \
