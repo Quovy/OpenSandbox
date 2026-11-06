@@ -33,8 +33,11 @@ WORKFLOW = DOCKERFILE.parents[2] / ".github" / "workflows" / "egress-test.yml"
 RUNS = [line[4:] for line in DOCKERFILE.read_text().replace("\\\n", "").splitlines()
         if line.startswith("RUN ")]
 GOPROXY_RUN = next(run for run in RUNS if "go env -w GOPROXY=" in run)
-APT_RUN = next(run for run in RUNS if "APT_MIRROR" in run).split("&& apt-get update", 1)[0]
+# The Quovy fork builds the runtime on wolfi (apk), so it has no APT mirror override.
+APT_RUN = next((run.split("&& apt-get update", 1)[0] for run in RUNS if "APT_MIRROR" in run), None)
 H2_CHECK_RUN = next(run for run in RUNS if "dependency_versions_supported" in run)
+# The fork installs with the versioned pip of its single CPython (pip3.11).
+PIP_INSTALL = re.compile(r"pip3(?:\.\d+)? install")
 H2_CHECK_CODE = shlex.split(H2_CHECK_RUN)[-1]
 
 
@@ -56,9 +59,9 @@ class DockerfileH2DependencyTests(unittest.TestCase):
     def test_docker_installs_copied_shared_requirements(self):
         dockerfile = DOCKERFILE.read_text()
         copy = "COPY components/egress/requirements-mitmproxy.txt /tmp/requirements-mitmproxy.txt"
-        install = next(run for run in RUNS if "pip3 install" in run)
-        self.assertLess(dockerfile.index(copy), dockerfile.index("pip3 install"))
-        words = shlex.split(install.split("pip3 install", 1)[1])
+        install = next(run for run in RUNS if PIP_INSTALL.search(run))
+        self.assertLess(dockerfile.index(copy), PIP_INSTALL.search(dockerfile).start())
+        words = shlex.split(PIP_INSTALL.split(install, 1)[1])
         self.assertEqual(words[words.index("-r") + 1], "/tmp/requirements-mitmproxy.txt")
         self.assertFalse(any("==" in word for word in words))
 
@@ -148,6 +151,8 @@ class DockerfileBuildOverrideTests(unittest.TestCase):
         return self.events.read_text().splitlines() if self.events.exists() else []
 
     def run_apt(self):
+        if APT_RUN is None:
+            self.skipTest("Dockerfile has no APT_MIRROR override")
         # Do not touch host APT files, run apt-get, or execute package cleanup.
         return self.run_snippet(APT_RUN.replace("/etc/apt", str(self.apt)) + " && next-step")
 
