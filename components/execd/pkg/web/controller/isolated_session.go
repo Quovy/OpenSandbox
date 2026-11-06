@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/isolation"
@@ -31,28 +33,22 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// isolatedRunner is set by InitIsolatedRunner during startup.
 var isolatedRunner *runtime.IsolatedRunner
 
-// isolatedProbeResult stores the probe result for capabilities reporting.
 var isolatedProbeResult *isolation.ProbeResult
 
-// InitIsolatedRunner wires the isolated session runner.
 func InitIsolatedRunner(r *runtime.IsolatedRunner) {
 	isolatedRunner = r
 }
 
-// InitIsolatedProbe stores the probe result for the capabilities endpoint.
 func InitIsolatedProbe(p *isolation.ProbeResult) {
 	isolatedProbeResult = p
 }
 
-// IsolatedSessionController handles /v1/isolated/* endpoints.
 type IsolatedSessionController struct {
 	*basicController
 }
 
-// NewIsolatedSessionController creates a controller bound to ctx.
 func NewIsolatedSessionController(ctx *gin.Context) *IsolatedSessionController {
 	return &IsolatedSessionController{
 		basicController: newBasicController(ctx),
@@ -67,7 +63,6 @@ func (c *IsolatedSessionController) initialized() bool {
 	return isolatedRunner != nil
 }
 
-// Create handles POST /v1/isolated/session.
 func (c *IsolatedSessionController) Create() {
 	if !c.probed() {
 		c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeServiceUnavailable, "isolation unavailable")
@@ -93,10 +88,18 @@ func (c *IsolatedSessionController) Create() {
 		})
 	}
 
+	overlays := make([]runtime.IsolatedOverlayOptions, 0, len(req.Overlays)+1)
+	for _, ov := range req.EffectiveOverlays() {
+		overlays = append(overlays, runtime.IsolatedOverlayOptions{
+			Path:    ov.Path,
+			Mode:    ov.Mode,
+			Persist: ov.Persist,
+		})
+	}
+
 	opts := &runtime.IsolatedSessionOptions{
 		Profile:            req.Profile,
-		WorkspacePath:      req.Workspace.Path,
-		WorkspaceMode:      req.Workspace.Mode,
+		Overlays:           overlays,
 		ExtraWritable:      req.ExtraWritable,
 		Binds:              binds,
 		ShareNet:           req.ShareNet,
@@ -122,7 +125,8 @@ func (c *IsolatedSessionController) Create() {
 }
 
 func classifyIsolatedCreateError(err error) (int, model.ErrorCode) {
-	if errors.Is(err, runtime.ErrUidModeUnavailable) {
+	if errors.Is(err, runtime.ErrUidModeUnavailable) ||
+		errors.Is(err, runtime.ErrSessionPrivateNetUnavailable) {
 		return http.StatusServiceUnavailable, model.ErrorCodeNotSupported
 	}
 	if errors.Is(err, runtime.ErrSessionNamespaceUnavailable) ||
@@ -134,6 +138,7 @@ func classifyIsolatedCreateError(err error) (int, model.ErrorCode) {
 		strings.Contains(err.Error(), "unknown isolation profile") ||
 		strings.Contains(err.Error(), "must be an existing path") ||
 		strings.Contains(err.Error(), "must be an absolute path") ||
+		strings.Contains(err.Error(), "duplicate overlay path") ||
 		strings.Contains(err.Error(), "source is required") {
 		return http.StatusBadRequest, model.ErrorCodeRuntimeError
 	}
@@ -171,10 +176,22 @@ func (c *IsolatedSessionController) Get() {
 		Gid:           state.Gid,
 		UidMode:       state.UidMode,
 	}
-	if state.WorkspacePath != "" {
-		resp.Workspace = &model.WorkspaceSpec{
-			Path: state.WorkspacePath,
-			Mode: state.WorkspaceMode,
+	if len(state.Overlays) > 0 {
+		resp.Overlays = make([]model.OverlaySpec, 0, len(state.Overlays))
+		for _, ov := range state.Overlays {
+			spec := model.OverlaySpec{Path: ov.Path, Mode: ov.Mode}
+			if ov.Persist != nil {
+				persist := *ov.Persist
+				spec.Persist = &persist
+			}
+			resp.Overlays = append(resp.Overlays, spec)
+		}
+		// The legacy workspace echo applies to single-overlay sessions only.
+		if len(state.Overlays) == 1 {
+			resp.Workspace = &model.WorkspaceSpec{
+				Path: state.Overlays[0].Path,
+				Mode: state.Overlays[0].Mode,
+			}
 		}
 	}
 	if len(state.Binds) > 0 {
@@ -203,7 +220,6 @@ func (c *IsolatedSessionController) Get() {
 	c.RespondSuccess(resp)
 }
 
-// List handles GET /v1/isolated/sessions.
 func (c *IsolatedSessionController) List() {
 	if !c.initialized() {
 		c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeServiceUnavailable, "isolation unavailable")
@@ -225,7 +241,6 @@ func (c *IsolatedSessionController) List() {
 	c.RespondSuccess(model.ListIsolatedSessionsResponse{Sessions: items})
 }
 
-// Run handles POST /v1/isolated/session/:sessionId/run (SSE streaming).
 func (c *IsolatedSessionController) Run() {
 	if !c.initialized() {
 		c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeServiceUnavailable, "isolation unavailable")
@@ -253,6 +268,17 @@ func (c *IsolatedSessionController) Run() {
 	}
 	defer cancel()
 
+	// Unknown-session runs must stay JSON 404s, so probe before the SSE
+	// headers below are committed.
+	if _, err := isolatedRunner.GetIsolatedSession(sessionID); err != nil {
+		if errors.Is(err, runtime.ErrContextNotFound) {
+			c.RespondError(http.StatusNotFound, model.ErrorCodeSessionNotFound, "session not found")
+			return
+		}
+		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, err.Error())
+		return
+	}
+
 	// Background mode: submit detached, return a run handle, let the client
 	// poll status/logs. Deliberately independent of this request's context so
 	// a client disconnect cannot cancel detached work. 202 Accepted keeps the
@@ -272,7 +298,18 @@ func (c *IsolatedSessionController) Run() {
 		return
 	}
 
-	// SSE stdout callback.
+	// Commit SSE headers up front and ping periodically so gateway idle
+	// timeouts cannot reap the stream while a silent command runs.
+	c.setupSSEResponse()
+
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	var pingWg sync.WaitGroup
+	pingWg.Add(1)
+	safego.Go(func() {
+		defer pingWg.Done()
+		c.ping(pingCtx)
+	})
+
 	onStdout := func(line string) {
 		if line == "" {
 			return
@@ -289,9 +326,17 @@ func (c *IsolatedSessionController) Run() {
 	err := isolatedRunner.RunInIsolatedSession(ctx, sessionID, req.Code, req.Envs, onStdout)
 	durationMs := float64(time.Since(startTime)) / float64(time.Millisecond)
 
+	// Stop pinging before the final event and handler return.
+	pingCancel()
+	pingWg.Wait()
+
 	if err != nil {
 		if errors.Is(err, runtime.ErrContextNotFound) {
-			c.RespondError(http.StatusNotFound, model.ErrorCodeSessionNotFound, "session not found")
+			// The session vanished after the probe (e.g. concurrent delete).
+			// SSE headers are already committed, so the failure must go out
+			// as a terminal stream event, not a JSON body.
+			telemetry.RecordIsolatedRun(ctx, "error", durationMs)
+			c.writeIsolatedRunError("SessionNotFound", "session not found")
 			return
 		}
 		telemetry.RecordIsolatedRun(ctx, "error", durationMs)
@@ -301,16 +346,7 @@ func (c *IsolatedSessionController) Run() {
 			ename = "ExitError"
 			evalue = strings.TrimPrefix(evalue, "command exited with code ")
 		}
-		event := model.ServerStreamEvent{
-			Type:      model.StreamEventTypeError,
-			Text:      err.Error(),
-			Timestamp: time.Now().UnixMilli(),
-			Error: &execute.ErrorOutput{
-				EName:  ename,
-				EValue: evalue,
-			},
-		}
-		c.writeSingleEvent("IsolatedError", event.ToJSON(), true, event.Summary())
+		c.writeIsolatedRunError(ename, evalue)
 		return
 	}
 	telemetry.RecordIsolatedRun(ctx, "success", durationMs)
@@ -321,7 +357,21 @@ func (c *IsolatedSessionController) Run() {
 	c.writeSingleEvent("IsolatedComplete", event.ToJSON(), true, event.Summary())
 }
 
-// respondRunError maps background-run start and query errors to HTTP responses.
+// writeIsolatedRunError emits a terminal IsolatedError SSE event; only call
+// after the SSE headers are committed.
+func (c *IsolatedSessionController) writeIsolatedRunError(ename, evalue string) {
+	event := model.ServerStreamEvent{
+		Type:      model.StreamEventTypeError,
+		Text:      evalue,
+		Timestamp: time.Now().UnixMilli(),
+		Error: &execute.ErrorOutput{
+			EName:  ename,
+			EValue: evalue,
+		},
+	}
+	c.writeSingleEvent("IsolatedError", event.ToJSON(), true, event.Summary())
+}
+
 func (c *IsolatedSessionController) respondRunError(err error) {
 	if errors.Is(err, runtime.ErrContextNotFound) {
 		c.RespondError(http.StatusNotFound, model.ErrorCodeSessionNotFound, "session not found")
@@ -334,7 +384,6 @@ func (c *IsolatedSessionController) respondRunError(err error) {
 	c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, err.Error())
 }
 
-// GetRunStatus handles GET /v1/isolated/session/:sessionId/runs/:runId.
 func (c *IsolatedSessionController) GetRunStatus() {
 	if !c.initialized() {
 		c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeServiceUnavailable, "isolation unavailable")
@@ -363,7 +412,6 @@ func (c *IsolatedSessionController) GetRunStatus() {
 	c.RespondSuccess(resp)
 }
 
-// GetRunLogs handles GET /v1/isolated/session/:sessionId/runs/:runId/logs.
 // The body is the combined stdout/stderr of the run as plain text; the
 // EXECD-ISOLATED-TAIL-CURSOR response header carries the next byte cursor for
 // incremental polling.
@@ -400,7 +448,6 @@ func (c *IsolatedSessionController) GetRunLogs() {
 	c.ctx.String(http.StatusOK, "%s", output)
 }
 
-// Delete handles DELETE /v1/isolated/session/:sessionId.
 func (c *IsolatedSessionController) Delete() {
 	if !c.initialized() {
 		c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeServiceUnavailable, "isolation unavailable")
@@ -431,23 +478,44 @@ func classifyIsolatedDeleteError(err error) (int, model.ErrorCode) {
 	return http.StatusInternalServerError, model.ErrorCodeRuntimeError
 }
 
-// Diff handles GET /v1/isolated/session/:sessionId/diff.
 func (c *IsolatedSessionController) Diff() {
 	c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeNotSupported, "diff not implemented yet (phase 2)")
 }
 
-// Commit handles POST /v1/isolated/session/:sessionId/commit.
 func (c *IsolatedSessionController) Commit() {
 	c.RespondError(http.StatusServiceUnavailable, model.ErrorCodeNotSupported, "commit not implemented yet (phase 2)")
 }
 
-// Capabilities handles GET /v1/isolated/capabilities.
 func (c *IsolatedSessionController) Capabilities() {
+	hardeningReport := runtime.ReportHardening()
+	hardening := &model.HardeningStatus{
+		InitMode:     hardeningReport.InitMode,
+		SignalShield: hardeningReport.SignalShield,
+		CapDrop: &model.HardeningLayerState{
+			State:   hardeningReport.CapDrop.State,
+			Message: hardeningReport.CapDrop.Message,
+		},
+		Seccomp: &model.HardeningLayerState{
+			State:   hardeningReport.Seccomp.State,
+			Message: hardeningReport.Seccomp.Message,
+		},
+		Landlock: &model.HardeningLayerState{
+			State:   hardeningReport.Landlock.State,
+			Message: hardeningReport.Landlock.Message,
+		},
+		Ebpf: &model.HardeningLayerState{
+			State:   hardeningReport.Ebpf.State,
+			Message: hardeningReport.Ebpf.Message,
+		},
+	}
+	runtimeInit := &model.RuntimeInitStatus{Version: 1}
 	if isolatedRunner == nil {
 		resp := model.CapabilitiesResponse{
 			Available:       false,
 			CommitSupported: false,
 			DiffSupported:   false,
+			Hardening:       hardening,
+			RuntimeInit:     runtimeInit,
 		}
 		if isolatedProbeResult != nil {
 			resp.Isolator = isolatedProbeResult.Isolator
@@ -455,19 +523,26 @@ func (c *IsolatedSessionController) Capabilities() {
 			resp.Message = isolatedProbeResult.Message
 			resp.SetprivAvailable = isolatedProbeResult.SetprivAvailable
 			resp.UsernsAvailable = isolatedProbeResult.UsernsAvailable
+			resp.SetprivNetAvailable = isolatedProbeResult.SetprivNetAvailable
+			resp.UsernsNetAvailable = isolatedProbeResult.UsernsNetAvailable
 		}
 		c.RespondSuccess(resp)
 		return
 	}
 	caps := isolatedRunner.Capabilities()
 	resp := model.CapabilitiesResponse{
-		Available:        caps.Available,
-		Isolator:         caps.Isolator,
-		Version:          caps.Version,
-		SetprivAvailable: caps.SetprivAvailable,
-		UsernsAvailable:  caps.UsernsAvailable,
-		CommitSupported:  caps.CommitSupported,
-		DiffSupported:    caps.DiffSupported,
+		Available:           caps.Available,
+		Isolator:            caps.Isolator,
+		Version:             caps.Version,
+		Message:             caps.Message,
+		SetprivAvailable:    caps.SetprivAvailable,
+		UsernsAvailable:     caps.UsernsAvailable,
+		SetprivNetAvailable: caps.SetprivNetAvailable,
+		UsernsNetAvailable:  caps.UsernsNetAvailable,
+		CommitSupported:     caps.CommitSupported,
+		DiffSupported:       caps.DiffSupported,
+		Hardening:           hardening,
+		RuntimeInit:         runtimeInit,
 	}
 	// Probe results indicate overlay capability, not diff/commit implementation.
 	// Diff and commit are Phase 2; do not advertise them as supported.

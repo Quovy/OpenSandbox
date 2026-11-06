@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
@@ -32,7 +33,6 @@ func setupMetricController(method, path string) (*MetricController, *httptest.Re
 	return ctrl, w
 }
 
-// TestReadMetrics exercises readMetrics end-to-end.
 func TestReadMetrics(t *testing.T) {
 	ctrl := &MetricController{}
 
@@ -41,26 +41,21 @@ func TestReadMetrics(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, metrics)
 
-	// Validate CPU count
 	assert.Greater(t, metrics.CpuCount, 0.0)
 
-	// Validate CPU utilization
 	assert.GreaterOrEqual(t, metrics.CpuUsedPct, 0.0)
 	assert.Less(t, metrics.CpuUsedPct, 100.1) // CPU usage should be under 100% with small float tolerance
 
-	// Validate memory information
 	assert.Greater(t, metrics.MemTotalMiB, 0.0)
 	assert.GreaterOrEqual(t, metrics.MemUsedMiB, 0.0)
-	assert.LessOrEqual(t, metrics.MemUsedMiB, metrics.MemTotalMiB) // Used memory should not exceed total
+	assert.LessOrEqual(t, metrics.MemUsedMiB, metrics.MemTotalMiB)
 
-	// Validate timestamps
 	currentTime := time.Now().UnixMilli()
 	oneMinuteAgo := currentTime - 60*1000
-	assert.GreaterOrEqual(t, metrics.Timestamp, oneMinuteAgo) // Should be within the last minute
-	assert.LessOrEqual(t, metrics.Timestamp, currentTime)     // Should not be in the future
+	assert.GreaterOrEqual(t, metrics.Timestamp, oneMinuteAgo)
+	assert.LessOrEqual(t, metrics.Timestamp, currentTime)
 }
 
-// TestGetMetricsEndpoint covers the happy path.
 func TestGetMetricsEndpoint(t *testing.T) {
 	ctrl, w := setupMetricController("GET", "/api/metrics")
 
@@ -79,7 +74,6 @@ func TestGetMetricsEndpoint(t *testing.T) {
 	assert.NotZero(t, metrics.Timestamp)
 }
 
-// TestWatchMetricsHeaders verifies SSE header defaults.
 func TestWatchMetricsHeaders(t *testing.T) {
 	ctrl, w := setupMetricController("GET", "/api/watch-metrics")
 
@@ -98,7 +92,6 @@ func TestWatchMetricsHeaders(t *testing.T) {
 	assert.Equal(t, "no", buffering)
 }
 
-// TestMetricSerialization ensures metrics marshal and unmarshal cleanly.
 func TestMetricSerialization(t *testing.T) {
 	metrics := &model.Metrics{
 		CpuCount:    4,
@@ -108,24 +101,15 @@ func TestMetricSerialization(t *testing.T) {
 		Timestamp:   time.Now().UnixMilli(),
 	}
 
+	// Serialize under the JSON keys defined by the model tags so that
+	// external consumers (SDKs, dashboards) see a stable wire format.
 	data, err := json.Marshal(metrics)
-	assert.NoError(t, err)
-
-	var decodedMetrics model.Metrics
-	err = json.Unmarshal(data, &decodedMetrics)
-	assert.NoError(t, err)
-	assert.Equal(t, metrics.CpuCount, decodedMetrics.CpuCount)
-	assert.Equal(t, metrics.CpuUsedPct, decodedMetrics.CpuUsedPct)
-	assert.Equal(t, metrics.MemTotalMiB, decodedMetrics.MemTotalMiB)
-	assert.Equal(t, metrics.MemUsedMiB, decodedMetrics.MemUsedMiB)
-	assert.Equal(t, metrics.Timestamp, decodedMetrics.Timestamp)
-
-	errorMsg := map[string]string{"error": "test error"}
-	errorData, err := json.Marshal(errorMsg)
-	assert.NoError(t, err)
-
-	var decodedError map[string]string
-	err = json.Unmarshal(errorData, &decodedError)
-	assert.NoError(t, err)
-	assert.Equal(t, "test error", decodedError["error"])
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, float64(4), decoded["cpu_count"])
+	assert.Equal(t, 25.5, decoded["cpu_used_pct"])
+	assert.Equal(t, float64(8192), decoded["mem_total_mib"])
+	assert.Equal(t, float64(4096), decoded["mem_used_mib"])
+	assert.NotEmpty(t, decoded["timestamp"])
 }

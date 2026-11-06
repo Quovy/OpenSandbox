@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,13 +20,16 @@ Public entry points: ``prep_execd_init_for_egress``, ``build_security_context_fo
 """
 
 import json
+import shlex
 from typing import Any, Dict, List, Optional
 
-from opensandbox_server.api.schema import NetworkPolicy
-from opensandbox_server.config import EGRESS_MODE_DNS
 from opensandbox_server.services.constants import (
     EGRESS_MODE_ENV,
     EGRESS_RULES_ENV,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+    EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+    OTEL_EXPORTER_OTLP_ENDPOINT,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_EGRESS_SANDBOX_ID,
@@ -34,29 +37,35 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
 )
+from opensandbox_server.services.helpers import upstream_proxy_egress_env
+from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
+
+# A pod-level non-root UID would clear NET_ADMIN from the sidecar's effective
+# capability set and make the init container's sysctl write fail with EPERM,
+# so the egress containers carry an explicit, container-scoped root exception.
+_ROOT_CONTAINER_OVERRIDES: Dict[str, Any] = {"runAsNonRoot": False, "runAsUser": 0}
+
+_IPV6_DISABLE_PATH = "/proc/sys/net/ipv6/conf/all/disable_ipv6"
 
 
 def prep_execd_init_for_egress(exec_install_script: str) -> tuple[str, Dict[str, Any]]:
     """
     Prepare execd init when ``egress.disable_ipv6`` is true: disable IPv6 in the Pod netns, then install.
 
-    Writes ``/proc/sys/.../disable_ipv6`` (no ``sysctl`` binary required). The returned
-    security context dict must be applied to the execd init container (typically via
-    ``build_security_context_from_dict`` in ``security_context``).
-
-    A pod-level non-root UID otherwise overrides this init container and makes
-    the sysctl write fail with EPERM. Keep the root exception explicit and
-    local to the privileged init container.
+    Writes ``/proc/sys/.../disable_ipv6`` when that path exists (no ``sysctl`` binary
+    required). A missing path is valid for an IPv4-only Pod netns, while a write failure
+    remains fatal. The returned security context dict must be applied to the execd init
+    container (typically via ``build_security_context_from_dict`` in ``security_context``).
 
     Returns:
         The prefixed shell script and its privileged root security context.
     """
-    script = f"set -e; echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 && {exec_install_script}"
-    return script, {
-        "privileged": True,
-        "runAsNonRoot": False,
-        "runAsUser": 0,
-    }
+    ipv6_disable_path = shlex.quote(_IPV6_DISABLE_PATH)
+    script = (
+        f"set -e; if [ -e {ipv6_disable_path} ]; then "
+        f"echo 1 > {ipv6_disable_path}; fi; {exec_install_script}"
+    )
+    return script, {"privileged": True, **_ROOT_CONTAINER_OVERRIDES}
 
 
 def build_security_context_for_sandbox_container(
@@ -80,52 +89,80 @@ def build_security_context_for_sandbox_container(
 
 def apply_egress_to_spec(
     containers: List[Dict[str, Any]],
-    network_policy: Optional[NetworkPolicy],
-    egress_image: Optional[str],
-    egress_auth_token: Optional[str] = None,
-    egress_mode: str = EGRESS_MODE_DNS,
-    credential_proxy_enabled: bool = False,
-    extra_env: Optional[Dict[str, Optional[str]]] = None,
+    egress_settings: Optional[EgressWorkloadSettings] = None,
     sandbox_id: Optional[str] = None,
+    pod_volumes: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     Append the egress sidecar to ``containers``. When ``egress.disable_ipv6`` is enabled,
     IPv6 is handled in execd init (``prep_execd_init_for_egress``); Pod-level sysctls are not modified.
 
     ``sandbox_id`` is injected as ``OPENSANDBOX_EGRESS_SANDBOX_ID`` when provided.
+    ``egress.otlp_endpoint`` is injected as ``OTEL_EXPORTER_OTLP_ENDPOINT`` when configured.
+    When ``egress_settings.upstream_proxy.ca_secret_name`` is set, the CA Secret is
+    projected onto ``pod_volumes`` (required, to avoid a dangling mount) and
+    mounted read-only into the egress sidecar only.
     """
-    if not network_policy or not egress_image:
+    if egress_settings is None:
         return
 
-    policy_payload = json.dumps(network_policy.model_dump(by_alias=True, exclude_none=True))
+    policy_payload = json.dumps(
+        egress_settings.network_policy.model_dump(by_alias=True, exclude_none=True)
+    )
 
     env: List[Dict[str, str]] = [
         {"name": EGRESS_RULES_ENV, "value": policy_payload},
-        {"name": EGRESS_MODE_ENV, "value": egress_mode},
+        {"name": EGRESS_MODE_ENV, "value": egress_settings.mode},
     ]
+    if egress_settings.otlp_endpoint:
+        env.append(
+            {"name": OTEL_EXPORTER_OTLP_ENDPOINT, "value": egress_settings.otlp_endpoint}
+        )
+    for name, value in upstream_proxy_egress_env(egress_settings.upstream_proxy).items():
+        env.append({"name": name, "value": value})
     if sandbox_id:
         env.append({"name": OPENSANDBOX_EGRESS_SANDBOX_ID, "value": sandbox_id})
-    if credential_proxy_enabled:
+    if egress_settings.credential_proxy_enabled:
         env.append({"name": OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT, "value": "true"})
-    if egress_auth_token:
-        env.append({"name": OPENSANDBOX_EGRESS_TOKEN, "value": egress_auth_token})
-    if extra_env:
-        for name, value in extra_env.items():
-            if credential_proxy_enabled and name == OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT:
+    if egress_settings.auth_token:
+        env.append({"name": OPENSANDBOX_EGRESS_TOKEN, "value": egress_settings.auth_token})
+    upstream_proxy = egress_settings.upstream_proxy
+    ca_secret_name = upstream_proxy.ca_secret_name if upstream_proxy else None
+    if ca_secret_name is not None:
+        if pod_volumes is None:
+            raise ValueError(
+                "pod_volumes is required for upstream proxy CA Secret mounting"
+            )
+        pod_volumes.append(
+            {
+                "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+                "secret": {
+                    "secretName": ca_secret_name,
+                    "items": [
+                        {
+                            "key": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                            "path": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                        }
+                    ],
+                },
+            }
+        )
+    if egress_settings.env:
+        for name, value in egress_settings.env.items():
+            if (
+                egress_settings.credential_proxy_enabled
+                and name == OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT
+            ):
                 continue
             env.append({"name": name, "value": value or ""})
 
     sidecar: Dict[str, Any] = {
         "name": "egress",
-        "image": egress_image,
+        "image": egress_settings.image,
         "env": env,
         "securityContext": {
             "capabilities": {"add": ["NET_ADMIN"]},
-            # A pod-level non-root UID clears NET_ADMIN from the effective
-            # capability set. The sidecar must retain it to install the
-            # nftables/iptables policy, so scope the root exception here.
-            "runAsNonRoot": False,
-            "runAsUser": 0,
+            **_ROOT_CONTAINER_OVERRIDES,
         },
         "ports": [{"name": "egress-api", "containerPort": 18080}],
         "readinessProbe": {
@@ -143,8 +180,27 @@ def apply_egress_to_spec(
             "mountPath": OPENSANDBOX_RUNTIME_MOUNT_PATH,
         }
     ]
-    if egress_auth_token:
+    if ca_secret_name is not None:
+        sidecar["volumeMounts"].append(
+            {
+                "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+                "mountPath": EGRESS_UPSTREAM_EXTRA_CA_PATH,
+                "subPath": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                "readOnly": True,
+            }
+        )
+    resources = {}
+    if egress_settings.resource_requests:
+        resources["requests"] = egress_settings.resource_requests
+    if egress_settings.resource_limits:
+        resources["limits"] = egress_settings.resource_limits
+    if resources:
+        sidecar["resources"] = resources
+    if egress_settings.auth_token:
         sidecar["readinessProbe"]["httpGet"]["httpHeaders"] = [
-            {"name": OPEN_SANDBOX_EGRESS_AUTH_HEADER, "value": egress_auth_token}
+            {
+                "name": OPEN_SANDBOX_EGRESS_AUTH_HEADER,
+                "value": egress_settings.auth_token,
+            }
         ]
     containers.append(sidecar)

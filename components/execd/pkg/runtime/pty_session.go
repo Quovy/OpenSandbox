@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -58,7 +59,6 @@ type PTYSession interface {
 	ResizePTY(cols, rows uint16) error
 }
 
-// IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
 func IsPTYSessionSupported() bool { return true }
 
 func NewPTYSessionID() string {
@@ -86,6 +86,7 @@ type ptySession struct {
 	lastExitCode int           // exit code; -1 until process exits
 	doneCh       chan struct{} // closed when process exits (non-nil after Start*)
 	outputDoneCh chan struct{} // closed after output broadcasters finish writing to replay
+	proc         *managedProcess
 
 	// Stdin (PTY master in PTY mode; write end of os.Pipe in pipe mode)
 	stdin io.WriteCloser
@@ -132,7 +133,6 @@ func (s *ptySession) LockWS() bool {
 	return s.wsConnected.CompareAndSwap(false, true)
 }
 
-// UnlockWS releases the WebSocket connection lock.
 func (s *ptySession) UnlockWS() {
 	s.wsConnected.Store(false)
 }
@@ -247,6 +247,27 @@ func buildPTYCommand(command string) *exec.Cmd {
 	return exec.Command(shell, args...)
 }
 
+// defaultPTYTerm backs the TERM default in ptySessionEnv: execd runs as a
+// daemon whose environment normally carries no TERM, which makes interactive
+// programs disable colors and terminfo features.
+const defaultPTYTerm = "xterm-256color"
+
+// ptySessionEnv returns the user process environment with TERM defaulted for
+// the interactive PTY side; pipe mode is not a terminal and gets no default.
+func ptySessionEnv() []string {
+	env := UserProcessEnvironment()
+	for i, kv := range env {
+		if name, value, ok := strings.Cut(kv, "="); ok && name == "TERM" {
+			if value != "" {
+				return env
+			}
+			env[i] = "TERM=" + defaultPTYTerm
+			return env
+		}
+	}
+	return append(env, "TERM="+defaultPTYTerm)
+}
+
 // StartPTY launches the preferred shell via pty.StartWithSize.
 // Must be called with the WS lock held.
 func (s *ptySession) StartPTY() error {
@@ -261,14 +282,21 @@ func (s *ptySession) StartPTY() error {
 	}
 
 	cmd := buildPTYCommand(s.command)
-	cmd.Env = os.Environ()
+	// Resolve through the shared user-env layering (sandbox binding envs from
+	// /init < EXECD_ENVS file) instead of inheriting execd's raw environment.
+	cmd.Env = ptySessionEnv()
 	if s.cwd != "" {
 		cmd.Dir = s.cwd
 	}
 	// Do NOT set Setpgid: pty.StartWithSize sets Setsid+Setctty internally.
 	// Combining Setsid+Setpgid causes EPERM (setpgid is illegal for a session leader).
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
+	var ptmx *os.File
+	mp, err := launchManagedWith(cmd, func() error {
+		var perr error
+		ptmx, perr = pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
+		return perr
+	})
 	if err != nil {
 		return fmt.Errorf("pty.StartWithSize: %w", err)
 	}
@@ -276,16 +304,17 @@ func (s *ptySession) StartPTY() error {
 	s.ptmx = ptmx
 	s.isPTY = true
 	s.pid = cmd.Process.Pid
+	s.proc = mp
 	s.doneCh = make(chan struct{})
 	outputDoneCh := make(chan struct{})
 	s.outputDoneCh = outputDoneCh
-	s.stdin = ptmx // write to the PTY master to feed stdin
+	s.stdin = ptmx
 
 	safego.Go(func() {
 		defer close(outputDoneCh)
 		s.broadcastPTY(ptmx)
 	})
-	safego.Go(func() { s.waitAndExit(cmd, ptmx) })
+	safego.Go(func() { s.waitAndExit(mp, ptmx, outputDoneCh) })
 
 	return nil
 }
@@ -323,7 +352,7 @@ func (s *ptySession) StartPipe() error {
 	}
 
 	cmd := buildPTYCommand(s.command)
-	cmd.Env = os.Environ()
+	cmd.Env = UserProcessEnvironment()
 	if s.cwd != "" {
 		cmd.Dir = s.cwd
 	}
@@ -332,7 +361,8 @@ func (s *ptySession) StartPipe() error {
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
-	if err := cmd.Start(); err != nil {
+	mp, err := launchManagedWith(cmd, cmd.Start)
+	if err != nil {
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		_ = stdoutR.Close()
@@ -349,6 +379,7 @@ func (s *ptySession) StartPipe() error {
 
 	s.isPTY = false
 	s.pid = cmd.Process.Pid
+	s.proc = mp
 	s.doneCh = make(chan struct{})
 	outputDoneCh := make(chan struct{})
 	s.outputDoneCh = outputDoneCh
@@ -368,7 +399,7 @@ func (s *ptySession) StartPipe() error {
 		outputWg.Wait()
 		close(outputDoneCh)
 	})
-	safego.Go(func() { s.waitAndExitPipe(cmd, stdinW, stdoutR, stderrR) })
+	safego.Go(func() { s.waitAndExitPipe(mp, stdinW, stdoutR, stderrR) })
 
 	return nil
 }
@@ -423,43 +454,51 @@ func (s *ptySession) writeAndFanout(chunk []byte, isStdout bool) {
 	if w != nil {
 		if _, err := w.Write(chunk); err != nil {
 			// Pipe was closed (client detached) — ignore.
-			log.Warn("pty fanout write: %v", err)
+			log.Warn("pty: fanout write: %v", err)
 		}
 	}
 }
 
+// ptyDrainTimeout bounds how long the session waits for buffered PTY output
+// after the shell exits, in case an attached client stopped reading.
+const ptyDrainTimeout = 2 * time.Second
+
 // waitAndExit waits for the PTY-mode process and updates session state on exit.
-func (s *ptySession) waitAndExit(cmd *exec.Cmd, ptmx *os.File) {
-	_ = cmd.Wait()
+func (s *ptySession) waitAndExit(mp *managedProcess, ptmx *os.File, outputDone <-chan struct{}) {
+	_ = mp.Wait()
 
-	// Close the PTY master to unblock the broadcast goroutine.
-	_ = ptmx.Close()
-
+	// The shell is reaped and its PID may be reused, so stop signalling it
+	// before waiting for its output below.
 	s.mu.Lock()
-	exitCode := 0
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	}
+	exitCode := mp.ExitCode()
 	s.lastExitCode = exitCode
 	s.pid = 0
 	doneCh := s.doneCh
 	s.mu.Unlock()
 
+	// Output the shell wrote before exiting can still be buffered in the
+	// master, and closing it discards that output. The broadcast goroutine
+	// stops once it has read everything (the master then returns EIO), so
+	// wait for it, but not past ptyDrainTimeout: it blocks while an attached
+	// client is not reading.
+	select {
+	case <-outputDone:
+	case <-time.After(ptyDrainTimeout):
+	}
+	_ = ptmx.Close()
+
 	close(doneCh)
 }
 
 // waitAndExitPipe waits for the pipe-mode process and updates session state on exit.
-func (s *ptySession) waitAndExitPipe(cmd *exec.Cmd, stdinW, stdoutR, stderrR *os.File) {
-	_ = cmd.Wait()
+func (s *ptySession) waitAndExitPipe(mp *managedProcess, stdinW, stdoutR, stderrR *os.File) {
+	_ = mp.Wait()
 
 	// Close stdin write-end so the child (if still running) sees EOF.
 	_ = stdinW.Close()
 
 	s.mu.Lock()
-	exitCode := 0
-	if cmd.ProcessState != nil {
-		exitCode = cmd.ProcessState.ExitCode()
-	}
+	exitCode := mp.ExitCode()
 	s.lastExitCode = exitCode
 	s.pid = 0
 	doneCh := s.doneCh
@@ -469,12 +508,19 @@ func (s *ptySession) waitAndExitPipe(cmd *exec.Cmd, stdinW, stdoutR, stderrR *os
 }
 
 // WriteStdin writes p to shell stdin (PTY master or pipe write-end).
+// Input that arrives once the shell is reaped is dropped, as a terminal would:
+// while the output drains the master is still open, and a write to it would
+// block once the tty input queue is full and then fail.
 func (s *ptySession) WriteStdin(p []byte) (int, error) {
 	s.mu.Lock()
 	w := s.stdin
+	exited := s.pid == 0
 	s.mu.Unlock()
 	if w == nil {
 		return 0, errors.New("session not started")
+	}
+	if exited {
+		return len(p), nil
 	}
 	return w.Write(p)
 }
@@ -578,7 +624,7 @@ func (s *ptySession) SendSignal(name string) {
 
 	sig := parseSignalName(name)
 	if sig == 0 {
-		log.Warn("ptySession.SendSignal: unknown signal %q", name)
+		log.Warn("pty: send signal: unknown signal %q", name)
 		return
 	}
 
@@ -586,7 +632,7 @@ func (s *ptySession) SendSignal(name string) {
 	// In pipe mode (Setpgid), pgid is also == pid.
 	// Either way, Kill(-pid, sig) sends to the process group.
 	if err := syscall.Kill(-pid, sig); err != nil {
-		log.Warn("ptySession.SendSignal kill(-%d, %v): %v", pid, sig, err)
+		log.Warn("pty: send signal kill(-%d, %v): %v", pid, sig, err)
 	}
 }
 
@@ -670,7 +716,7 @@ func (c *Controller) CreatePTYSession(id, cwd, command string) (PTYSession, erro
 	}
 	s := newPTYSession(id, resolvedCwd, command)
 	c.ptySessionMap.Store(id, s)
-	log.Info("created pty session %s", id)
+	log.Info("pty: created session %s", id)
 	return s, nil
 }
 
@@ -703,11 +749,10 @@ func (c *Controller) DeletePTYSession(id string) error {
 	}
 	s.close()
 	c.ptySessionMap.Delete(id)
-	log.Info("deleted pty session %s", id)
+	log.Info("pty: deleted session %s", id)
 	return nil
 }
 
-// GetPTYSessionStatus returns status information for a PTY session.
 func (c *Controller) GetPTYSessionStatus(id string) (running bool, outputOffset int64, err error) {
 	s := c.getPTYSession(id)
 	if s == nil {

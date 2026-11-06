@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,16 @@ package renewintent
 import "time"
 
 type Intent struct {
+	Namespace  string `json:"namespace,omitempty"`
 	SandboxID  string `json:"sandbox_id"`
 	ObservedAt string `json:"observed_at"`
 	Port       int    `json:"port,omitempty"`
 	RequestURI string `json:"request_uri,omitempty"`
 }
 
-func NewIntent(sandboxID string, port int, requestURI string) Intent {
+func NewIntent(namespace, sandboxID string, port int, requestURI string) Intent {
 	return Intent{
+		Namespace:  namespace,
 		SandboxID:  sandboxID,
 		ObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Port:       port,

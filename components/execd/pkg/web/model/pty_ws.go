@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,11 @@
 
 package model
 
-// ClientFrame is a JSON frame sent from the WebSocket client to the server.
+const (
+	PTYWebSocketProtocol    = "opensandbox-pty"
+	PTYWebSocketTokenPrefix = "base64url.bearer.execd.opensandbox."
+)
+
 type ClientFrame struct {
 	Type   string `json:"type"`
 	Data   string `json:"data,omitempty"`
@@ -23,7 +27,6 @@ type ClientFrame struct {
 	Signal string `json:"signal,omitempty"`
 }
 
-// ServerFrame is a JSON frame sent from the server to the WebSocket client.
 type ServerFrame struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`

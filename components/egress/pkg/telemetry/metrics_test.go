@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,31 +26,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
-	inttelemetry "github.com/alibaba/opensandbox/internal/telemetry"
 )
-
-func TestAppendMetricAttrsFromKeyValuePairs(t *testing.T) {
-	var base []attribute.KeyValue
-	out := inttelemetry.AppendAttrsFromKeyValuePairs(base, "a=b")
-	assert.Len(t, out, 1)
-	assert.Equal(t, "a", string(out[0].Key))
-	assert.Equal(t, "b", out[0].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "  foo=bar  , baz=qux ")
-	assert.Len(t, out, 2)
-	assert.Equal(t, "foo", string(out[0].Key))
-	assert.Equal(t, "bar", out[0].Value.AsString())
-	assert.Equal(t, "baz", string(out[1].Key))
-	assert.Equal(t, "qux", out[1].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "k=v=x")
-	assert.Len(t, out, 1)
-	assert.Equal(t, "k", string(out[0].Key))
-	assert.Equal(t, "v=x", out[0].Value.AsString())
-
-	out = inttelemetry.AppendAttrsFromKeyValuePairs(nil, "novalue=,=bad,nokv")
-	assert.Len(t, out, 0)
-}
 
 // The instrument records seconds, so it needs boundaries on a seconds ladder. With the
 // SDK default (the spec's millisecond ladder) every realistic DNS latency collapses into
@@ -112,6 +88,47 @@ func dnsDurationDataPoint(t *testing.T, rm *metricdata.ResourceMetrics) metricda
 	return metricdata.HistogramDataPoint[float64]{}
 }
 
+// collectEgressMetrics registers the egress instruments against a fresh ManualReader and
+// returns the single observed value per metric name.
+func collectEgressMetrics(t *testing.T) map[string]float64 {
+	t.Helper()
+
+	reader := sdkmetric.NewManualReader()
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(previous) })
+
+	if err := registerEgressMetrics(); err != nil {
+		t.Fatalf("registerEgressMetrics: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	out := map[string]float64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch data := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				for _, dp := range data.DataPoints {
+					out[m.Name] = float64(dp.Value)
+				}
+			case metricdata.Gauge[float64]:
+				for _, dp := range data.DataPoints {
+					out[m.Name] = dp.Value
+				}
+			case metricdata.Sum[float64]:
+				for _, dp := range data.DataPoints {
+					out[m.Name] = dp.Value
+				}
+			}
+		}
+	}
+	return out
+}
+
 // The failure counters carry a bounded attribute on top of the shared set. This checks the
 // attribute lands and, critically, that adding it does not corrupt the shared slice: it is
 // returned by a sync.OnceValue and may have spare capacity, so appending in place would
@@ -127,6 +144,11 @@ func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
 	RecordDNSQueryFailed(DNSFailureRcode)
 	RecordDNSQueryFailed(DNSFailureUpstreamError)
 	RecordNftablesUpdateFailed(NftOpDynamicAdd)
+	RecordNftablesUpdateFailed(NftOpUpstreamProxyAdd)
+	RecordNftablesUpdateFailed(NftOpUpstreamProxySync)
+	RecordDNSReplyFailed(DNSReplyStageAnswer)
+	RecordDNSReplyFailed(DNSReplyStageAnswer)
+	RecordDNSReplyFailed(DNSReplyStageDeny)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
@@ -137,8 +159,14 @@ func TestFailureCountersCarryBoundedAttributeWithoutSharingState(t *testing.T) {
 		DNSFailureRcode:         1,
 	}, dns, "each reason must be its own stream")
 
+	reply := counterByAttr(t, &rm, "egress.dns.reply.failed_total", "stage")
+	assert.Equal(t, map[string]int64{
+		DNSReplyStageAnswer: 2,
+		DNSReplyStageDeny:   1,
+	}, reply, "each stage must be its own stream")
+
 	nft := counterByAttr(t, &rm, "egress.nftables.updates.failed_total", "operation")
-	assert.Equal(t, map[string]int64{NftOpDynamicAdd: 1}, nft)
+	assert.Equal(t, map[string]int64{NftOpDynamicAdd: 1, NftOpUpstreamProxyAdd: 1, NftOpUpstreamProxySync: 1}, nft)
 }
 
 // counterByAttr sums an Int64 counter's data points keyed by one attribute, and asserts

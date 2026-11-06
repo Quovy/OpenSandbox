@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,11 +19,43 @@ This module defines data models based on the OpenAPI specification
 for request/response validation and serialization.
 """
 
+import ipaddress
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, RootModel, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, RootModel, field_validator, model_validator
 
+from opensandbox_server.constants import (
+    IDLE_TIMEOUT_MAX_SECONDS,
+    IDLE_TIMEOUT_MIN_SECONDS,
+    PROBE_TIMEOUT_MAX_SECONDS,
+    PROBE_TIMEOUT_MIN_SECONDS,
+    RENEW_EXTEND_MAX_SECONDS,
+    RENEW_EXTEND_MIN_SECONDS,
+)
+from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
+
+
+def _is_ip_or_cidr(value: str) -> bool:
+    """
+    Mirror policy.go's target-kind detection (netip.ParseAddr/ParsePrefix): a
+    target is IP/CIDR if it parses as either; anything else (including
+    domains) is not.
+    """
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    # netip.ParsePrefix rejects netmask notation and scoped prefixes; the
+    # sidecar would classify both as domains, so mirror it.
+    if "/" in value and (not value.partition("/")[2].isdigit() or "%" in value):
+        return False
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return True
+    except ValueError:
+        return False
 
 # ============================================================================
 # Image Specification
@@ -87,18 +119,64 @@ class ResourceLimits(RootModel[Dict[str, str]]):
 
 class NetworkRule(BaseModel):
     """
-    Egress rule: allow/deny a specific domain or wildcard.
+    Egress rule: allow/deny a domain, wildcard, IP/CIDR, and/or a set of TCP ports.
     """
 
     action: str = Field(..., description="Whether to allow or deny matching targets (allow | deny).")
-    target: str = Field(
-        ...,
-        description="FQDN or wildcard domain (e.g., 'example.com', '*.example.com').",
-        min_length=1,
+    target: Optional[str] = Field(
+        None,
+        description=(
+            "FQDN, wildcard domain (e.g., 'example.com', '*.example.com'), IP address, or CIDR. "
+            "May be omitted when `ports` is set; otherwise required. Blank normalizes to omitted "
+            "(the sidecar marshals port-only rules as \"target\": \"\" on read-back)."
+        ),
     )
+    ports: Optional[List[int]] = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description=(
+            "Restricts this rule to specific TCP destination ports (1-65535). Omitted target with "
+            "ports set applies to all destinations; a domain target with ports is rejected. TCP "
+            "only, max 256 ports per rule."
+        ),
+    )
+
+    @field_validator("target")
+    @classmethod
+    def normalize_target(cls, target: Optional[str]) -> Optional[str]:
+        # Mirror policy.go: trim before classifying.
+        if target is None:
+            return None
+        target = target.strip()
+        return target or None
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports(cls, ports: Optional[List[int]]) -> Optional[List[int]]:
+        # Mirrors policy.go's normalizePorts.
+        if ports is None:
+            return ports
+        seen: set[int] = set()
+        for port in ports:
+            if port < 1 or port > 65535:
+                raise ValueError(f"NetworkRule port {port} out of range 1-65535.")
+            if port in seen:
+                raise ValueError(f"NetworkRule has duplicate port {port}.")
+            seen.add(port)
+        return ports
+
+    @model_validator(mode="after")
+    def validate_target_or_ports(self) -> "NetworkRule":
+        if self.target is None and self.ports is None:
+            raise ValueError("NetworkRule requires target, ports, or both.")
+        if self.ports is not None and self.target is not None and not _is_ip_or_cidr(self.target):
+            raise ValueError("NetworkRule ports are not supported for domain targets yet.")
+        return self
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class NetworkPolicy(BaseModel):
@@ -118,6 +196,7 @@ class NetworkPolicy(BaseModel):
 
     class Config:
         populate_by_name = True
+        extra = "forbid"
 
 
 class CredentialProxyConfig(BaseModel):
@@ -136,6 +215,472 @@ class CredentialProxyConfig(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+# ============================================================================
+# Credential Vault (server-routed; mirrors specs/egress-api.yaml sidecar shapes)
+# ============================================================================
+
+
+class InlineCredentialSource(BaseModel):
+    type: Literal["inline"] = Field(..., description="Credential source type.")
+    value: str = Field(
+        ...,
+        description="Write-only credential value; never returned on any read.",
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class Credential(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique credential name.")
+    source: InlineCredentialSource = Field(..., description="Credential value source.")
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialSubstitution(BaseModel):
+    """Literal case-sensitive placeholder replacement for selected request surfaces."""
+
+    credential: str = Field(..., min_length=1, description="Credential name used as the replacement value.")
+    placeholder: str = Field(..., min_length=1, description="Literal placeholder to replace.")
+    in_: list[Literal["path", "query", "header", "body"]] = Field(
+        ...,
+        min_length=1,
+        alias="in",
+        description="Request surfaces where the placeholder may be replaced.",
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CustomHeaderEntry(BaseModel):
+    name: str = Field(
+        ...,
+        pattern=r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$",
+        description="Header name injected by the binding.",
+    )
+    credential: str = Field(..., min_length=1, description="Credential name whose value is injected.")
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class BearerCredentialAuth(BaseModel):
+    type: Literal["bearer"]
+    credential: str = Field(..., min_length=1, description="Credential name whose value becomes the bearer token.")
+    substitutions: Optional[list[CredentialSubstitution]] = Field(
+        default=None, description="Optional placeholder substitutions scoped to this binding."
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class BasicCredentialAuth(BaseModel):
+    type: Literal["basic"]
+    credential: str = Field(
+        ...,
+        min_length=1,
+        description="Credential containing pre-encoded base64(username:password).",
+    )
+    substitutions: Optional[list[CredentialSubstitution]] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class ApiKeyCredentialAuth(BaseModel):
+    type: Literal["apiKey"]
+    name: str = Field(
+        ...,
+        pattern=r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$",
+        description="Header name receiving the API key.",
+    )
+    credential: str = Field(..., min_length=1, description="Credential name whose value is the API key.")
+    substitutions: Optional[list[CredentialSubstitution]] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CustomHeadersCredentialAuth(BaseModel):
+    type: Literal["customHeaders"]
+    headers: list[CustomHeaderEntry] = Field(..., min_length=1, description="Headers injected by this binding.")
+    substitutions: Optional[list[CredentialSubstitution]] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class PassthroughCredentialAuth(BaseModel):
+    type: Literal["passthrough"]
+    substitutions: Optional[list[CredentialSubstitution]] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+CredentialAuth = Annotated[
+    BearerCredentialAuth
+    | BasicCredentialAuth
+    | ApiKeyCredentialAuth
+    | CustomHeadersCredentialAuth
+    | PassthroughCredentialAuth,
+    Field(discriminator="type"),
+]
+
+
+class CredentialMatch(BaseModel):
+    schemes: Optional[list[Literal["https", "http"]]] = Field(
+        default=None, description="Schemes the binding matches; defaults to [https]."
+    )
+    ports: Optional[list[int]] = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated. Port is derived from scheme; other values are rejected with a validation error.",
+    )
+    hosts: list[str] = Field(..., min_length=1, description="Host patterns (FQDN or wildcard domain).")
+    methods: Optional[list[str]] = Field(
+        default=None,
+        description="HTTP methods the binding matches; defaults to GET, POST, PUT, PATCH, DELETE.",
+    )
+    paths: Optional[list[str]] = Field(
+        default=None, description="Path patterns the binding matches; defaults to ['/*']."
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialBinding(BaseModel):
+    name: str = Field(..., min_length=1, description="Unique binding name.")
+    match: CredentialMatch = Field(..., description="Request matcher for credential injection.")
+    auth: CredentialAuth = Field(..., description="Injected credential shape.")
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialVaultCreateRequest(BaseModel):
+    """Create the initial Credential Vault revision (create-only)."""
+
+    credentials: list[Credential] = Field(..., description="Initial credentials (inline sources).")
+    bindings: list[CredentialBinding] = Field(..., description="Initial credential bindings.")
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialMutationSet(BaseModel):
+    add: Optional[list[Credential]] = Field(
+        default=None, description="Credentials to create; fails when a name already exists."
+    )
+    replace: Optional[list[Credential]] = Field(
+        default=None, description="Credentials to replace; fails when a name does not exist."
+    )
+    delete: Optional[list[str]] = Field(
+        default=None, description="Credential names to remove; fails when a name does not exist."
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialBindingMutationSet(BaseModel):
+    add: Optional[list[CredentialBinding]] = Field(
+        default=None, description="Bindings to create; fails when a name already exists."
+    )
+    replace: Optional[list[CredentialBinding]] = Field(
+        default=None, description="Bindings to replace; fails when a name does not exist."
+    )
+    delete: Optional[list[str]] = Field(
+        default=None, description="Binding names to remove; fails when a name does not exist."
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialVaultMutationRequest(BaseModel):
+    """Atomically mutate credentials and bindings (server-side merge commit)."""
+
+    expected_revision: Optional[int] = Field(
+        default=None,
+        alias="expectedRevision",
+        description="Optional optimistic concurrency guard; mismatch fails with 412.",
+    )
+    credentials: Optional[CredentialMutationSet] = Field(
+        default=None, description="Credential mutations (add/replace/delete)."
+    )
+    bindings: Optional[CredentialBindingMutationSet] = Field(
+        default=None, description="Binding mutations (add/replace/delete)."
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class CredentialAuthMetadata(BaseModel):
+    type: str = Field(..., description="Injected credential shape type.")
+    name: Optional[str] = Field(
+        default=None, description="Header name, for the apiKey shape only."
+    )
+
+    class Config:
+        populate_by_name = True
+
+
+class CredentialMetadata(BaseModel):
+    name: str
+    source_type: str = Field(..., alias="sourceType", description="Credential source type.")
+    revision: int
+
+    class Config:
+        populate_by_name = True
+
+
+class CredentialBindingMetadata(BaseModel):
+    name: str
+    revision: int
+    match: Optional[CredentialMatch] = None
+    auth: Optional[CredentialAuthMetadata] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class CredentialVaultState(BaseModel):
+    """Sanitized Credential Vault state — credential values never appear."""
+
+    revision: int
+    credentials: list[CredentialMetadata]
+    bindings: list[CredentialBindingMetadata]
+
+    class Config:
+        populate_by_name = True
+
+
+class CredentialListResponse(BaseModel):
+    revision: int
+    credentials: list[CredentialMetadata]
+
+    class Config:
+        populate_by_name = True
+
+
+class CredentialBindingListResponse(BaseModel):
+    revision: int
+    bindings: list[CredentialBindingMetadata]
+
+    class Config:
+        populate_by_name = True
+
+
+class LifecycleHook(BaseModel):
+    """Command executed by execd before the user entrypoint starts."""
+
+    command: List[str] = Field(..., min_length=1)
+    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1, le=10800)
+
+    @model_validator(mode="after")
+    def validate_command(self) -> "LifecycleHook":
+        if not self.command[0].strip():
+            raise ValueError("Lifecycle hook command must not be empty.")
+        return self
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class PeriodicLifecycleHook(BaseModel):
+    """Named command scheduled by execd while the sandbox is running."""
+
+    name: str = Field(..., min_length=1)
+    schedule: str = Field(..., min_length=1)
+    command: List[str] = Field(..., min_length=1)
+    timeout_seconds: Optional[int] = Field(None, alias="timeoutSeconds", ge=1, le=300)
+
+    @model_validator(mode="after")
+    def normalize_and_validate(self) -> "PeriodicLifecycleHook":
+        self.name = self.name.strip()
+        self.schedule = self.schedule.strip()
+        if not self.name:
+            raise ValueError("Periodic lifecycle hook name must not be blank.")
+        if not self.schedule:
+            raise ValueError("Periodic lifecycle hook schedule must not be blank.")
+        if not self.command[0].strip():
+            raise ValueError("Periodic lifecycle hook command must not be empty.")
+        return self
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class ActivityProbe(BaseModel):
+    """App-declared activity probe (``idlePolicy.activeProbe``, OSEP-0024).
+
+    ``GET {path}`` on ``{port}`` answering ``200 {"active": true}`` counts
+    as activity and resets the idle clock.
+    """
+
+    port: int = Field(..., ge=1, le=65535)
+    path: str = Field(..., min_length=1, max_length=512)
+    timeout_seconds: Optional[int] = Field(
+        None,
+        alias="timeoutSeconds",
+        ge=PROBE_TIMEOUT_MIN_SECONDS,
+        le=PROBE_TIMEOUT_MAX_SECONDS,
+    )
+
+    @model_validator(mode="after")
+    def validate_path(self) -> "ActivityProbe":
+        if not self.path.startswith("/"):
+            raise ValueError("idlePolicy.activeProbe.path must be an absolute HTTP path.")
+        if any(ord(char) < 0x20 or char == "\x7f" or char.isspace() for char in self.path):
+            raise ValueError(
+                "idlePolicy.activeProbe.path must not contain whitespace or control characters."
+            )
+        return self
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class IdlePolicy(BaseModel):
+    """Idle behavior declared by the sandbox (OSEP-0024).
+
+    With a timeout the sandbox is auto-paused after X idle seconds; without
+    it the policy is wake-only. Omitting ``idlePolicy`` preserves today's
+    behavior exactly.
+    """
+
+    idle_timeout_seconds: Optional[int] = Field(
+        None,
+        alias="idleTimeoutSeconds",
+        ge=IDLE_TIMEOUT_MIN_SECONDS,
+        le=IDLE_TIMEOUT_MAX_SECONDS,
+        description="Idle threshold X in seconds. Absent means a wake-only policy.",
+    )
+    on_idle: Optional[Literal["pause"]] = Field(
+        None,
+        alias="onIdle",
+        description="Action taken at the idle threshold; only 'pause' exists today.",
+    )
+    wake_on_access: bool = Field(
+        True,
+        alias="wakeOnAccess",
+        description=(
+            "Whether traffic may wake the sandbox from Paused. False keeps "
+            "today's manual-resume-only behavior."
+        ),
+    )
+    active_probe: Optional[ActivityProbe] = Field(None, alias="activeProbe")
+
+    @model_validator(mode="after")
+    def validate_pairing(self) -> "IdlePolicy":
+        if self.idle_timeout_seconds is None:
+            if self.on_idle is not None:
+                raise ValueError(
+                    "idlePolicy.onIdle must be omitted when idleTimeoutSeconds is omitted "
+                    "(a policy without a timeout is wake-only)."
+                )
+            if self.active_probe is not None:
+                raise ValueError(
+                    "idlePolicy.activeProbe requires idleTimeoutSeconds; the probe "
+                    "governs auto-pause and a wake-only policy is never probed."
+                )
+        elif self.on_idle is None:
+            raise ValueError(
+                "idlePolicy.onIdle is required when idleTimeoutSeconds is set."
+            )
+        return self
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class RenewalPolicy(BaseModel):
+    """Renew-on-access behavior (OSEP-0009): observed access moves the
+    expiration to ``max(now + extendSeconds, current)``. Control-plane
+    policy; supersedes the deprecated ``access.renew.extend.seconds``
+    extensions key.
+    """
+
+    extend_seconds: int = Field(
+        ...,
+        alias="extendSeconds",
+        ge=RENEW_EXTEND_MIN_SECONDS,
+        le=RENEW_EXTEND_MAX_SECONDS,
+        description=(
+            "Extension window X in seconds for each access-driven renewal: "
+            "the expiration is moved to max(now + X, current expiresAt)."
+        ),
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class SandboxLifecycle(BaseModel):
+    """Extensible lifecycle configuration: hooks run in the guest via execd;
+    ``idlePolicy`` (OSEP-0024) and ``renewalPolicy`` (OSEP-0009) are
+    control-plane state and never reach it.
+    """
+
+    pre_start: Optional[LifecycleHook] = Field(None, alias="preStart")
+    periodic: Optional[List[PeriodicLifecycleHook]] = None
+    idle_policy: Optional[IdlePolicy] = Field(
+        None,
+        alias="idlePolicy",
+        description="Auto-pause and wake-on-access behavior (fast-sandbox backend only).",
+    )
+    renewal_policy: Optional[RenewalPolicy] = Field(
+        None,
+        alias="renewalPolicy",
+        description=(
+            "Renew-on-access behavior (OSEP-0009); control-plane state. "
+            "Supersedes the deprecated access.renew.extend.seconds extensions key."
+        ),
+    )
+
+    @property
+    def has_hooks(self) -> bool:
+        return self.pre_start is not None or bool(self.periodic)
+
+    @model_validator(mode="after")
+    def validate_periodic_names(self) -> "SandboxLifecycle":
+        names = [hook.name for hook in self.periodic or []]
+        if len(names) != len(set(names)):
+            raise ValueError("Periodic lifecycle hook names must be unique.")
+        return self
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
 
 
 # ============================================================================
@@ -392,6 +937,11 @@ class CreateSandboxRequest(BaseModel):
     """
     Request to create a new sandbox from either a container image or a snapshot.
     """
+
+    # Internal routing hint: set by snapshot restore resolution to the backend
+    # that produced the snapshot (e.g. "fsb"); never serialized on the wire.
+    _resolved_snapshot_backend: Optional[str] = PrivateAttr(default=None)
+
     image: Optional[ImageSpec] = Field(
         None,
         description="Container image specification for the sandbox",
@@ -443,6 +993,10 @@ class CreateSandboxRequest(BaseModel):
         None,
         description="Custom key-value metadata for management, filtering, and tagging",
     )
+    lifecycle: Optional[SandboxLifecycle] = Field(
+        None,
+        description="Optional declarative lifecycle hooks executed by execd.",
+    )
     entrypoint: Optional[List[str]] = Field(
         None,
         min_length=1,
@@ -490,13 +1044,68 @@ class CreateSandboxRequest(BaseModel):
         None,
         description="Opaque container for provider-specific or transient parameters not covered by the core API",
     )
+    template_id: Optional[str] = Field(
+        None,
+        alias="templateId",
+        min_length=1,
+        description=(
+            "Fsb template to create the sandbox from. Mutually "
+            "exclusive with image and snapshotId; in template mode the workload "
+            "shape is fixed by the template's golden image, so entrypoint, env, "
+            "resourceLimits, resourceRequests, volumes, platform, credentialProxy, "
+            "secureAccess and lifecycle hooks are rejected. lifecycle.idlePolicy "
+            "is allowed (control-plane state, not workload shape). timeout is "
+            "required."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_source_and_entrypoint(self) -> "CreateSandboxRequest":
+        if self.env and OPENSANDBOX_LIFECYCLE in self.env:
+            raise ValueError(
+                f"Environment variable '{OPENSANDBOX_LIFECYCLE}' is reserved. "
+                "Use the lifecycle request field instead."
+            )
+
+        # Template mode (fsb): workload-shaping fields are rejected, not
+        # ignored; idlePolicy is control-plane state, so a hooks-free
+        # lifecycle may carry it.
+        if self.template_id is not None and self.template_id.strip():
+            conflicts = {
+                "image": self.image is not None,
+                "snapshotId": bool((self.snapshot_id or "").strip()),
+                "entrypoint": self.entrypoint is not None,
+                "env": self.env is not None,
+                "resourceLimits": self.resource_limits is not None,
+                "resourceRequests": self.resource_requests is not None,
+                "volumes": self.volumes is not None,
+                "platform": self.platform is not None,
+                "credentialProxy": self.credential_proxy is not None,
+                "secureAccess": self.secure_access,
+                "lifecycle": self.lifecycle is not None and self.lifecycle.has_hooks,
+            }
+            present = [name for name, is_set in conflicts.items() if is_set]
+            if present:
+                raise ValueError(
+                    f"templateId cannot be combined with: {', '.join(sorted(present))}; "
+                    "the workload shape is fixed by the template's golden image."
+                )
+            if self.timeout is None:
+                raise ValueError("timeout is required when templateId is provided.")
+            return self
+        if self.template_id is not None:
+            self.template_id = None  # normalize blank templateId
+
         # When poolRef is set, image/snapshotId/entrypoint/resourceLimits are
         # all defined in the Pool CRD and not required from the caller.
         has_pool_ref = bool((self.extensions or {}).get("poolRef", "").strip())
         if has_pool_ref:
+            if self.lifecycle is not None and self.lifecycle.has_hooks:
+                raise ValueError(
+                    "lifecycle hooks cannot be used together with poolRef; "
+                    "lifecycle.idlePolicy is not a hook and is allowed where "
+                    "the backend supports it."
+                )
             # Reject conflicting fields that would be ignored in pool mode
             if bool((self.snapshot_id or "").strip()):
                 raise ValueError("snapshotId cannot be used together with poolRef.")
@@ -533,6 +1142,11 @@ class CreateSandboxRequest(BaseModel):
     class Config:
         populate_by_name = True
 
+    @property
+    def resolved_snapshot_backend(self) -> Optional[str]:
+        """Backend that produced the snapshot being restored, if resolved."""
+        return self._resolved_snapshot_backend
+
 
 class CreateSandboxResponse(BaseModel):
     """
@@ -566,6 +1180,17 @@ class CreateSandboxResponse(BaseModel):
         populate_by_name = True
 
 
+class AllocationSummary(BaseModel):
+    """Current runtime-confirmed pool allocation summary."""
+    mode: Literal["pool"] = Field("pool", description="Allocation mode.")
+    pool_ref: str = Field(..., alias="poolRef", description="Concrete pool reference currently allocated.")
+    state: Literal["allocated"] = Field("allocated", description="Current confirmed allocation state.")
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
 class Sandbox(BaseModel):
     """
     Runtime execution environment provisioned from a container image.
@@ -591,6 +1216,14 @@ class Sandbox(BaseModel):
     extensions: Optional[Dict[str, str]] = Field(
         None,
         description="Opaque extension data restored from provider-specific storage",
+    )
+    allocation: Optional[AllocationSummary] = Field(
+        None,
+        description=(
+            "Current runtime-confirmed pool allocation summary. Omitted unless the runtime confirms "
+            "an active pool allocation; it is not a request echo, allocation history, readiness signal, "
+            "or Kubernetes introspection result."
+        ),
     )
     entrypoint: Optional[List[str]] = Field(None, description="The command to execute as the sandbox's entry process")
     expires_at: Optional[datetime] = Field(
@@ -798,7 +1431,11 @@ class RenewSandboxExpirationRequest(BaseModel):
     expires_at: datetime = Field(
         ...,
         alias="expiresAt",
-        description="New absolute expiration time in UTC (RFC 3339 format). Must be in the future.",
+        description=(
+            "New absolute expiration time in UTC (RFC 3339 format). Must be in the future. "
+            "May be earlier than, equal to, or later than the current expiresAt. "
+            "The creation-time limit server.max_sandbox_timeout_seconds does not apply."
+        ),
     )
 
     class Config:
@@ -982,6 +1619,164 @@ class ListPoolsResponse(BaseModel):
     Collection of pools.
     """
     items: List[PoolResponse] = Field(..., description="List of pools.")
+
+
+# ============================================================================
+# Fsb Templates
+# ============================================================================
+
+class FsbTemplateReadiness(BaseModel):
+    """
+    Build-side readiness gate for a fsb template.
+    """
+    probe: Optional[str] = Field(
+        None,
+        description=(
+            "Readiness probe checked first during the golden-image build; "
+            "e.g. 'tcp://127.0.0.1:44772' or 'cmd://<command>'."
+        ),
+    )
+    warmup_seconds: Optional[int] = Field(
+        None,
+        ge=0,
+        alias="warmupSeconds",
+        description="Fallback warmup window in seconds (default 60).",
+    )
+
+    class Config:
+        populate_by_name = True
+
+
+class CreateFsbTemplateRequest(BaseModel):
+    """
+    Request to create a fsb template: a fast-sandbox golden-image build.
+
+    The server persists the build intent, resolves it to a SandboxTemplate
+    CRD, and reports the asynchronous build through the template status.
+    Kernel, execd and guest init are server-side build inputs supplied from
+    the [kubernetes] configuration, not client fields.
+    """
+    image: str = Field(
+        ...,
+        min_length=1,
+        description="Source OCI image reference the golden image is built from",
+    )
+    resource_limits: Optional[ResourceLimits] = Field(
+        None,
+        alias="resourceLimits",
+        description=(
+            "Guest machine sizing: cpu -> guest vCPUs, memory -> guest memory, "
+            "disk -> logical size of the guest rootfs. The artifact set is "
+            "stored and P2P-pulled at the disk size, so keep it just above "
+            "the expanded source image. Defaults: cpu 1, memory 512Mi, "
+            "disk 2Gi."
+        ),
+    )
+    entrypoint: Optional[List[str]] = Field(
+        None,
+        min_length=1,
+        description="Guest business command (argv); empty defaults to ['tail', '-f', '/dev/null'].",
+    )
+    env: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "Environment variables baked into the golden image (injected as "
+            "/etc/sandbox-init.env in the guest; literal values only). The "
+            "source image's own OCI Config.Env is inherited like a container "
+            "runtime would; an env with the same name here overrides the "
+            "inherited value. Names must be valid shell variable names "
+            "([A-Za-z_][A-Za-z0-9_]*)."
+        ),
+    )
+    metadata: Optional[Dict[str, str]] = Field(
+        None,
+        description="Custom key-value metadata for management, filtering, and tagging",
+    )
+    readiness: Optional[FsbTemplateReadiness] = Field(
+        None,
+        description="Optional build-side readiness gate",
+    )
+    publish: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Publish destination for the built snapshot set: "
+            "'oci://registry/repository' for format=overlaybd (default), "
+            "'s3://bucket/prefix' for format=native."
+        ),
+    )
+    format: Literal["native", "overlaybd"] = Field(
+        "overlaybd",
+        description="Storage encoding of the produced snapshot set",
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
+class FsbTemplateStatus(BaseModel):
+    """
+    Status of a fsb template build.
+    """
+    phase: Literal["Pending", "Building", "Succeeded", "Failed"] = Field(
+        ...,
+        description="Build lifecycle phase",
+    )
+    manifest_ref: Optional[str] = Field(
+        None,
+        alias="manifestRef",
+        description=(
+            "Published artifact reference — oci://...@sha256 for "
+            "format=overlaybd, s3://.../manifest.json for native; present "
+            "when Succeeded"
+        ),
+    )
+    message: Optional[str] = Field(
+        None,
+        description="Failure reason when phase is Failed",
+    )
+
+    class Config:
+        populate_by_name = True
+
+
+class FsbTemplate(BaseModel):
+    """
+    A fsb template: a golden image whose build is declared and executed
+    by fast-sandbox.
+    """
+    template_id: str = Field(..., alias="templateId", description="Server-generated template ID (tpl_<uuid>)")
+    image: str = Field(..., description="Source OCI image reference")
+    resource_limits: Optional[ResourceLimits] = Field(None, alias="resourceLimits")
+    entrypoint: Optional[List[str]] = Field(None, description="Guest business command (argv)")
+    env: Optional[Dict[str, str]] = Field(
+        None, description="Environment variables baked into the golden image"
+    )
+    metadata: Optional[Dict[str, str]] = Field(None, description="Custom metadata from the creation request")
+    readiness: Optional[FsbTemplateReadiness] = Field(None, description="Build-side readiness gate")
+    publish: str = Field(
+        ...,
+        description=(
+            "Artifact publish destination — oci://registry/repository for "
+            "format=overlaybd (default), s3://bucket/prefix for format=native"
+        ),
+    )
+    format: Literal["native", "overlaybd"] = Field(..., description="Snapshot storage encoding")
+    status: FsbTemplateStatus = Field(..., description="Build status")
+    created_at: datetime = Field(..., alias="createdAt", description="Creation timestamp")
+    updated_at: datetime = Field(..., alias="updatedAt", description="Last update timestamp")
+
+    class Config:
+        populate_by_name = True
+
+
+class ListFsbTemplatesResponse(BaseModel):
+    """
+    Paginated collection of fsb templates.
+    """
+    items: List[FsbTemplate] = Field(..., description="List of templates")
+    pagination: PaginationInfo = Field(..., description="Pagination metadata")
 
 
 # ============================================================================

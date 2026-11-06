@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,6 +64,11 @@ public abstract class BaseE2ETest {
     }
 
     protected static ConnectionConfig createConnectionConfig(boolean useServerProxy) {
+        return createConnectionConfig(useServerProxy, false);
+    }
+
+    protected static ConnectionConfig createConnectionConfig(
+            boolean useServerProxy, boolean enableTracing) {
         String protocol = configValue(PROP_PROTOCOL, ENV_PROTOCOL, "http");
         return ConnectionConfig.builder()
                 .apiKey(configValue(PROP_API_KEY, ENV_API_KEY, "e2e-test"))
@@ -71,6 +76,7 @@ public abstract class BaseE2ETest {
                 .requestTimeout(Duration.ofMinutes(3))
                 .protocol(protocol)
                 .useServerProxy(useServerProxy || shouldUseServerProxy())
+                .enableTracing(enableTracing)
                 .build();
     }
 

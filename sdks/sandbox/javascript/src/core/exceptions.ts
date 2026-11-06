@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,13 @@ export type SandboxErrorCode =
   | "UNHEALTHY"
   | "INVALID_ARGUMENT"
   | "UNEXPECTED_RESPONSE"
+  | "WAKE_TIMEOUT"
+  | "POOL_EMPTY"
+  | "POOL_ACQUIRE_FAILED"
+  | "POOL_NOT_RUNNING"
+  | "POOL_STATE_STORE_UNAVAILABLE"
+  | "POOL_DESTROYED"
+  | "POOL_DESTROY_INCOMPLETE"
   // Allow server-defined codes as well.
   | (string & {});
 
@@ -33,6 +40,13 @@ export class SandboxError {
   static readonly UNHEALTHY: SandboxErrorCode = "UNHEALTHY";
   static readonly INVALID_ARGUMENT: SandboxErrorCode = "INVALID_ARGUMENT";
   static readonly UNEXPECTED_RESPONSE: SandboxErrorCode = "UNEXPECTED_RESPONSE";
+  static readonly WAKE_TIMEOUT: SandboxErrorCode = "WAKE_TIMEOUT";
+  static readonly POOL_EMPTY: SandboxErrorCode = "POOL_EMPTY";
+  static readonly POOL_ACQUIRE_FAILED: SandboxErrorCode = "POOL_ACQUIRE_FAILED";
+  static readonly POOL_NOT_RUNNING: SandboxErrorCode = "POOL_NOT_RUNNING";
+  static readonly POOL_STATE_STORE_UNAVAILABLE: SandboxErrorCode = "POOL_STATE_STORE_UNAVAILABLE";
+  static readonly POOL_DESTROYED: SandboxErrorCode = "POOL_DESTROYED";
+  static readonly POOL_DESTROY_INCOMPLETE: SandboxErrorCode = "POOL_DESTROY_INCOMPLETE";
 
   constructor(
     readonly code: SandboxErrorCode,
@@ -122,6 +136,44 @@ export class SandboxReadyTimeoutException extends SandboxException {
   }
 }
 
+/**
+ * Thrown when the OSEP-0024 wake retry budget is exhausted.
+ *
+ * The gateway answered `503` with the `OpenSandbox-Wake: expired` marker on
+ * every attempt: the sandbox restore did not finish within the wake retry
+ * policy's budget. The request was never forwarded, so retrying later is
+ * safe — the server-side resume continues in the background regardless.
+ *
+ * `attempts` carries the number of marked wake-timeout responses received;
+ * `waitedMs` carries the total wall-clock time spent across waits, retries,
+ * and request time.
+ */
+export class SandboxWakeTimeoutException extends SandboxApiException {
+  readonly name: string = "SandboxWakeTimeoutException";
+  readonly attempts: number;
+  readonly waitedMs: number;
+
+  constructor(opts: {
+    message?: string;
+    cause?: unknown;
+    attempts?: number;
+    waitedMs?: number;
+    requestId?: string;
+    rawBody?: unknown;
+  }) {
+    super({
+      message: opts.message,
+      cause: opts.cause,
+      statusCode: 503,
+      error: new SandboxError(SandboxError.WAKE_TIMEOUT, opts.message),
+      requestId: opts.requestId,
+      rawBody: opts.rawBody,
+    });
+    this.attempts = opts.attempts ?? 0;
+    this.waitedMs = opts.waitedMs ?? 0;
+  }
+}
+
 export class InvalidArgumentException extends SandboxException {
   readonly name: string = "InvalidArgumentException";
 
@@ -130,6 +182,68 @@ export class InvalidArgumentException extends SandboxException {
       message: opts.message,
       cause: opts.cause,
       error: new SandboxError(SandboxError.INVALID_ARGUMENT, opts.message),
+    });
+  }
+}
+
+export class PoolEmptyException extends SandboxException {
+  readonly name: string = "PoolEmptyException";
+
+  constructor(poolName: string) {
+    const message = `Sandbox pool '${poolName}' has no idle sandbox available`;
+    super({ message, error: new SandboxError(SandboxError.POOL_EMPTY, message) });
+  }
+}
+
+export class PoolAcquireFailedException extends SandboxException {
+  readonly name: string = "PoolAcquireFailedException";
+
+  constructor(poolName: string, cause?: unknown) {
+    const message = `Sandbox pool '${poolName}' could not acquire a usable idle sandbox`;
+    super({ message, cause, error: new SandboxError(SandboxError.POOL_ACQUIRE_FAILED, message) });
+  }
+}
+
+export class PoolNotRunningException extends SandboxException {
+  readonly name: string = "PoolNotRunningException";
+
+  constructor(poolName: string, state: string) {
+    const message = `Sandbox pool '${poolName}' is not running (state=${state})`;
+    super({ message, error: new SandboxError(SandboxError.POOL_NOT_RUNNING, message) });
+  }
+}
+
+export class PoolStateStoreUnavailableException extends SandboxException {
+  readonly name: string = "PoolStateStoreUnavailableException";
+
+  constructor(operation: string, cause?: unknown) {
+    const message = `Sandbox pool state store operation '${operation}' failed`;
+    super({
+      message,
+      cause,
+      error: new SandboxError(SandboxError.POOL_STATE_STORE_UNAVAILABLE, message),
+    });
+  }
+}
+
+export class PoolDestroyedException extends SandboxException {
+  readonly name: string = "PoolDestroyedException";
+
+  constructor(poolName: string, state: string) {
+    const message = `Sandbox pool '${poolName}' namespace is ${state}`;
+    super({ message, error: new SandboxError(SandboxError.POOL_DESTROYED, message) });
+  }
+}
+
+export class PoolDestroyIncompleteException extends SandboxException {
+  readonly name: string = "PoolDestroyIncompleteException";
+
+  constructor(poolName: string, cause?: unknown) {
+    const message = `Sandbox pool '${poolName}' destroy did not complete`;
+    super({
+      message,
+      cause,
+      error: new SandboxError(SandboxError.POOL_DESTROY_INCOMPLETE, message),
     });
   }
 }

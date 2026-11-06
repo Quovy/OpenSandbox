@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package assign
 
 import (
 	"context"
+	"fmt"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 )
@@ -32,4 +33,21 @@ func (p *capacityPredicate) Predicate(_ context.Context, sbx *sandboxv1alpha1.Ba
 		desired = *sbx.Spec.Replicas
 	}
 	return pool.Spec.CapacitySpec.PoolMax-pool.Status.Allocated >= desired
+}
+
+func (p *capacityPredicate) Reason(_ context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool) string {
+	desired := int32(1)
+	if sbx.Spec.Replicas != nil {
+		desired = *sbx.Spec.Replicas
+	}
+	return fmt.Sprintf(
+		"capacity exhausted: poolMax=%d, allocated=%d, desired=%d",
+		pool.Spec.CapacitySpec.PoolMax,
+		pool.Status.Allocated,
+		desired,
+	)
+}
+
+func (p *capacityPredicate) FailureCode() string {
+	return FailureCodeCapacityExhausted
 }

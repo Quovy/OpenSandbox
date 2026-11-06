@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ import (
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
+	Subprotocols:    []string{model.PTYWebSocketProtocol},
 	// Allow all origins — execd runs behind a trusted reverse proxy.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -112,7 +113,7 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 	//    evicting, so a bad or incomplete handshake cannot kill the current holder.
 	conn, err := wsUpgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
-		log.Warn("pty ws upgrade failed for session %s: %v", id, err)
+		log.Warn("pty ws: upgrade session=%s: %v", id, err)
 		if locked {
 			session.UnlockWS()
 		}
@@ -132,7 +133,6 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 	// From here we hold the lock; it is released at the very end of this function (see
 	// defer below), only after all pump goroutines have exited.
 
-	// Resolve query parameters.
 	pipeMode := ctx.Query("pty") == "0"
 	since := queryInt64(ctx.Query("since"), 0)
 
@@ -145,7 +145,7 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 			startErr = session.StartPTY()
 		}
 		if startErr != nil {
-			log.Warn("pty start failed for session %s: %v", id, startErr)
+			log.Warn("pty ws: start session=%s: %v", id, startErr)
 			writeErrFrame(conn, model.WSErrCodeStartFailed, startErr.Error())
 			_ = conn.Close()
 			session.UnlockWS()
@@ -174,7 +174,6 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		session.ClearEvictHandler(evictGen)
 	}()
 
-	// cancelCh is closed to signal all goroutines to stop.
 	cancelCh := make(chan struct{})
 	cancelOnce := sync.OnceFunc(func() { close(cancelCh) })
 
@@ -201,16 +200,14 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 	// closeConn it must not wait behind a stalled output writer: a takeover targets
 	// exactly the slow/abandoned-client case, so blocking on connMu (held by a pump
 	// stuck in WriteMessage) until wsWriteDeadline would defeat wsTakeoverTimeout. It
-	// therefore sends the close frame only on a best-effort basis (TryLock, short
-	// deadline) and always closes the conn, which unblocks any stuck writer. A client
+	// therefore sends the close frame with WriteControl, which is safe alongside the
+	// pumps' writes and waits at most wsTakeoverCloseTimeout for an in-flight frame to
+	// finish, and always closes the conn, which unblocks any stuck writer. A client
 	// too backed-up to receive the frame could not have received it anyway.
 	evictClose := func(code int, text string) {
-		if connMu.TryLock() {
-			_ = conn.SetWriteDeadline(time.Now().Add(wsTakeoverCloseTimeout))
-			_ = conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(code, text))
-			connMu.Unlock()
-		}
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(code, text),
+			time.Now().Add(wsTakeoverCloseTimeout))
 		_ = conn.Close()
 	}
 
@@ -220,16 +217,15 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		return conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
 	})
 
-	// Register a close-only eviction hook BEFORE the initial writes so a concurrent
+	// Register the eviction hook BEFORE the initial writes so a concurrent
 	// ?takeover=1 can interrupt a holder stalled during a large replay or the connected
-	// frame. At this point the initial writes run without connMu (pumps not yet started),
-	// so the hook must not acquire connMu or write to conn — only close it. Closing
-	// unblocks any blocked WriteMessage and makes the subsequent read loop exit, which
-	// triggers the deferred cleanup and releases the lock. cancelOnce is also called so
-	// all goroutines stop once the pumps do start.
+	// frame. WriteControl is concurrent-safe with the initial unlocked writes, so evictClose
+	// sends the WSCloseTakenOver close frame best-effort (allowing the client to distinguish
+	// a handoff from a network drop) before closing the connection and unblocking any writer.
+	// Generation-tokened: a tearing-down handler never clears a successor's hook.
 	evictGen = session.SetEvictHandler(func() {
+		evictClose(model.WSCloseTakenOver, model.WSErrCodeTakenOver)
 		cancelOnce()
-		_ = conn.Close()
 	})
 
 	// 8. Send replay frame if there is missed output.
@@ -237,7 +233,7 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		// No connMu needed — pump goroutines not yet started.
 		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
-			log.Warn("pty ws send replay for session %s: %v", id, err2)
+			log.Warn("pty ws: send replay session=%s: %v", id, err2)
 			return
 		}
 	}
@@ -253,12 +249,12 @@ func PTYSessionWebSocket(ctx *gin.Context) {
 		Mode:      mode,
 		Role:      "holder",
 	}); err2 != nil {
-		log.Warn("pty ws send connected for session %s: %v", id, err2)
+		log.Warn("pty ws: send connected session=%s: %v", id, err2)
 		return
 	}
 
 	// Upgrade the eviction hook now that the initial writes are done and all subsequent
-	// writes will be serialized by connMu (pumps + evictClose's TryLock). The full hook
+	// writes will be serialized by connMu (evictClose bypasses it via WriteControl). The full hook
 	// sends the WSCloseTakenOver close frame best-effort so the client can distinguish an
 	// intentional handoff from a network drop, then closes the conn and cancels goroutines.
 	// Generation-tokened: a tearing-down handler never clears a successor's hook.
@@ -311,7 +307,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 
 	conn, err := wsUpgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
-		log.Warn("pty viewer ws upgrade failed for session %s: %v", id, err)
+		log.Warn("pty viewer ws: upgrade session=%s: %v", id, err)
 		return
 	}
 
@@ -356,7 +352,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 	if len(snapshotBytes) > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline))
 		if err2 := writeReplayFrame(conn, snapshotBytes, snapshotOffset); err2 != nil {
-			log.Warn("pty viewer ws send replay for session %s: %v", id, err2)
+			log.Warn("pty viewer ws: send replay session=%s: %v", id, err2)
 			return
 		}
 	}
@@ -371,7 +367,7 @@ func ptyViewerWebSocket(ctx *gin.Context, session runtime.PTYSession, id string)
 		Mode:      mode,
 		Role:      "viewer",
 	}); err2 != nil {
-		log.Warn("pty viewer ws send connected for session %s: %v", id, err2)
+		log.Warn("pty viewer ws: send connected session=%s: %v", id, err2)
 		return
 	}
 
@@ -430,7 +426,7 @@ func ptyViewerStreamPump(
 		writeErr := writeReplayFrame(conn, data, actualOffset)
 		connMu.Unlock()
 		if writeErr != nil {
-			log.Warn("pty viewer ws write output for session %s: %v", id, writeErr)
+			log.Warn("pty viewer ws: write output session=%s: %v", id, writeErr)
 			cancelOnce()
 			return false
 		}
@@ -460,6 +456,8 @@ const ptyViewerReadOnlyViolationLimit = 5
 // ptyViewerClientReadLoop accepts ping frames but rejects every operation that
 // could mutate the session. It closes a connection that repeatedly sends
 // mutating frames to bound server-to-client error traffic.
+//
+//nolint:gocognit // pre-existing complexity on main; not part of OSEP-0018
 func ptyViewerClientReadLoop(
 	conn *websocket.Conn,
 	writeJSON func(any) error,
@@ -500,39 +498,60 @@ func ptyViewerClientReadLoop(
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			if len(data) > 0 && data[0] == model.BinStdin {
-				if !readOnlyError() {
-					return
-				}
+			if !ptyViewerHandleBinaryMessage(data, readOnlyError) {
+				return
 			}
 		case websocket.TextMessage:
-			var frame model.ClientFrame
-			if json.Unmarshal(data, &frame) != nil {
-				continue
-			}
-			switch frame.Type {
-			case "stdin", "signal", "resize":
-				if !readOnlyError() {
-					return
-				}
-			case "ping":
-				if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
-					cancelOnce()
-				}
-			default:
-				if err := writeJSON(model.ServerFrame{
-					Type:  "error",
-					Code:  model.WSErrCodeInvalidFrame,
-					Error: fmt.Sprintf("unknown frame type %q", frame.Type),
-				}); err != nil {
-					cancelOnce()
-				}
+			if !ptyViewerHandleTextMessage(data, writeJSON, readOnlyError, cancelOnce) {
+				return
 			}
 		}
 	}
 }
 
-// ptyPingLoop sends periodic WebSocket pings until cancelCh is closed.
+// ptyViewerHandleBinaryMessage reports stdin payloads on a read-only viewer;
+// returns false when the read loop should exit.
+func ptyViewerHandleBinaryMessage(data []byte, readOnlyError func() bool) bool {
+	if len(data) > 0 && data[0] == model.BinStdin {
+		return readOnlyError()
+	}
+	return true
+}
+
+// ptyViewerHandleTextMessage handles client frames on a read-only viewer;
+// returns false when the read loop should exit.
+func ptyViewerHandleTextMessage(data []byte, writeJSON func(any) error, readOnlyError func() bool, cancelOnce func()) bool {
+	var frame model.ClientFrame
+	if json.Unmarshal(data, &frame) != nil {
+		return true
+	}
+	switch frame.Type {
+	case "stdin", "signal", "resize":
+		return readOnlyError()
+	case "ping":
+		ptyViewerReplyPong(writeJSON, cancelOnce)
+	default:
+		ptyViewerReplyInvalidFrame(writeJSON, cancelOnce, frame.Type)
+	}
+	return true
+}
+
+func ptyViewerReplyPong(writeJSON func(any) error, cancelOnce func()) {
+	if err := writeJSON(model.ServerFrame{Type: "pong"}); err != nil {
+		cancelOnce()
+	}
+}
+
+func ptyViewerReplyInvalidFrame(writeJSON func(any) error, cancelOnce func(), frameType string) {
+	if err := writeJSON(model.ServerFrame{
+		Type:  "error",
+		Code:  model.WSErrCodeInvalidFrame,
+		Error: fmt.Sprintf("unknown frame type %q", frameType),
+	}); err != nil {
+		cancelOnce()
+	}
+}
+
 func ptyPingLoop(conn *websocket.Conn, connMu *sync.Mutex, cancelCh <-chan struct{}, cancelOnce func()) {
 	t := time.NewTicker(wsPingInterval)
 	defer t.Stop()
@@ -561,7 +580,6 @@ func writeReplayFrame(conn *websocket.Conn, data []byte, offset int64) error {
 	return conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
-// ptyStreamPump reads raw chunks from r and sends them as binary frames over WS.
 func ptyStreamPump(r io.Reader, typeByte byte, name, id string, conn *websocket.Conn, connMu *sync.Mutex, pumpWg *sync.WaitGroup, cancelCh <-chan struct{}, cancelOnce func()) {
 	defer pumpWg.Done()
 	const chunkSize = 32 * 1024
@@ -580,7 +598,7 @@ func ptyStreamPump(r io.Reader, typeByte byte, name, id string, conn *websocket.
 			writeErr := conn.WriteMessage(websocket.BinaryMessage, frame[:1+n])
 			connMu.Unlock()
 			if writeErr != nil {
-				log.Warn("pty ws write %s for session %s: %v", name, id, writeErr)
+				log.Warn("pty ws: write %s session=%s: %v", name, id, writeErr)
 				cancelOnce()
 				return
 			}
@@ -660,7 +678,7 @@ func ptyHandleTextMsg(session runtime.PTYSession, id string, data []byte, writeJ
 	case "resize":
 		if frame.Cols > 0 && frame.Rows > 0 {
 			if resErr := session.ResizePTY(uint16(frame.Cols), uint16(frame.Rows)); resErr != nil {
-				log.Warn("pty resize session %s: %v", id, resErr)
+				log.Warn("pty ws: resize session=%s: %v", id, resErr)
 			}
 		}
 	case "ping":
@@ -672,7 +690,6 @@ func ptyHandleTextMsg(session runtime.PTYSession, id string, data []byte, writeJ
 	return false
 }
 
-// ptyClientReadLoop processes incoming WebSocket messages until the connection closes.
 func ptyClientReadLoop(conn *websocket.Conn, session runtime.PTYSession, id string, writeJSON func(any) error, cancelCh <-chan struct{}, cancelOnce func()) {
 	for {
 		select {

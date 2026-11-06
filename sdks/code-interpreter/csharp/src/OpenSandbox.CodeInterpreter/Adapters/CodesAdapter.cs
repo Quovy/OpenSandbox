@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ using OpenSandbox.CodeInterpreter.Services;
 using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
+using OpenSandbox.Services;
 using Microsoft.Extensions.Logging;
 
 namespace OpenSandbox.CodeInterpreter.Adapters;
@@ -28,7 +29,7 @@ namespace OpenSandbox.CodeInterpreter.Adapters;
 /// <summary>
 /// Adapter implementation for the codes service.
 /// </summary>
-internal sealed class CodesAdapter : ICodes
+internal sealed class CodesAdapter : ICodes, IExecdHealth
 {
     private readonly HttpClientWrapper _client;
     private readonly HttpClient _sseHttpClient;
@@ -152,11 +153,24 @@ internal sealed class CodesAdapter : ICodes
 
         _logger.LogInformation("Interrupting code execution: {ExecutionId}", executionId);
         var queryParams = new Dictionary<string, string?> { ["id"] = executionId };
-        await _client.DeleteAsync("/code", queryParams, cancellationToken).ConfigureAwait(false);
+        await _client.DeleteAsync("/code", queryParams, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
-    public async IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(
-        RunCodeRequest request,
+    public async Task<bool> PingAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await _client.GetAsync("/ping", cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Code interpreter ping failed");
+            return false;
+        }
+    }
+
+    public async IAsyncEnumerable<ServerStreamEvent> RunStreamAsync(        RunCodeRequest request,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (request == null)
@@ -200,9 +214,11 @@ internal sealed class CodesAdapter : ICodes
             throw new InvalidArgumentException("Code cannot be empty");
         }
 
-        if (options?.Context != null && options.Language != null)
+        // Only a mismatch is an error (aligned with the Python/JS SDKs).
+        if (options?.Context != null && options.Language != null && options.Context.Language != options.Language)
         {
-            throw new InvalidArgumentException("Provide either options.Context or options.Language, not both");
+            throw new InvalidArgumentException(
+                $"Language '{options.Language}' must match context language '{options.Context.Language}'");
         }
 
         var context = options?.Context
@@ -223,6 +239,16 @@ internal sealed class CodesAdapter : ICodes
         await foreach (var ev in RunStreamAsync(request, cancellationToken).ConfigureAwait(false))
         {
             await dispatcher.DispatchAsync(ev).ConfigureAwait(false);
+        }
+
+        // Infer the exit code the same way CommandsAdapter does.
+        if (execution.Error != null)
+        {
+            execution.ExitCode = int.TryParse(execution.Error.Value, out var exitCode) ? exitCode : null;
+        }
+        else if (execution.Complete != null)
+        {
+            execution.ExitCode = 0;
         }
 
         return execution;

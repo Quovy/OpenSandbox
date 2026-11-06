@@ -5,25 +5,35 @@ configs:
       host = "0.0.0.0"
       port = 8090
 
+      [proxy]
+      # The lifecycle server is attached to opensandbox-net, while sandboxes
+      # created through the mounted Docker socket use Docker's bridge network.
+      # Route through host-published ports instead of unreachable sandbox IPs.
+      resolve_internal = false
+
       [log]
       level = "INFO"
 
       [runtime]
       type = "docker"
-      # execd_image = "opensandbox/execd:v1.0.22"
-      execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.22"
+      # execd_image = "opensandbox/execd:v1.1.0"
+      execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0"
 
       [egress]
-      image = "opensandbox/egress:v1.1.6"
-      # image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.6"
+      image = "opensandbox/egress:v1.1.7"
+      # image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.7"
+      readiness_timeout_seconds = 30.0
 
       [docker]
       network_mode = "bridge"
-      # When server runs in a container, set host_ip to the host's IP or hostname so bridge-mode endpoints are reachable (e.g. host.docker.internal or the host LAN IP).
-      # It's required when server deployed with docker container under host.
+      # Required when the server runs in a container: host-mapped endpoints and
+      # proxy targets must resolve back to the Docker host.
       host_ip = "host.docker.internal"
       port_range_min = 40000
       port_range_max = 60000
+      # Optional: publish sandbox ports on ONE host address instead of every interface, e.g. the
+      # Docker bridge gateway (an IP, not a name) — then only containers on the host reach execd.
+      # publish_host = "172.17.0.1"
       drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
       no_new_privileges = true
       # TODO: For production environments, it is recommended to set this to '4096' or higher to avoid
@@ -38,10 +48,13 @@ version: '3.8'
 
 services:
   opensandbox-server:
-    image: opensandbox/server:latest
+    # Includes configurable proxy resolution for this Compose/bridge topology.
+    image: opensandbox/server:release-1.1.0
     container_name: opensandbox-server
     networks:
       - opensandbox-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8090:8090"
     volumes:
@@ -57,6 +70,8 @@ services:
     container_name: sdk-client
     networks:
       - opensandbox-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: >
       sh -c "pip install opensandbox && tail -f /dev/null"
     environment:

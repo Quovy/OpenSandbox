@@ -1,6 +1,6 @@
 //go:build linux
 
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,11 +42,9 @@ var seccompBPF []byte
 //  3. /usr/bin/bwrap               — system package (Alpine apk)
 //  4. /usr/local/bin/bwrap         — manual install
 func findBwrap() string {
-	// First: respect whatever the user has in $PATH.
 	if path, err := exec.LookPath("bwrap"); err == nil {
 		return path
 	}
-	// Fall back to known locations.
 	for _, p := range []string{
 		"/opt/opensandbox/bwrap",
 		"/usr/bin/bwrap",
@@ -64,7 +62,6 @@ func findBwrap() string {
 // buildArgv must skip that flag in userns mode. Detected once at startup.
 var bwrapIsSetuid bool
 
-// isSetuidBinary reports whether the file at path has the setuid bit set.
 func isSetuidBinary(path string) bool {
 	if path == "" {
 		return false
@@ -80,12 +77,10 @@ func currentProcessIDs() (uint32, uint32) {
 	return uint32(os.Getuid()), uint32(os.Getgid())
 }
 
-// bwrapImpl is the Linux bwrap Isolator.
 type bwrapImpl struct {
 	probe ProbeResult
 }
 
-// NewBwrap returns a bwrap Isolator for Linux, configured by cfg.
 func NewBwrap(cfg Config) Isolator {
 	probe := Probe(ProbeConfig{
 		UpperRoot:     cfg.UpperRoot,
@@ -126,12 +121,19 @@ func (b *bwrapImpl) Available() bool {
 
 func (b *bwrapImpl) Capabilities() Capabilities {
 	return Capabilities{
+		// Available reuses the live check so the capabilities report can
+		// never disagree with the create path's probed() gate: Available()
+		// also validates the session gate file, which the probe alone does
+		// not cover.
 		Available:              b.Available(),
 		Isolator:               b.probe.Isolator,
 		Version:                b.probe.Version,
+		Message:                b.probe.Message,
 		SetprivAvailable:       b.probe.SetprivAvailable,
 		SetprivSwitchAvailable: b.probe.SetprivSwitchAvailable,
+		SetprivNetAvailable:    b.probe.SetprivNetAvailable,
 		UsernsAvailable:        b.probe.UsernsAvailable,
+		UsernsNetAvailable:     b.probe.UsernsNetAvailable,
 		Profiles:               []Profile{ProfileStrict, ProfileBalanced},
 		ShareNetOverridable:    true,
 		CommitSupported:        false, // Phase 2

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -258,7 +258,6 @@ func TestIdleGC(t *testing.T) {
 	defer cancel()
 	require.NoError(t, r.RunInIsolatedSession(ctx, id, "true", nil, nil))
 
-	// Session should exist immediately after run.
 	_, err = r.GetIsolatedSession(id)
 	require.NoError(t, err)
 
@@ -266,15 +265,14 @@ func TestIdleGC(t *testing.T) {
 	// GC interval is 60s, too slow for test. Manually trigger.
 	r.CollectIdle()
 
-	// After GC, session should be gone (idle > 2s since we waited).
-	// But since lastRunAt was just updated, it should still exist.
+	// lastRunAt was just refreshed by the run above, so the session must
+	// survive this GC pass despite being older than the idle timeout.
 	_, err = r.GetIsolatedSession(id)
 	require.NoError(t, err)
 
 	// Wait past the idle timeout.
 	time.Sleep(3 * time.Second)
 
-	// Trigger GC again — now it should be collected.
 	r.CollectIdle()
 
 	_, err = r.GetIsolatedSession(id)
@@ -294,7 +292,6 @@ func TestIdleGC_Disabled(t *testing.T) {
 	require.NoError(t, err)
 	defer r.DeleteIsolatedSession(id)
 
-	// CollectIdle should not delete sessions with timeout=0.
 	r.CollectIdle()
 
 	_, err = r.GetIsolatedSession(id)

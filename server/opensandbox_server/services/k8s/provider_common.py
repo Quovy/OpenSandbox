@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,7 +129,11 @@ def _build_execd_init_container(
         "(test ! -e /usr/local/libexec/opensandbox-session-gate || "
         "(cp /usr/local/libexec/opensandbox-session-gate "
         "/opt/opensandbox/opensandbox-session-gate && "
-        "chmod 0555 /opt/opensandbox/opensandbox-session-gate))"
+        "chmod 0555 /opt/opensandbox/opensandbox-session-gate)) && "
+        "(test ! -e /usr/local/libexec/opensandbox-launcher || "
+        "(cp /usr/local/libexec/opensandbox-launcher "
+        "/opt/opensandbox/opensandbox-launcher && "
+        "chmod 0555 /opt/opensandbox/opensandbox-launcher))"
     )
     security_context = None
     if disable_ipv6_for_egress:

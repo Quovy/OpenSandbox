@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional OpenTelemetry integration for SDK metrics ingestion."""
+"""Optional OpenTelemetry integration for Server and SDK metrics."""
 
 from opensandbox_server.integrations.otel.metrics import (
+    record_http_request_duration,
     record_sandbox_create_duration,
     setup_otel_metrics,
     shutdown_otel_metrics,
 )
 
 __all__ = [
+    "record_http_request_duration",
     "record_sandbox_create_duration",
     "setup_otel_metrics",
     "shutdown_otel_metrics",

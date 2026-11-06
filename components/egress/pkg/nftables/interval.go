@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,12 @@ func normalizeNFTIntervalSet(elems []string) ([]string, error) {
 		out = append(out, formatPrefixForNFT(p))
 	}
 	return out, nil
+}
+
+// NormalizeIntervalSet is the exported form used by the fast-sandbox profile
+// ruleset builder (pkg/fastsandboxnft), which shares the interval-set semantics.
+func NormalizeIntervalSet(elems []string) ([]string, error) {
+	return normalizeNFTIntervalSet(elems)
 }
 
 func parseAsPrefix(s string) (netip.Prefix, error) {

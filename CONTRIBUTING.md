@@ -12,6 +12,7 @@ Thank you for your interest in contributing to OpenSandbox! This guide will help
 - [Coding Standards](#coding-standards)
 - [Testing Guidelines](#testing-guidelines)
 - [Submitting Contributions](#submitting-contributions)
+- [Contributor Advancement](#contributor-advancement)
 - [Communication Channels](#communication-channels)
 
 ## Code of Conduct
@@ -53,7 +54,7 @@ Different components have different requirements:
 
 #### For execd (Go)
 
-- **Go 1.24+**
+- **Go 1.25+**
 - **Make** - Build automation (optional)
 - **Docker** - For building container images
 
@@ -74,7 +75,7 @@ cd server
 uv sync
 
 # Copy example configuration from the source tree
-cp server/opensandbox_server/examples/example.config.toml ~/.sandbox.toml
+cp opensandbox_server/examples/example.config.toml ~/.sandbox.toml
 
 # Edit configuration for development
 # Set [log] level = "DEBUG" and [server] api_key
@@ -134,15 +135,15 @@ OpenSandbox/
 │   └── sandbox-lifecycle.yml # Lifecycle API spec
 ├── server/                   # Sandbox server (Python/FastAPI)
 ├── components/
-│   └── execd/                # Execution daemon (Go/Beego)
-├── sandboxes/                # Sandbox implementations
-│   └── code-interpreter/     # Code Interpreter sandbox
+│   └── execd/                # Execution daemon (Go/Gin)
 ├── examples/                 # Example integrations
 ├── docs/                     # Documentation
 ├── tests/                    # Cross-component tests
-│   └── e2e/                  # End-to-end tests
+│   └── python/               # Python end-to-end tests
 └── scripts/                  # Build and utility scripts
 ```
+
+To contribute to sandbox environment images (such as `code-interpreter`), see [opensandbox-group/sandbox-images](https://github.com/opensandbox-group/sandbox-images).
 
 ## Development Workflow
 
@@ -226,10 +227,7 @@ refactor(sdk): simplify filesystem API
 
 ## Coding Standards
 
-Contributions are required to generally comply with the coding standards for
-the language and component they touch. Generated files are excluded where the
-local tool configuration excludes them; update the source specification or
-generator and regenerate those files instead of hand-editing generated output.
+Contributions are required to generally comply with the coding standards for the language and component they touch. Generated files are excluded where the local tool configuration excludes them; update the source specification or generator and regenerate those files instead of hand-editing generated output.
 
 ### Required Style Guides
 
@@ -378,9 +376,7 @@ dotnet build OpenSandbox.CodeInterpreter.sln --configuration Release /warnaserro
 
 ## Build System Standards
 
-OpenSandbox produces native Go binaries for `components/execd`, `components/ingress`,
-`components/egress`, `kubernetes`, and `sdks/sandbox/go`. These build systems must
-preserve caller-provided build flags and only append project-required flags.
+OpenSandbox produces native Go binaries for `components/execd`, `components/ingress`, `components/egress`, `kubernetes`, and `sdks/sandbox/go`. These build systems must preserve caller-provided build flags and only append project-required flags.
 
 ### Build Variables
 
@@ -391,10 +387,7 @@ preserve caller-provided build flags and only append project-required flags.
 
 ### Debug Information
 
-Default project builds must not strip debug information. Do not add `strip`,
-`install -s`, or Go linker flags such as `-s -w` to the default build path.
-Distribution-specific packaging may strip binaries only outside the default
-developer and CI build path.
+Default project builds must not strip debug information. Do not add `strip`, `install -s`, or Go linker flags such as `-s -w` to the default build path. Distribution-specific packaging may strip binaries only outside the default developer and CI build path.
 
 ### Build Dependency Graph
 
@@ -405,19 +398,11 @@ Use package-aware build tools instead of recursive independent builds:
 - JavaScript and TypeScript SDKs use pnpm workspace dependencies.
 - C# SDKs use solution/project references through `dotnet build`.
 
-Subdirectory-specific Make targets may delegate to these tools, but they must not
-replace the build tool's dependency graph with independent recursive directory
-builds where cross-directory dependencies exist.
+Subdirectory-specific Make targets may delegate to these tools, but they must not replace the build tool's dependency graph with independent recursive directory builds where cross-directory dependencies exist.
 
 ### Repeatable Builds
 
-Native Go binary builds include `-trimpath`, `-buildvcs=false`, and `-ldflags`
-with `-buildid= -B none` so that source paths, VCS metadata, and build IDs or
-Mach-O UUIDs do not make binaries differ. For repeatable release metadata, set `SOURCE_DATE_EPOCH`
-or set `BUILD_TIME`, `VERSION`, and `GIT_COMMIT` explicitly before invoking
-Makefile or Docker build scripts. When `SOURCE_DATE_EPOCH` is set and
-`BUILD_TIME` is unset, build scripts derive `BUILD_TIME` from
-`SOURCE_DATE_EPOCH`.
+Native Go binary builds include `-trimpath`, `-buildvcs=false`, and `-ldflags` with `-buildid= -B none` so that source paths, VCS metadata, and build IDs or Mach-O UUIDs do not make binaries differ. For repeatable release metadata, set `SOURCE_DATE_EPOCH` or set `BUILD_TIME`, `VERSION`, and `GIT_COMMIT` explicitly before invoking Makefile or Docker build scripts. When `SOURCE_DATE_EPOCH` is set and `BUILD_TIME` is unset, build scripts derive `BUILD_TIME` from `SOURCE_DATE_EPOCH`.
 
 ## Testing Guidelines
 
@@ -493,12 +478,12 @@ go test -v -cover ./pkg/...
 Integration tests require Docker:
 
 ```bash
-# Server integration tests
+# Server tests (from the repository root)
 cd server
-uv run pytest tests/integration/
+uv run pytest tests/
 
-# E2E tests
-cd tests/e2e/python
+# Python E2E tests
+cd ../tests/python
 uv run pytest
 ```
 
@@ -556,9 +541,11 @@ When creating a PR, fill out the template:
 
 ### Pull Request Guidelines
 
+Source code changes exceeding **2000 lines cannot be reviewed**. PRs above this limit will not be reviewed; please split them before submitting. Plan your development pace accordingly: break large features into a series of small, focused PRs (for example, by module, layer, or feature increment) and land them incrementally instead of accumulating a long-running branch. Refactors should be separated from behavior changes whenever possible.
+
 **Do:**
 
-- Keep PRs focused and reasonably sized (< 500 lines if possible)
+- Keep PRs focused and reasonably sized (< 500 lines if possible; hard limit 2000 lines, see above)
 - Write clear PR descriptions with motivation and context
 - Link related issues
 - Respond to review comments promptly
@@ -580,6 +567,12 @@ When creating a PR, fill out the template:
 3. **Feedback Loop**: Address review comments
 4. **Approval**: Once approved, a maintainer will merge your PR
 5. **Cleanup**: Delete your feature branch after merge
+
+## Contributor Advancement
+
+OpenSandbox welcomes contributors seeking long-term involvement and project stewardship. The project maintains an explicit advancement process from Contributor to Maintainer (component ownership) and Project Maintainer (repository-wide stewardship).
+
+For details on nominations, eligibility, review periods, and approval thresholds, see [GOVERNANCE.md](GOVERNANCE.md#becoming-a-maintainer).
 
 ## Communication Channels
 
@@ -632,8 +625,7 @@ Use GitHub Discussions for:
 
 - **Issues**: Technical problems or bugs
 - **Discussions**: Questions and community support
-- **Security vulnerabilities**: Follow [SECURITY.md](SECURITY.md) and use
-  GitHub private vulnerability reporting. Do not open a public issue.
+- **Security vulnerabilities**: Follow [SECURITY.md](SECURITY.md) and use GitHub private vulnerability reporting. Do not open a public issue.
 - **Code of Conduct reports**: Email conduct@opensandbox.io
 
 ## Additional Resources
@@ -659,7 +651,7 @@ Browse [examples/](examples/) for real-world usage patterns:
 ### External Resources
 
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [Beego Documentation](https://beego.wiki/)
+- [Gin Documentation](https://gin-gonic.com/en/docs/)
 - [Jupyter Protocol](https://jupyter-client.readthedocs.io/en/stable/messaging.html)
 - [OpenAPI Specification](https://swagger.io/specification/)
 - [Docker API](https://docs.docker.com/engine/api/)

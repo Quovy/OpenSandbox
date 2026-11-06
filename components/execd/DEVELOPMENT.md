@@ -6,8 +6,7 @@
 
 - **Go 1.25+** — match `go.mod`
 - **Make** — build automation
-- **C compiler and static libc (Linux only)** — build the fail-closed
-  isolated-session workload gate
+- **C compiler and static libc (Linux only)** — build the fail-closed isolated-session workload gate
 - **Docker/Podman** — containerized testing (optional)
 - **Jupyter Server** — required for integration tests
 
@@ -19,9 +18,7 @@ go mod download
 make build        # → bin/execd (+ bin/opensandbox-session-gate on Linux)
 ```
 
-The published execd container already installs the isolated-session gate. For
-a Linux source build that will serve isolated-session APIs, install the gate
-at its fixed trusted runtime path before starting execd:
+The published execd container already installs the isolated-session gate. For a Linux source build that will serve isolated-session APIs, install the gate at its fixed trusted runtime path before starting execd:
 
 ```bash
 make build-session-gate
@@ -31,35 +28,44 @@ sudo make install-session-gate
 #   /opt/opensandbox/opensandbox-session-gate    (execd runtime)
 ```
 
-The build and install are deliberately separate so compilation never runs
-under `sudo`; the install target only copies the previously built helper.
-The `/opt/opensandbox` directory and gate must remain root-owned and must not
-be group- or world-writable. Plain execd APIs can run without the gate, but
-`/v1/isolated/capabilities` reports `available: false` and isolated-session
-creation fails closed when the gate is absent or untrusted.
+The build and install are deliberately separate so compilation never runs under `sudo`; the install target only copies the previously built helper. The `/opt/opensandbox` directory and gate must remain root-owned and must not be group- or world-writable. Plain execd APIs can run without the gate, but `/v1/isolated/capabilities` reports `available: false` and isolated-session creation fails closed when the gate is absent or untrusted.
 
 ## Project Structure
 
 ```
 execd/
-├── main.go                 # Entry point
+├── main.go                 # Entry point (startup order, HTTP server, shutdown)
 ├── Makefile                # Build automation
 ├── Dockerfile              # Container image
+├── bootstrap.sh            # Container entrypoint (binary selection, init mode)
+├── configs/                # Example isolation config TOMLs
+├── native/                 # C sources for Linux helpers (session gate, launcher)
 ├── pkg/
-│   ├── flag/               # CLI flag parsing
+│   ├── flag/               # CLI flag parsing (env first, flag overrides)
+│   ├── log/                # Structured logger wrapper + command/token sanitization
 │   ├── web/
 │   │   ├── router.go       # Gin route registration
+│   │   ├── proxy.go        # Port proxying to sandbox processes
 │   │   ├── controller/     # Request handlers
 │   │   └── model/          # API request/response models
 │   ├── runtime/            # Execution engine
 │   │   ├── ctrl.go         # Main controller
 │   │   ├── jupyter.go      # Jupyter kernel execution
 │   │   ├── command.go      # Shell command execution
-│   │   └── bash_session.go # Pipe-based bash sessions
+│   │   ├── bash_session.go # Pipe-based bash sessions
+│   │   ├── pty_session.go  # PTY sessions
+│   │   ├── isolated_*.go   # Isolated sessions (bwrap, idle GC, background runs)
+│   │   ├── initmode_*.go   # Init mode (PID 1 duties: reap, forward signals)
+│   │   └── hardening_*.go  # Pre-exec hardening floor (OSEP-0018)
 │   ├── jupyter/            # Jupyter HTTP/WebSocket client
+│   ├── isolation/          # bwrap isolator, capability probe, upper-dir GC
+│   ├── lifecycle/          # preStart and periodic hooks
+│   ├── sessionresource/    # Session namespace pin management
+│   ├── vfs/                # Virtual FS interface for file handlers
+│   ├── ebpf/               # eBPF observation layer (execd-ebpf variant)
 │   ├── telemetry/          # OTLP metrics
 │   ├── clone3compat/       # Linux clone3 seccomp workaround
-│   └── log/                # Structured logger wrapper
+│   └── util/               # path/glob helpers
 └── tests/                  # Integration test scripts
 ```
 
@@ -143,6 +149,4 @@ make build-session-gate
 sudo make install-session-gate  # Linux isolated-session runtime prerequisite
 ```
 
-`make multi-build` produces execd binaries for compile checks only. Use the
-multi-architecture Docker build for a complete Linux runtime containing the
-matching statically linked session gate.
+`make multi-build` produces execd binaries for compile checks only. Use the multi-architecture Docker build for a complete Linux runtime containing the matching statically linked session gate.

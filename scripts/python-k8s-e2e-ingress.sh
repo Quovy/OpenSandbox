@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
 # limitations under the License.
 
 # Kubernetes E2E (Python) with server ingress.mode=gateway and the chart-deployed
-# ingress-gateway (components/ingress). See kubernetes/charts/opensandbox-server/README.md.
+# ingress-gateway (components/ingress). See manifests/charts/server/README.md.
 #
 # Compared to scripts/python-k8s-e2e.sh:
-# - Builds/opensandbox/ingress image and sets server.gateway.* so Helm deploys opensandbox-ingress-gateway.
+# - Builds/opensandbox/ingress image, enables the server [ingress] announcement
+#   (server.gateway.*) and deploys the ingress-gateway chart (opensandbox-ingress-gateway).
 # - Port-forwards both the lifecycle API and the gateway.
 # - Sets OPENSANDBOX_TEST_USE_SERVER_PROXY=false so the SDK uses gateway routes + headers from the API.
 #
-# Route mode (Helm server.gateway.gatewayRouteMode + ingress --mode):
+# Route mode (Helm server.gateway.gatewayRouteMode + gateway.gatewayRouteMode + ingress --mode):
 #   Default header. For URI path routing: E2E_GATEWAY_ROUTE_MODE=uri ./scripts/python-k8s-e2e-ingress.sh
 
 set -euxo pipefail
@@ -51,7 +52,7 @@ SERVER_RELEASE="${SERVER_RELEASE:-opensandbox-server}"
 SERVER_VALUES_FILE="${SERVER_VALUES_FILE:-/tmp/opensandbox-server-values-ingress.yaml}"
 PORT_FORWARD_LOG="${PORT_FORWARD_LOG:-/tmp/opensandbox-server-port-forward.log}"
 GATEWAY_PORT_FORWARD_LOG="${GATEWAY_PORT_FORWARD_LOG:-/tmp/opensandbox-ingress-gateway-port-forward.log}"
-SANDBOX_TEST_IMAGE="${SANDBOX_TEST_IMAGE:-ubuntu:24.04}"
+SANDBOX_TEST_IMAGE="${SANDBOX_TEST_IMAGE:-ubuntu:latest}"
 
 GATEWAY_LOCAL_PORT="${GATEWAY_LOCAL_PORT:-8081}"
 INGRESS_GATEWAY_ADDRESS="${INGRESS_GATEWAY_ADDRESS:-127.0.0.1:${GATEWAY_LOCAL_PORT}}"
@@ -91,6 +92,7 @@ export OPENSANDBOX_E2E_RUNTIME="kubernetes"
 export OPENSANDBOX_TEST_USE_SERVER_PROXY="false"
 export OPENSANDBOX_TEST_SECURE_ACCESS_VERIFIABLE="true"
 export OPENSANDBOX_TEST_PVC_NAME="${PVC_NAME}"
+export OPENSANDBOX_E2E_NAMESPACE="${E2E_NAMESPACE}"
 
 k8s_e2e_export_sandbox_resource_env
 

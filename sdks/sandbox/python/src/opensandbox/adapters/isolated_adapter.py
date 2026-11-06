@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import logging
 
 import httpx
 
+from opensandbox._httpx import build_async_redirect_client_options
 from opensandbox.adapters.converter.event_node import EventNode
 from opensandbox.adapters.converter.exception_converter import ExceptionConverter
 from opensandbox.adapters.converter.execution_event_dispatcher import (
@@ -55,7 +56,7 @@ from opensandbox.services.isolated import (
     IsolationServiceMixin,
     IsolationSession,
 )
-from opensandbox.transport import unwrap_retry_transport
+from opensandbox.transport import streaming_transport
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,10 @@ def _decode_sse_event_data(data: str) -> EventNode | None:
 
 def _infer_exit_code(execution: Execution) -> int | None:
     if execution.error is not None:
+        # Prefer the authoritative error.exit_code; fall back to parsing evalue
+        # for servers that predate it.
+        if execution.error.exit_code is not None:
+            return execution.error.exit_code
         try:
             return int(execution.error.value)
         except (TypeError, ValueError):
@@ -94,6 +99,7 @@ def _infer_exit_code(execution: Execution) -> int | None:
 _ECHO_FIELDS = (
     "profile",
     "workspace",
+    "overlays",
     "extra_writable",
     "binds",
     "share_net",
@@ -237,17 +243,14 @@ class IsolatedSessionsAdapter(IsolationServiceMixin, IsolationService):
         timeout_seconds = self.connection_config.request_timeout.total_seconds()
         timeout = httpx.Timeout(timeout_seconds)
 
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **self.execd_endpoint.headers,
-        }
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
         self._httpx_client = httpx.AsyncClient(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
             transport=self.connection_config.transport,
+            **build_async_redirect_client_options(self.connection_config, base_url),
         )
 
         sse_headers = {
@@ -255,9 +258,8 @@ class IsolatedSessionsAdapter(IsolationServiceMixin, IsolationService):
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
-        # SSE bootstraps bypass the retry wrapper: request bodies are
-        # not replayable and a non-idempotent status opt-in would cause
-        # duplicate execution on a resent SSE POST.
+        # SSE bootstraps keep only the wake-timeout retry: a non-idempotent
+        # status opt-in would cause duplicate execution on a resent SSE POST.
         self._sse_client = httpx.AsyncClient(
             headers=sse_headers,
             timeout=httpx.Timeout(
@@ -266,7 +268,8 @@ class IsolatedSessionsAdapter(IsolationServiceMixin, IsolationService):
                 write=timeout_seconds,
                 pool=None,
             ),
-            transport=unwrap_retry_transport(self.connection_config.transport),
+            transport=streaming_transport(self.connection_config.transport),
+            **build_async_redirect_client_options(self.connection_config, base_url),
         )
 
     def _get_url(self, path: str) -> str:

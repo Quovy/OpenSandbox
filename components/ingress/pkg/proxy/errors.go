@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
 	"github.com/alibaba/opensandbox/ingress/pkg/sandbox"
 	"github.com/alibaba/opensandbox/ingress/pkg/signature"
 )
@@ -28,6 +29,9 @@ func ingressRouteErrHTTPStatus(err error) int {
 	}
 	if errors.Is(err, sandbox.ErrSandboxNotFound) {
 		return http.StatusNotFound
+	}
+	if errors.Is(err, routescope.ErrInvalidScope) || errors.Is(err, routescope.ErrUnauthorized) {
+		return http.StatusUnauthorized
 	}
 	return signature.HTTPStatusForIngressErr(err)
 }
@@ -42,6 +46,9 @@ func providerErrHTTPStatus(err error) int {
 
 	if errors.Is(err, sandbox.ErrSandboxNotReady) {
 		return http.StatusServiceUnavailable
+	}
+	if errors.Is(err, sandbox.ErrTargetUnsupported) {
+		return http.StatusNotImplemented
 	}
 
 	return http.StatusBadGateway

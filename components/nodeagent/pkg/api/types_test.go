@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,5 +50,14 @@ func TestPermanent(t *testing.T) {
 	}
 	if Permanent(nil) != nil {
 		t.Fatal("Permanent(nil) must remain nil")
+	}
+}
+
+func TestStreamMetadataEqualDistinguishesMissingEmptyValues(t *testing.T) {
+	if (StreamMetadata{"first": ""}).Equal(StreamMetadata{"second": ""}) {
+		t.Fatal("metadata with different empty-valued keys compared equal")
+	}
+	if !(StreamMetadata{"first": ""}).Equal(StreamMetadata{"first": ""}) {
+		t.Fatal("identical metadata did not compare equal")
 	}
 }

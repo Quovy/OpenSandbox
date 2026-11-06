@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,28 @@ func StartActiveSocketServer(
 	if activeHandler == nil {
 		return nil, nil, fmt.Errorf("active credential vault handler is required")
 	}
+	return startActiveSocketServer(func(w http.ResponseWriter, _ *http.Request) { activeHandler(w) }, socketPath, socketGID)
+}
+
+// StartActiveSocketServerRequestAware passes the request to active-vault
+// handlers. Sidecar handlers inspect conditional snapshot headers; fast-sandbox
+// handlers additionally dispatch clientIp (source IP -> subject -> snapshot).
+func StartActiveSocketServerRequestAware(
+	activeHandler func(http.ResponseWriter, *http.Request),
+	socketPath string,
+	socketGID int,
+) (*http.Server, func(context.Context) error, error) {
+	if activeHandler == nil {
+		return nil, nil, fmt.Errorf("active credential vault handler is required")
+	}
+	return startActiveSocketServer(activeHandler, socketPath, socketGID)
+}
+
+func startActiveSocketServer(
+	activeHandler func(http.ResponseWriter, *http.Request),
+	socketPath string,
+	socketGID int,
+) (*http.Server, func(context.Context) error, error) {
 	if socketPath == "" {
 		return nil, nil, fmt.Errorf("socket path is required")
 	}
@@ -82,7 +104,7 @@ func StartActiveSocketServer(
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		activeHandler(w)
+		activeHandler(w, r)
 	})
 
 	srv := &http.Server{Handler: mux}

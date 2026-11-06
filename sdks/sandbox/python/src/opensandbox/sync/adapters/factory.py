@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from opensandbox.sync.adapters.filesystem_adapter import FilesystemAdapterSync
 from opensandbox.sync.adapters.health_adapter import HealthAdapterSync
 from opensandbox.sync.adapters.isolated_adapter import IsolatedSessionsAdapterSync
 from opensandbox.sync.adapters.metrics_adapter import MetricsAdapterSync
+from opensandbox.sync.adapters.network_policy_adapter import NetworkPolicyAdapterSync
 from opensandbox.sync.adapters.sandboxes_adapter import SandboxesAdapterSync
 from opensandbox.sync.services import (
     CommandsSync,
@@ -57,6 +58,10 @@ class AdapterFactorySync:
 
     def create_egress_service(self, endpoint: SandboxEndpoint) -> EgressSync:
         return EgressAdapterSync(self.connection_config, endpoint)
+
+    def create_network_policy_service(self, sandbox_id: str) -> EgressSync:
+        """Create a lifecycle control-plane network policy service (fsb template sandboxes)."""
+        return NetworkPolicyAdapterSync(self.connection_config, sandbox_id)
 
     def create_health_service(self, endpoint: SandboxEndpoint) -> HealthSync:
         return HealthAdapterSync(self.connection_config, endpoint)

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,6 +40,8 @@ import type {
   WriteEntry,
 } from "../models/filesystem.js";
 import { SandboxApiException, SandboxError } from "../core/exceptions.js";
+import { iterateBodyStream } from "../core/streams.js";
+import { throwOnUploadFailure } from "./uploadFailure.js";
 
 function joinUrl(baseUrl: string, pathname: string): string {
   const base = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
@@ -74,12 +76,12 @@ async function collectBytes(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value) { chunks.push(value); total += value.length; }
+        if (value) { chunks.push(Uint8Array.from(value)); total += value.length; }
       }
     } finally { reader.releaseLock(); }
   } else {
     for await (const chunk of source) {
-      chunks.push(chunk);
+      chunks.push(Uint8Array.from(chunk));
       total += chunk.length;
     }
   }
@@ -110,11 +112,18 @@ export interface IsolatedFilesystemAdapterOptions {
   baseUrl: string;
   sessionId: string;
   fetch?: typeof fetch;
+  /**
+   * No-overall-timeout fetch used for uploads, whose request body is produced
+   * by the caller and may take longer than the connection's request timeout.
+   * See `ConnectionConfig.uploadFetch`. Falls back to `fetch`.
+   */
+  uploadFetch?: typeof fetch;
   headers?: Record<string, string>;
 }
 
 export class IsolatedFilesystemAdapter implements SandboxFiles {
   private readonly fetch: typeof fetch;
+  private readonly uploadFetch: typeof fetch;
   private readonly sessionId: string;
 
   private static readonly Api = {
@@ -131,6 +140,7 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
     private readonly opts: IsolatedFilesystemAdapterOptions,
   ) {
     this.fetch = opts.fetch ?? fetch;
+    this.uploadFetch = opts.uploadFetch ?? this.fetch;
     this.sessionId = opts.sessionId;
   }
 
@@ -337,23 +347,17 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
       form.append("file", fileBlob, fileName);
     }
 
-    const res = await this.fetch(url, {
+    const res = await this.uploadFetch(url, {
       method: "POST",
       headers: { ...(this.opts.headers ?? {}) },
       body: form,
+      // Uploads never follow redirects: the multipart body cannot always be
+      // replayed, and a redirect could otherwise replay credentials. A 3xx is
+      // surfaced below as a SandboxApiException with the original status.
+      redirect: "manual",
     });
 
-    if (!res.ok) {
-      const requestId = res.headers.get("x-request-id") ?? undefined;
-      const rawBody = await res.text().catch(() => undefined);
-      throw new SandboxApiException({
-        message: `Upload failed (status=${res.status})`,
-        statusCode: res.status,
-        requestId,
-        error: new SandboxError(SandboxError.UNEXPECTED_RESPONSE, "Upload failed"),
-        rawBody,
-      });
-    }
+    await throwOnUploadFailure(res);
   }
 
   async readBytes(
@@ -427,12 +431,7 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
     }
     const body = res.body as ReadableStream<Uint8Array> | null;
     if (!body) return;
-    const reader = body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      if (value) yield value;
-    }
+    yield* iterateBodyStream(body);
   }
 
   async readFile(

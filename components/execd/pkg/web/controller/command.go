@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,7 +29,6 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// RunCommand executes a shell command and streams the output via SSE.
 func (c *CodeInterpretingController) RunCommand() {
 	var request model.RunCommandRequest
 	if err := c.bindJSON(&request); err != nil {
@@ -78,9 +77,14 @@ func (c *CodeInterpretingController) RunCommand() {
 			close(completeCh)
 		})
 	}
-	origComplete := eventsHandler.OnExecuteComplete
 	eventsHandler.OnExecuteComplete = func(executionTime time.Duration) {
-		origComplete(executionTime)
+		var exitCode *int
+		if !request.Background {
+			// The foreground runtime invokes this hook only after a successful wait.
+			code := 0
+			exitCode = &code
+		}
+		c.writeExecutionComplete(executionTime, exitCode)
 		recordExecution("success")
 		signalComplete()
 	}
@@ -104,11 +108,7 @@ func (c *CodeInterpretingController) RunCommand() {
 	err = codeRunner.Execute(runCodeRequest)
 	if err != nil {
 		recordExecution("failure")
-		c.RespondError(
-			http.StatusInternalServerError,
-			model.ErrorCodeRuntimeError,
-			fmt.Sprintf("error running commands %v", err),
-		)
+		c.respondRunError(runCodeRequest.Hooks, completeCh, fmt.Sprintf("error running commands %v", err))
 		return
 	}
 
@@ -121,12 +121,10 @@ func (c *CodeInterpretingController) RunCommand() {
 	time.Sleep(flag.ApiGracefulShutdownTimeout)
 }
 
-// InterruptCommand stops a running shell command session.
 func (c *CodeInterpretingController) InterruptCommand() {
 	c.interrupt()
 }
 
-// GetCommandStatus returns command status by id.
 func (c *CodeInterpretingController) GetCommandStatus() {
 	commandID := c.ctx.Param("id")
 	if commandID == "" {
@@ -157,7 +155,6 @@ func (c *CodeInterpretingController) GetCommandStatus() {
 	c.RespondSuccess(resp)
 }
 
-// GetBackgroundCommandOutput returns accumulated stdout/stderr for a command session as plain text.
 func (c *CodeInterpretingController) GetBackgroundCommandOutput() {
 	id := c.ctx.Param("id")
 	if id == "" {
@@ -183,6 +180,7 @@ func (c *CodeInterpretingController) buildExecuteCommandRequest(request model.Ru
 		return &runtime.ExecuteCodeRequest{
 			Language: runtime.BackgroundCommand,
 			Code:     request.Command,
+			Argv:     request.Argv,
 			Cwd:      request.Cwd,
 			Timeout:  timeout,
 			Gid:      request.Gid,
@@ -193,6 +191,7 @@ func (c *CodeInterpretingController) buildExecuteCommandRequest(request model.Ru
 		return &runtime.ExecuteCodeRequest{
 			Language: runtime.Command,
 			Code:     request.Command,
+			Argv:     request.Argv,
 			Cwd:      request.Cwd,
 			Timeout:  timeout,
 			Gid:      request.Gid,

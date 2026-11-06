@@ -62,6 +62,8 @@ The sandbox transitions through both stable and intermediate states:
 
 The Lifecycle API exposes only the coarse-grained sandbox states above. For detailed snapshot progress, inspect the internal `SandboxSnapshot` resource:
 
+Pod termination can continue after the controller reports `Paused`. A resume request can be submitted during this interval; the controller waits for the old Pod to be removed before recreating its replacement. Pods with a deletion timestamp do not contribute new runtime failure conditions, including terminal exit statuses reported by Kubernetes during deletion. Failures already recorded on the sandbox remain terminal, and failures of replacement Pods are still reported normally.
+
 - `Pending`: snapshot request accepted, waiting to resolve source Pod / create commit Job
 - `Committing`: commit Job is running and pushing snapshot images
 - `Succeed`: snapshot is ready and can be used for the next resume
@@ -73,14 +75,23 @@ The Lifecycle API exposes only the coarse-grained sandbox states above. For deta
 |--|-----------|
 | Root filesystem contents | ✅ Yes — committed as OCI image |
 | Environment variables | ✅ Yes — from BatchSandbox template |
-| Running processes / memory | ❌ No — process state is not checkpointed |
+| Running processes / memory | Rootfs mode: no. Opt-in QEMU-in-runc mode: the QEMU process and Guest memory are restored; other outer processes restart. See [QEMU VMState Snapshots](/guides/qemu-vmstate-snapshots). |
 | Explicit volume mounts | Depends on volume type |
 | Credential Vault entries | No - stored only in egress sidecar memory; re-inject from a trusted control plane after resume |
 
 Pause/resume is currently single-replica only. The internal pause snapshot records one source Pod's container images and does not store per-replica state, so the Kubernetes controller rejects pause requests unless `BatchSandbox.spec.replicas=1`.
 
-See [Credential Vault](/guides/credential-vault#persistence-across-pause-and-resume)
-for the required post-resume credential re-injection procedure.
+See [Credential Vault](/guides/credential-vault#persistence-across-pause-and-resume) for the required post-resume credential re-injection procedure.
+
+### Durability and abnormal termination
+
+The root filesystem is durable only after the snapshot reaches `Succeed` and the OCI image has been pushed to the configured registry. A pause request being accepted, or a snapshot being in `Pending` or `Committing`, does not provide a durability guarantee.
+
+Changes made after the last successful snapshot remain in the container's writable layer. They are not automatically snapshotted when the process exits, the container is OOM-killed, the Pod enters `Failed`, the Pod is evicted, or the node becomes unavailable. The lifecycle API does not currently expose a post-failure snapshot or recovery operation, and a new container created by a Kubernetes restart does not inherit the old writable layer.
+
+The image-committer can sometimes read a stopped container directly from containerd while its metadata and writable snapshot still exist on the source node. This is a best-effort operator recovery path, not a supported durability contract: the normal snapshot API requires a `Running` sandbox, and containerd or kubelet garbage collection, Pod replacement, node loss, or a reused container identity can make the old layer unavailable or ambiguous.
+
+For data that must survive an unexpected termination, store it in a persistent volume or an external service and take explicit root filesystem snapshots for reproducible environment state. Files in mounted volumes follow the persistence and backup behavior of that volume; they are not included in the OCI rootfs snapshot.
 
 ---
 
@@ -102,8 +113,8 @@ SandboxSnapshot Controller
     │ creates commit Job on the same node
     ▼
 commit Job Pod (image-committer)
-    │ nerdctl: commit container rootfs → OCI image
-    │ nerdctl: push to registry
+    │ containerd API: commit container rootfs → OCI image
+    │ OCI registry resolver: push image
     ▼
 SandboxSnapshot.status.phase = Succeed
     │ BatchSandbox.status.phase = Paused
@@ -154,9 +165,11 @@ Configure the controller manager deployment with snapshot flags:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `--snapshot-registry` | string | `""` | **Required.** OCI registry prefix. Images are stored as `<registry>/<sandboxName>-<container>:snap-gen<N>`. |
+| `--snapshot-registry` | string | `""` | **Required.** OCI registry prefix. By default, images are stored as `<registry>/<sandboxName>-<container>:snap-gen<N>`. |
+| `--snapshot-image-uri-template` | string | `""` | Go named-field template for snapshot image URIs; empty uses the default naming rule below. |
 | `--snapshot-registry-insecure` | bool | `false` | Enables insecure registry mode for snapshot push operations. Use only for HTTP or self-signed local registries. |
 | `--snapshot-push-secret` | string | `""` | Kubernetes Secret name for pushing snapshots. Must be `kubernetes.io/dockerconfigjson` type. |
+| `--image-committer-pod-template-file` | string | `""` | Path to a PodTemplateSpec overlay for commit Job Pods. |
 | `--resume-pull-secret` | string | `""` | Kubernetes Secret name injected into resumed sandboxes for pulling snapshot images. Can be the same as push secret. |
 | `--image-committer-image` | string | `"image-committer:dev"` | Image used by commit Jobs. |
 | `--commit-job-timeout` | duration | `"10m"` | Timeout for commit Jobs. |
@@ -166,8 +179,10 @@ Configure the controller manager deployment with snapshot flags:
 The `opensandbox-controller` Helm chart now exposes the snapshot-related controller values directly:
 
 - `controller.snapshot.imageCommitterImage`
+- `controller.snapshot.imageCommitterPodTemplate`
 - `controller.snapshot.commitJobTimeout`
 - `controller.snapshot.registry`
+- `controller.snapshot.imageURITemplate`
 - `controller.snapshot.registryInsecure`
 - `controller.snapshot.snapshotPushSecret`
 - `controller.snapshot.resumePullSecret`
@@ -241,8 +256,7 @@ curl -X POST http://localhost:8080/v1/sandboxes/{sandbox_id}/pause \
 
 **Response:** `202 Accepted` with an empty body.
 
-The pause is asynchronous. The sandbox transitions through:
-`running` → `pausing` → `paused`
+The pause is asynchronous. The sandbox transitions through: `running` → `pausing` → `paused`
 
 ### Check pause status
 
@@ -261,8 +275,7 @@ curl -X POST http://localhost:8080/v1/sandboxes/{sandbox_id}/resume \
 
 **Response:** `202 Accepted` with an empty body.
 
-The sandbox transitions through:
-`paused` → `resuming` → `running`
+The sandbox transitions through: `paused` → `resuming` → `running`
 
 ### Multiple pause/resume cycles
 
@@ -295,16 +308,87 @@ For example, with `--snapshot-registry=registry.example.com/sandboxes`, sandbox 
 registry.example.com/sandboxes/my-sandbox-sandbox:snap-gen1
 ```
 
-Server-managed public snapshots use the same repository layout but a stable
-snapshot-id-derived tag:
+Server-managed public snapshots use the same repository layout but a stable snapshot-id-derived tag:
 ```
 <snapshot-registry>/<sandboxName>-<containerName>:snap-<snapshotIdHex>
 ```
 
-The controller distinguishes the two modes by owner reference. Pause/resume
-snapshots are created by the `BatchSandbox` controller and have a controller
-ownerReference to the owning `BatchSandbox`; public snapshots are created by the
-Lifecycle server and do not use that ownerReference.
+The controller distinguishes the two modes by owner reference. Pause/resume snapshots are created by the `BatchSandbox` controller and have a controller ownerReference to the owning `BatchSandbox`; public snapshots are created by the Lifecycle server and do not use that ownerReference.
+
+#### Custom image names
+
+Set `--snapshot-image-uri-template` on the controller manager, or `controller.snapshot.imageURITemplate` in the controller Helm chart, to replace the naming rule. An empty value uses this Go `text/template`:
+
+```text
+{{.Registry}}/{{.SandboxName}}-{{.ContainerName}}:{{.SnapshotTag}}
+```
+
+The template receives these named fields:
+
+| Field | Value |
+|-------|-------|
+| `Registry` | The required `--snapshot-registry` prefix, including any repository path |
+| `Namespace` | The snapshot's Kubernetes namespace |
+| `SandboxName` | The source BatchSandbox name |
+| `SnapshotName` | The SandboxSnapshot name |
+| `SnapshotUID` | The SandboxSnapshot UID |
+| `SnapshotCreationTime` | The SandboxSnapshot `metadata.creationTimestamp` as a Go `time.Time` in the controller process's local timezone |
+| `ContainerName` | The source container name, or `vmstate` for a QEMU VM-state artifact |
+| `SnapshotTag` | The existing `snap-gen<N>` or public snapshot tag described above |
+| `ArtifactKind` | `rootfs` for container images, or `vmstate` for a QEMU VM-state artifact |
+
+For example, use one repository with a distinct tag for each snapshot artifact:
+
+```yaml
+controller:
+  snapshot:
+    registry: registry.example.com/sandboxes
+    imageURITemplate: '{{.Registry}}/snapshots:{{.SnapshotUID}}-{{.ArtifactKind}}-{{.ContainerName}}'
+```
+
+To group images by the snapshot creation date in the controller's local timezone while retaining the sandbox, container, and snapshot tag:
+
+```yaml
+controller:
+  snapshot:
+    registry: registry.example.com/team
+    imageURITemplate: '{{.Registry}}/library/snapshots-{{date "2006-01-02" .SnapshotCreationTime}}:{{.SandboxName}}-{{.ContainerName}}-{{.SnapshotTag}}'
+```
+
+The date functions follow Helm's names and argument order and accept a Go `time.Time`, such as `SnapshotCreationTime`:
+
+```text
+{{date "2006-01-02" .SnapshotCreationTime}}
+{{dateInZone "2006-01-02" .SnapshotCreationTime "UTC"}}
+{{dateInZone "2006-01-02-15-04-05" .SnapshotCreationTime "+08:00"}}
+{{dateInZone "2006-01-02" .SnapshotCreationTime "America/New_York"}}
+```
+
+`date` uses Go's `time.Local`. `dateInZone` accepts `Local` or an empty timezone for the same default, `UTC` or `Z`, a signed `HH:MM` offset (hours 00–23, minutes 00–59), or an IANA `Area/Location` name. Fixed offsets such as `+05:30` do not change with daylight saving time; named zones follow the rules for the snapshot's creation instant. Unknown zones and malformed offsets fail template execution. These helpers reject a zero timestamp instead of substituting the current time.
+
+On Unix, the local timezone comes from `TZ`, or `/etc/localtime` when `TZ` is unset. In Kubernetes this is the controller container's timezone; set its `TZ` environment variable or provide its timezone files to select the intended local zone. The controller embeds timezone data for named zones when the OS has none.
+
+Formatting uses Go's standard layouts: `2006-01-02` for a date, `20060102-150405` for a compact timestamp, and `2006-01-02-15-04-05.000` for milliseconds. Java-style `yyyy-MM-dd` patterns are not supported. Layouts must produce a valid image reference in their template position: spaces, colons, or uppercase month names are unsuitable in a repository name and fail validation.
+
+Native methods remain available: `.SnapshotCreationTime.Format "2006-01-02"` uses the local timezone, while `.SnapshotCreationTime.UTC.Format "2006-01-02"` selects UTC explicitly. Templates written for the earlier UTC-only field should select UTC explicitly to preserve their date when the controller's local zone is not UTC.
+
+The source is always the snapshot creation timestamp, so retries after midnight keep the same date with the same timezone configuration. Existing commit Jobs retain their resolved targets when the template or timezone setting changes.
+
+For the umbrella chart, nest these values under `opensandbox-controller`. Helm passes the template literally; it does not evaluate the Go template fields. For Kustomize or a direct Deployment, add an argument to the manager container:
+
+```yaml
+- '--snapshot-image-uri-template={{.Registry}}/snapshots:{{.SnapshotUID}}-{{.ArtifactKind}}-{{.ContainerName}}'
+```
+
+The controller renders the URI before creating the commit Job. The image committer pushes directly to that URI, and restore uses the recorded reference; there is no intermediate push or rename. QEMU rootfs and VM-state artifacts use the same template and original snapshot tag.
+
+Templates must produce valid tagged OCI image references without a digest. Custom template results are normalized to fully qualified references before they are recorded and passed to the image committer: `snapshots:tag` becomes `docker.io/library/snapshots:tag`, and `team/snapshots:tag` becomes `docker.io/team/snapshots:tag`. Include an explicit registry host (a hostname containing a dot, a host with a port, or `localhost`) to target another registry. An empty template keeps the original naming rule and registry prefix unchanged. Names are not automatically sanitized or truncated. Include fields that keep artifacts and snapshots distinct; the controller rejects duplicate targets within a snapshot, but cannot detect collisions with other snapshots. Template syntax errors prevent controller startup; rendering errors, invalid references, and duplicate targets fail the snapshot before a commit Job is created. Changes apply when creating new commit Jobs; existing Jobs keep their resolved targets, and completed snapshots retain their recorded restore references.
+
+### Runtime compatibility
+
+The built-in `rootfs-v1` image committer requires a container runtime that exposes compatible containerd task pause/resume and writable-snapshot APIs. gVisor RuntimeClasses whose handler is `runsc` do not currently satisfy that contract. The Lifecycle server rejects public snapshot creation for those workloads before it persists a snapshot record or creates a `SandboxSnapshot` resource, leaving the running sandbox untouched.
+
+Native gVisor checkpoint/restore requires a dedicated snapshot backend and is not provided by the `rootfs-v1` committer.
 
 ### Commit Job
 
@@ -318,7 +402,11 @@ The controller creates a short-lived Kubernetes `Job` for each pause:
 
 The commit Job mounts the host containerd socket from the source node and runs as UID 0. This gives the `image-committer` image node-level container runtime access. Use only a trusted image, preferably pinned by digest or controlled by an admission policy.
 
-Before pausing containers, `image-committer` attempts to run `sync` inside every running container included in the snapshot. This flushes guest filesystem caches for VM-isolated runtimes such as Kata Containers, where a host-side sync cannot flush the guest kernel. Guest sync is best effort: if it fails, the commit Job logs a warning and continues, so recent guest filesystem writes may be absent from the resulting snapshot. Containers that were already stopped cannot be targeted by `nerdctl exec` and continue through the stopped-container commit path. The Job mounts both the containerd socket and the host `/run/containerd/fifo` directory; the FIFO mount lets the host-side containerd shim access the I/O streams created by `nerdctl exec`.
+The built-in image committer uses containerd APIs directly for container lookup, task pause/unpause, writable-snapshot image creation, and registry push. Before committing, it verifies that the node's content store contains every base-image blob for the node platform and fetches missing blobs from the original image digest; this avoids snapshot failures after CRI discards compressed content during image unpack. Source registries use HTTPS by default. For a trusted source registry that requires skipped TLS verification or plain HTTP, inject `SOURCE_IMAGE_REGISTRY_INSECURE=true` into the `commit` container through the image-committer Pod template. The reusable Go contracts and default implementations are exposed in [`pkg/imagecommitter`](https://github.com/opensandbox-group/OpenSandbox/tree/main/kubernetes/pkg/imagecommitter); provider-specific binaries can supply a credential provider and reuse the standard CLI contract. The Job also retains the host `/run/containerd/fifo` mount so compatible implementations can use containerd task exec. Any preparation command used by the built-in implementation is best effort and does not change the commit interface.
+
+The operator-controlled Pod template can add labels, annotations, a ServiceAccount, scheduling settings, init containers, sidecars, and settings on the required `commit` container such as resources, `env`, and `envFrom`. The template is the merge base, and controller-generated invariants override conflicting template values. The controller reserves the source `nodeName`, restart policy, committer image, image pull policy, command, arguments, security context, termination-message settings, and required environment variables, mounts, and volumes. Environment variables, mounts, and volumes are merged by name, with required controller values winning conflicts. Additional regular sidecars must terminate for the Job to complete.
+
+Any ServiceAccount or admission configuration referenced by the template must exist in every sandbox namespace. Unpause Jobs do not receive the commit Pod template because they do not access the registry.
 
 If the commit Job fails, the controller creates a best-effort `<snapshotName>-unpause` Job on the same node to unpause any source containers that may have been left paused by an abrupt committer exit.
 
@@ -393,7 +481,7 @@ curl http://localhost:8080/v1/sandboxes/{sandbox_id}
 | `conditions` | list | `Ready` / `Failed` conditions with reason and message |
 | `sourcePodName` | string | Pod name used for commit |
 | `sourceNodeName` | string | Node where commit Job runs |
-| `containers` | list | `{containerName, imageUri, imageDigest}` per container |
+| `containers` | list | `{containerName, imageUri, imageDigest}` per container. `imageDigest` is the image config digest, preserving the image ID semantics of earlier image-committer versions. |
 | `observedGeneration` | int | Last processed spec generation |
 
 ---
@@ -511,5 +599,8 @@ kubectl logs -n opensandbox-system deployment/opensandbox-controller-manager
 
 - **Documentation**: [OpenSandbox GitHub](https://github.com/opensandbox-group/OpenSandbox)
 - **Issues**: [GitHub Issues](https://github.com/opensandbox-group/OpenSandbox/issues)
-- **Design Document**: [OSEP-0008](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0008-pause-resume-rootfs-snapshot.md)
-- **Kubernetes controller**: [Kubernetes Overview](/kubernetes/)
+- **Kubernetes controller**: [Kubernetes Overview](/architecture/control-plane/operator)
+
+## Measure resume latency
+
+See [Kubernetes Resume Benchmark](/guides/kubernetes-resume-benchmark) for an opt-in rootfs benchmark with raw samples, P50/P95, failure reporting, and explicit cache conditions.

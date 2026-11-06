@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,19 @@
 
 package opensandbox
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // GetEgressPolicy retrieves the current egress network policy.
+//
+// Template-backed sandboxes have no sandbox-side egress sidecar: the policy
+// is read from the lifecycle control plane instead.
 func (s *Sandbox) GetEgressPolicy(ctx context.Context) (*PolicyStatusResponse, error) {
+	if s.templateBacked() {
+		return s.lifecycle.GetNetworkPolicy(ctx, s.id)
+	}
 	if err := s.resolveEgress(ctx); err != nil {
 		return nil, err
 	}
@@ -25,7 +34,13 @@ func (s *Sandbox) GetEgressPolicy(ctx context.Context) (*PolicyStatusResponse, e
 }
 
 // PatchEgressRules merges network rules into the current egress policy.
+//
+// Template-backed sandboxes have no sandbox-side egress sidecar: the rules
+// are merged through the lifecycle control plane instead.
 func (s *Sandbox) PatchEgressRules(ctx context.Context, rules []NetworkRule) (*PolicyStatusResponse, error) {
+	if s.templateBacked() {
+		return s.lifecycle.PatchNetworkPolicy(ctx, s.id, rules)
+	}
 	if err := s.resolveEgress(ctx); err != nil {
 		return nil, err
 	}
@@ -34,16 +49,30 @@ func (s *Sandbox) PatchEgressRules(ctx context.Context, rules []NetworkRule) (*P
 
 // DeleteEgressRules removes egress rules matching the given targets from the
 // current egress policy. Targets not present in the policy are silently ignored.
+//
+// Template-backed sandboxes have no sandbox-side egress sidecar: the rules
+// are removed through the lifecycle control plane instead.
 func (s *Sandbox) DeleteEgressRules(ctx context.Context, targets []string) (*PolicyStatusResponse, error) {
+	if s.templateBacked() {
+		return s.lifecycle.DeleteNetworkPolicyRules(ctx, s.id, targets)
+	}
 	if err := s.resolveEgress(ctx); err != nil {
 		return nil, err
 	}
 	return s.egress.DeletePolicy(ctx, targets)
 }
 
-// CredentialVault returns the sandbox-scoped egress client used for Credential
-// Vault operations.
+// CredentialVault returns the sandbox-scoped egress client used for direct
+// sidecar Credential Vault operations.
+//
+// Template-backed sandboxes have no sandbox-side egress sidecar, so this
+// method fails for them: use the sandbox-level Credential Vault methods
+// (CreateCredentialVault and friends), which route through the lifecycle
+// control plane instead.
 func (s *Sandbox) CredentialVault(ctx context.Context) (*EgressClient, error) {
+	if s.templateBacked() {
+		return nil, fmt.Errorf("opensandbox: the sidecar credential vault client is not available for template-backed sandboxes: use the server-routed Credential Vault methods instead")
+	}
 	if err := s.resolveEgress(ctx); err != nil {
 		return nil, err
 	}
@@ -52,6 +81,9 @@ func (s *Sandbox) CredentialVault(ctx context.Context) (*EgressClient, error) {
 
 // CreateCredentialVault creates the initial sandbox-local Credential Vault.
 func (s *Sandbox) CreateCredentialVault(ctx context.Context, req CredentialVaultCreateRequest) (*CredentialVaultState, error) {
+	if s.templateBacked() {
+		return s.lifecycle.CreateCredentialVault(ctx, s.id, req)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -61,6 +93,9 @@ func (s *Sandbox) CreateCredentialVault(ctx context.Context, req CredentialVault
 
 // GetCredentialVault returns sanitized Credential Vault state.
 func (s *Sandbox) GetCredentialVault(ctx context.Context) (*CredentialVaultState, error) {
+	if s.templateBacked() {
+		return s.lifecycle.GetCredentialVault(ctx, s.id)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -71,6 +106,9 @@ func (s *Sandbox) GetCredentialVault(ctx context.Context) (*CredentialVaultState
 // PatchCredentialVault atomically mutates sandbox-local credentials and
 // bindings.
 func (s *Sandbox) PatchCredentialVault(ctx context.Context, req CredentialVaultPatchRequest) (*CredentialVaultState, error) {
+	if s.templateBacked() {
+		return s.lifecycle.PatchCredentialVault(ctx, s.id, req)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -80,6 +118,9 @@ func (s *Sandbox) PatchCredentialVault(ctx context.Context, req CredentialVaultP
 
 // DeleteCredentialVault deletes the sandbox-local Credential Vault.
 func (s *Sandbox) DeleteCredentialVault(ctx context.Context) error {
+	if s.templateBacked() {
+		return s.lifecycle.DeleteCredentialVault(ctx, s.id)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return err
@@ -89,6 +130,9 @@ func (s *Sandbox) DeleteCredentialVault(ctx context.Context) error {
 
 // ListCredentialVaultCredentials returns sanitized credential metadata.
 func (s *Sandbox) ListCredentialVaultCredentials(ctx context.Context) (*CredentialListResponse, error) {
+	if s.templateBacked() {
+		return s.lifecycle.ListCredentialVaultCredentials(ctx, s.id)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -98,6 +142,9 @@ func (s *Sandbox) ListCredentialVaultCredentials(ctx context.Context) (*Credenti
 
 // GetCredentialVaultCredential returns sanitized metadata for one credential.
 func (s *Sandbox) GetCredentialVaultCredential(ctx context.Context, name string) (*CredentialMetadata, error) {
+	if s.templateBacked() {
+		return s.lifecycle.GetCredentialVaultCredential(ctx, s.id, name)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -107,6 +154,9 @@ func (s *Sandbox) GetCredentialVaultCredential(ctx context.Context, name string)
 
 // ListCredentialVaultBindings returns sanitized binding metadata.
 func (s *Sandbox) ListCredentialVaultBindings(ctx context.Context) (*CredentialBindingListResponse, error) {
+	if s.templateBacked() {
+		return s.lifecycle.ListCredentialVaultBindings(ctx, s.id)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err
@@ -116,6 +166,9 @@ func (s *Sandbox) ListCredentialVaultBindings(ctx context.Context) (*CredentialB
 
 // GetCredentialVaultBinding returns sanitized metadata for one binding.
 func (s *Sandbox) GetCredentialVaultBinding(ctx context.Context, name string) (*CredentialBindingMetadata, error) {
+	if s.templateBacked() {
+		return s.lifecycle.GetCredentialVaultBinding(ctx, s.id, name)
+	}
 	client, err := s.CredentialVault(ctx)
 	if err != nil {
 		return nil, err

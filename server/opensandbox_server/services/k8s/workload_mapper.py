@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,17 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Optional
 
-from opensandbox_server.api.schema import ImageSpec, PlatformSpec, Sandbox, SandboxStatus
+from opensandbox_server.api.schema import (
+    AllocationSummary,
+    ImageSpec,
+    PlatformSpec,
+    Sandbox,
+    SandboxStatus,
+)
 from opensandbox_server.extensions import extract_extensions_from_mapping
 from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SANDBOX_SNAPSHOT_ID_LABEL
 
@@ -43,6 +51,7 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
     snapshot_id = labels.get(SANDBOX_SNAPSHOT_ID_LABEL)
     expires_at = workload_provider.get_expiration(workload)
     status_info = workload_provider.get_status(workload)
+    workload_status = workload.get("status", {}) if isinstance(workload, dict) else workload.status
 
     user_metadata = {
         k: v for k, v in labels.items() if not _is_opensandbox_label(k)
@@ -67,6 +76,7 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
     if not snapshot_id:
         image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
     platform_spec = _extract_platform_from_workload(workload)
+    allocation = _extract_confirmed_pool_allocation(metadata, spec, workload_status)
     return Sandbox(
         id=sandbox_id,
         status=SandboxStatus(
@@ -83,7 +93,118 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         snapshotId=snapshot_id,
         entrypoint=entrypoint,
         platform=platform_spec,
+        allocation=allocation,
     )
+
+
+_POD_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$")
+_ALLOCATION_RELEASE_ANNOTATION_KEYS = (
+    "sandbox.opensandbox.io/alloc-release",
+    "sandbox.opensandbox.io/alloc-released",
+)
+
+
+def _extract_confirmed_pool_allocation(
+    metadata: Any,
+    spec: Any,
+    status: Any,
+) -> Optional[AllocationSummary]:
+    """Return a summary only when current pool allocation evidence is complete."""
+    pool_ref = _field(spec, "poolRef", "pool_ref")
+    if not isinstance(pool_ref, str) or not pool_ref.strip() or pool_ref == "*":
+        return None
+
+    if _field(metadata, "deletionTimestamp", "deletion_timestamp"):
+        return None
+    finalizers = _field(metadata, "finalizers")
+    if (
+        not isinstance(finalizers, list)
+        or "pool.sandbox.opensandbox.io/pool-allocation" not in finalizers
+    ):
+        return None
+
+    annotations = _field(metadata, "annotations")
+    if not isinstance(annotations, dict):
+        return None
+    raw_allocation = annotations.get("sandbox.opensandbox.io/alloc-status")
+    if not isinstance(raw_allocation, str):
+        return None
+    try:
+        annotation = json.loads(raw_allocation)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(annotation, dict) or annotation.get("poolRef") != pool_ref:
+        return None
+
+    pods = annotation.get("pods")
+    if (
+        not isinstance(pods, list)
+        or not pods
+        or any(not isinstance(pod, str) or not _POD_NAME_PATTERN.fullmatch(pod) for pod in pods)
+        or len(set(pods)) != len(pods)
+    ):
+        return None
+    allocated = _field(status, "allocated")
+    if (
+        not isinstance(allocated, int)
+        or isinstance(allocated, bool)
+        or allocated != len(pods)
+    ):
+        return None
+    if _has_released_or_releasing_allocation_pods(annotations, pods):
+        return None
+
+    return AllocationSummary(poolRef=pool_ref)
+
+
+def _has_released_or_releasing_allocation_pods(
+    annotations: dict[Any, Any],
+    allocation_pods: list[str],
+) -> bool:
+    """Return whether release state is malformed or includes allocated pods."""
+    allocation_pod_names = set(allocation_pods)
+    for key in _ALLOCATION_RELEASE_ANNOTATION_KEYS:
+        if key not in annotations:
+            continue
+
+        raw_release = annotations[key]
+        if not isinstance(raw_release, str):
+            return True
+        try:
+            release = json.loads(raw_release)
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(release, dict):
+            return True
+
+        released_pods = release.get("pods")
+        if (
+            not isinstance(released_pods, list)
+            or any(
+                not isinstance(pod, str)
+                or not _POD_NAME_PATTERN.fullmatch(pod)
+                for pod in released_pods
+            )
+            or len(set(released_pods)) != len(released_pods)
+        ):
+            return True
+        if allocation_pod_names.intersection(released_pods):
+            return True
+
+    return False
+
+
+def _field(value: Any, *names: str) -> Any:
+    if isinstance(value, dict):
+        for name in names:
+            if name in value:
+                return value[name]
+        return None
+    for name in names:
+        field = getattr(value, name, None)
+        if field is not None:
+            return field
+    return None
 
 
 def _extract_platform_from_workload(workload: Any) -> Optional[PlatformSpec]:
@@ -214,3 +335,46 @@ def _extract_platform_value_from_affinity(
         elif inferred != term_value:
             return None
     return inferred
+
+
+def allocated_pod_names(workload: Any) -> list[str]:
+    """Pods currently allocated to a pooled BatchSandbox.
+
+    Pool pods come from the Pool's template, so they don't carry the sandbox
+    ID label; the alloc-status annotation is the only link from the sandbox to
+    them. Pods being released or already released go back to the pool and may
+    belong to another sandbox, so they are left out, as the operator does.
+    """
+    if not isinstance(workload, dict):
+        return []
+    annotations = (workload.get("metadata") or {}).get("annotations") or {}
+    allocated = _annotation_pod_names(annotations, "sandbox.opensandbox.io/alloc-status")
+    if allocated is None:
+        return []
+    released: set[str] = set()
+    for key in _ALLOCATION_RELEASE_ANNOTATION_KEYS:
+        pods = _annotation_pod_names(annotations, key)
+        if pods is None:
+            # Without a readable release list we can't tell which pods are
+            # still ours, so report none rather than risk another sandbox's.
+            return []
+        released.update(pods)
+    return [name for name in allocated if name not in released]
+
+
+def _annotation_pod_names(annotations: Any, key: str) -> Optional[list[str]]:
+    """Pod names from an allocation annotation: [] if absent, None if malformed."""
+    raw = annotations.get(key) if isinstance(annotations, dict) else None
+    if raw is None or raw == "":
+        # The operator treats an empty annotation as absent too.
+        return []
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    pod_names = value.get("pods", []) if isinstance(value, dict) else None
+    if not isinstance(pod_names, list):
+        return None
+    return [name for name in pod_names if isinstance(name, str) and name]

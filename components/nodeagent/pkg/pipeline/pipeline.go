@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package pipeline merges one Source's event stream into per-stream workers,
+// batches records, and drives Sink writes, acknowledgements, and finalization
+// to a durable commit point in the state DB.
 package pipeline
 
 import (
@@ -32,13 +35,19 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// finalizeStore is the Pipeline's view of the durable state DB. It is
+// satisfied by *state.DB.
 type finalizeStore interface {
+	BindStreamKind(api.StreamRef) error
 	GetFinalizeIntent(streamRef string, revision uint64) (state.FinalizeIntent, bool, error)
 	PutFinalizeIntent(state.FinalizeIntent) error
 	ListFinalizeIntents() ([]state.FinalizeIntent, error)
 	GetSourceStream(streamRef string) (state.SourceStream, bool, error)
 }
 
+// Config bounds batching, retry, and memory behavior. DropPolicy is "block"
+// (apply backpressure to the Source) or "drop" (acknowledge records as
+// intentional drops).
 type Config struct {
 	BatchMaxItems        int
 	FlushInterval        time.Duration
@@ -51,8 +60,12 @@ type Config struct {
 	DropPolicy           string
 }
 
+// perStreamQueueSize keeps worker input channels effectively unbuffered so
+// the global admission budget in admit is the single backpressure point.
 const perStreamQueueSize = 1
 
+// Pipeline connects one Source to one Sink. Run consumes events until an
+// unrecoverable error or ctx cancellation; Close drains and releases workers.
 type Pipeline struct {
 	cfg      Config
 	source   api.Source
@@ -81,6 +94,7 @@ type Pipeline struct {
 	sandboxBytes  map[string]int64
 	budgetChanged chan struct{}
 	limiters      map[string]*rate.Limiter
+	limiterUsers  map[string]int
 	metrics       pipelineMetrics
 }
 
@@ -95,6 +109,8 @@ type pipelineMetrics struct {
 
 type worker struct {
 	streamRef   api.StreamRef
+	resource    api.Resource
+	metadata    api.StreamMetadata
 	input       chan admittedEvent
 	done        chan struct{}
 	predecessor <-chan struct{}
@@ -115,6 +131,9 @@ type pending struct {
 	sandboxID string
 }
 
+// retryOperation describes one retryable Pipeline step. timeout of zero means
+// the step inherits the caller's deadline. scope, when set, shares one retry
+// notification across a consume+acknowledge pair.
 type retryOperation struct {
 	call             func(context.Context) error
 	timeout          time.Duration
@@ -123,6 +142,8 @@ type retryOperation struct {
 	scope            *retryScope
 }
 
+// retryScope reports "a retry is active" to OnRetryStateChange exactly once
+// for the lifetime of the scope, no matter how many individual retries occur.
 type retryScope struct {
 	end func()
 }
@@ -140,6 +161,8 @@ func (s *retryScope) close() {
 	}
 }
 
+// New validates cfg, checks Source/Sink compatibility, and returns a stopped
+// Pipeline.
 func New(cfg Config, source api.Source, sink api.Sink, store finalizeStore, targetID string, log logger.Logger, onError func(error)) (*Pipeline, error) {
 	if cfg.BatchMaxItems <= 0 || cfg.FlushInterval <= 0 || cfg.SinkTimeout <= 0 || cfg.RetryMaxInterval <= 0 || cfg.MemoryBudgetBytes <= 0 || cfg.PerSandboxQueueBytes <= 0 {
 		return nil, errors.New("pipeline limits and durations must be positive")
@@ -159,11 +182,14 @@ func New(cfg Config, source api.Source, sink api.Sink, store finalizeStore, targ
 		cancelWorkers()
 		return nil, err
 	}
-	return &Pipeline{cfg: cfg, source: source, sink: sink, state: store, targetID: targetID, log: log.Named("pipeline"), onError: onError, workers: make(map[string]*worker), handoffs: make(map[string]<-chan struct{}), workerCtx: workerCtx, cancelWorkers: cancelWorkers, workerErrors: make(chan error, 1), sandboxBytes: make(map[string]int64), budgetChanged: make(chan struct{}, 1), limiters: make(map[string]*rate.Limiter), metrics: metrics}, nil
+	return &Pipeline{cfg: cfg, source: source, sink: sink, state: store, targetID: targetID, log: log.Named("pipeline"), onError: onError, workers: make(map[string]*worker), handoffs: make(map[string]<-chan struct{}), workerCtx: workerCtx, cancelWorkers: cancelWorkers, workerErrors: make(chan error, 1), sandboxBytes: make(map[string]int64), budgetChanged: make(chan struct{}, 1), limiters: make(map[string]*rate.Limiter), limiterUsers: make(map[string]int), metrics: metrics}, nil
 }
 
+// Run first replays interrupted finalizations from the state DB, then routes
+// each event to its stream worker until ctx is canceled, the channel closes,
+// or a worker fails. It returns the first unrecoverable error.
 func (p *Pipeline) Run(ctx context.Context, events <-chan api.SourceEvent) error {
-	if err := p.reconcileFinalizeIntents(); err != nil {
+	if err := p.reconcileFinalizeIntents(ctx); err != nil {
 		return err
 	}
 	for {
@@ -186,11 +212,12 @@ func (p *Pipeline) Run(ctx context.Context, events <-chan api.SourceEvent) error
 				}
 				return errors.New("source event channel closed unexpectedly")
 			}
-			if !event.Valid() {
-				return errors.New("invalid source event")
+			event = cloneSourceEventMetadata(event)
+			if err := validateSourceEvent(event); err != nil {
+				return err
 			}
 			streamRef := eventStream(event)
-			worker, err := p.getWorker(streamRef)
+			worker, err := p.getWorker(streamRef, eventResource(event), eventMetadata(event))
 			if err != nil {
 				return err
 			}
@@ -232,7 +259,7 @@ func (p *Pipeline) sendEvent(ctx context.Context, worker *worker, event api.Sour
 	return nil
 }
 
-func (p *Pipeline) reconcileFinalizeIntents() error {
+func (p *Pipeline) reconcileFinalizeIntents(ctx context.Context) error {
 	intents, err := p.state.ListFinalizeIntents()
 	if err != nil {
 		return err
@@ -241,31 +268,66 @@ func (p *Pipeline) reconcileFinalizeIntents() error {
 		if intent.TargetID != p.targetID || intent.FinalizeID != identity.FinalizeID(intent.StreamRef, intent.Revision, p.targetID) {
 			return fmt.Errorf("finalize intent identity mismatch for stream %s revision %d", intent.StreamRef, intent.Revision)
 		}
+	}
+	for _, intent := range intents {
 		if intent.SourceDone && !intent.SinkDone {
 			return fmt.Errorf("finalize intent for stream %s revision %d completed Source before Sink", intent.StreamRef, intent.Revision)
 		}
 		if intent.SourceDone {
 			continue
 		}
-		stream, found, err := p.state.GetSourceStream(intent.StreamRef)
-		if err != nil {
-			return err
-		}
-		if !found || stream.AcknowledgedRevision < intent.Revision {
+		if intent.StreamKind == "" {
+			stream, found, err := p.state.GetSourceStream(intent.StreamRef)
+			if err != nil {
+				return err
+			}
+			if !found || stream.AcknowledgedRevision < intent.Revision {
+				continue
+			}
+			if !intent.SinkDone {
+				return fmt.Errorf("source revision %d is acknowledged without a durable Sink completion", intent.Revision)
+			}
+			intent.SourceDone = true
+			if err := p.state.PutFinalizeIntent(intent); err != nil {
+				return err
+			}
 			continue
 		}
-		if !intent.SinkDone {
-			return fmt.Errorf("source revision %d is acknowledged without a durable Sink completion", intent.Revision)
-		}
-		intent.SourceDone = true
-		if err := p.state.PutFinalizeIntent(intent); err != nil {
+
+		if _, err := p.completeFinalize(ctx, intent); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (p *Pipeline) getWorker(streamRef api.StreamRef) (*worker, error) {
+// completeFinalize drives one finalize intent to its terminal state: it
+// finalizes the Sink, then acknowledges the Source end, persisting each
+// transition so a crash between steps resumes at the next step instead of
+// repeating completed work.
+func (p *Pipeline) completeFinalize(ctx context.Context, intent state.FinalizeIntent) (state.FinalizeIntent, error) {
+	if !intent.SinkDone {
+		if err := p.finalizeSinkWithRetry(ctx, finalizeRequest(intent)); err != nil {
+			return intent, err
+		}
+		intent.SinkDone = true
+		if err := p.state.PutFinalizeIntent(intent); err != nil {
+			return intent, err
+		}
+	}
+	if !intent.SourceDone {
+		if err := p.acknowledgeEndWithRetry(ctx, intent.EndToken.Clone()); err != nil {
+			return intent, err
+		}
+		intent.SourceDone = true
+		if err := p.state.PutFinalizeIntent(intent); err != nil {
+			return intent, err
+		}
+	}
+	return intent, nil
+}
+
+func (p *Pipeline) getWorker(streamRef api.StreamRef, resource api.Resource, metadata api.StreamMetadata) (*worker, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -273,15 +335,29 @@ func (p *Pipeline) getWorker(streamRef api.StreamRef) (*worker, error) {
 	}
 	p.activeSends.Add(1)
 	if existing := p.workers[streamRef.ID]; existing != nil {
+		if existing.streamRef != streamRef {
+			p.activeSends.Done()
+			return nil, errors.New("stream kind changed for an active stream")
+		}
+		if existing.resource != resource || !existing.metadata.Equal(metadata) {
+			p.activeSends.Done()
+			return nil, errors.New("stream identity or metadata changed")
+		}
 		return existing, nil
+	}
+	if err := p.state.BindStreamKind(streamRef); err != nil {
+		p.activeSends.Done()
+		return nil, err
 	}
 	predecessor := p.handoffs[streamRef.ID]
 	delete(p.handoffs, streamRef.ID)
-	w := &worker{streamRef: streamRef, input: make(chan admittedEvent, perStreamQueueSize), done: make(chan struct{}), predecessor: predecessor}
+	w := &worker{streamRef: streamRef, resource: resource, metadata: metadata.Clone(), input: make(chan admittedEvent, perStreamQueueSize), done: make(chan struct{}), predecessor: predecessor}
 	p.workers[streamRef.ID] = w
+	p.retainLimiter(resource.SandboxID)
 	p.wg.Add(1)
 	safego.Go(func() {
 		defer p.wg.Done()
+		defer p.releaseLimiter(resource.SandboxID)
 		defer func() {
 			close(w.done)
 			p.clearHandoff(w)
@@ -297,6 +373,9 @@ func (p *Pipeline) getWorker(streamRef api.StreamRef) (*worker, error) {
 	return w, nil
 }
 
+// runWorker consumes one stream's admitted events in order. It flushes on
+// the flush timer, on a full batch, and on channel close; a stream End event
+// flushes the residue and finalizes the revision before the worker exits.
 func (p *Pipeline) runWorker(ctx context.Context, worker *worker) error {
 	var items []pending
 	defer func() {
@@ -328,7 +407,7 @@ func (p *Pipeline) runWorker(ctx context.Context, worker *worker) error {
 		if len(items) == 0 {
 			return nil
 		}
-		if err := p.consumeWithRetry(ctx, worker.streamRef, items); err != nil {
+		if err := p.consumeWithRetry(ctx, worker.streamRef, worker.metadata, items); err != nil {
 			return err
 		}
 		for _, item := range items {
@@ -378,7 +457,7 @@ func (p *Pipeline) runWorker(ctx context.Context, worker *worker) error {
 	}
 }
 
-func (p *Pipeline) consumeWithRetry(ctx context.Context, streamRef api.StreamRef, pendingItems []pending) error {
+func (p *Pipeline) consumeWithRetry(ctx context.Context, streamRef api.StreamRef, metadata api.StreamMetadata, pendingItems []pending) error {
 	scope := &retryScope{}
 	defer scope.close()
 	batch := api.Batch{StreamRef: streamRef, Items: make([]api.BatchItem, len(pendingItems))}
@@ -388,6 +467,7 @@ func (p *Pipeline) consumeWithRetry(ctx context.Context, streamRef api.StreamRef
 	err := p.retry(ctx, retryOperation{
 		call: func(callCtx context.Context) error {
 			started := time.Now()
+			batch.Metadata = metadata.Clone()
 			err := p.sink.Consume(callCtx, batch)
 			p.metrics.consumeMillis.Record(context.Background(), float64(time.Since(started).Microseconds())/1000)
 			return err
@@ -421,6 +501,7 @@ func (p *Pipeline) finalize(ctx context.Context, worker *worker, end *api.Stream
 		return errors.New("stream end has an invalid coverage boundary")
 	}
 	finalizeID := identity.FinalizeID(end.StreamRef.ID, end.Revision, p.targetID)
+	outcome := worker.mergeDropOutcome(end.Outcome)
 	intent, found, err := p.state.GetFinalizeIntent(end.StreamRef.ID, end.Revision)
 	if err != nil {
 		return err
@@ -430,37 +511,80 @@ func (p *Pipeline) finalize(ctx context.Context, worker *worker, end *api.Stream
 		if finalizedAt.Before(end.CoverageStartedAt) {
 			finalizedAt = end.CoverageStartedAt
 		}
-		intent = state.FinalizeIntent{FinalizeID: finalizeID, TargetID: p.targetID, StreamRef: end.StreamRef.ID, Revision: end.Revision, CoverageStartedAt: end.CoverageStartedAt, FinalizedAt: finalizedAt}
+		intent = newFinalizeIntent(finalizeID, p.targetID, finalizedAt, end, outcome)
 		if err := p.state.PutFinalizeIntent(intent); err != nil {
 			return err
 		}
-	} else if intent.FinalizeID != finalizeID || intent.TargetID != p.targetID || !intent.CoverageStartedAt.Equal(end.CoverageStartedAt) {
-		return errors.New("finalize intent identity mismatch")
-	}
-	outcome := worker.mergeDropOutcome(end.Outcome)
-	request := api.FinalizeRequest{FinalizeID: intent.FinalizeID, TargetID: intent.TargetID, StreamRef: end.StreamRef, Revision: end.Revision, CoverageStartedAt: intent.CoverageStartedAt, Resource: end.Resource, Outcome: outcome, FinalizedAt: intent.FinalizedAt}
-	if !intent.SinkDone {
-		if err := p.finalizeSinkWithRetry(ctx, request); err != nil {
-			return err
+	} else {
+		if intent.FinalizeID != finalizeID || intent.TargetID != p.targetID || !intent.CoverageStartedAt.Equal(end.CoverageStartedAt) {
+			return errors.New("finalize intent identity mismatch")
 		}
-		intent.SinkDone = true
-		if err := p.state.PutFinalizeIntent(intent); err != nil {
-			return err
-		}
-	}
-	if !intent.SourceDone {
-		if err := p.acknowledgeEndWithRetry(ctx, end.EndToken); err != nil {
-			return err
-		}
-		intent.SourceDone = true
-		if err := p.state.PutFinalizeIntent(intent); err != nil {
-			return err
+		if intent.StreamKind == "" {
+			intent = enrichLegacyFinalizeIntent(intent, end, outcome)
+			if err := p.state.PutFinalizeIntent(intent); err != nil {
+				return err
+			}
+		} else if !finalizeIntentMatchesEvent(intent, end, outcome) {
+			return errors.New("stream end does not match persisted finalize intent")
 		}
 	}
-	p.budgetMu.Lock()
-	delete(p.limiters, end.Resource.SandboxID)
-	p.budgetMu.Unlock()
+	if _, err := p.completeFinalize(ctx, intent); err != nil {
+		return err
+	}
 	return nil
+}
+
+func newFinalizeIntent(finalizeID, targetID string, finalizedAt time.Time, end *api.StreamEnd, outcome api.SourceOutcome) state.FinalizeIntent {
+	resource := end.Resource
+	frozenOutcome := outcome.Clone()
+	endToken := end.EndToken.Clone()
+	return state.FinalizeIntent{
+		FinalizeID:        finalizeID,
+		TargetID:          targetID,
+		StreamRef:         end.StreamRef.ID,
+		StreamKind:        end.StreamRef.Kind,
+		Revision:          end.Revision,
+		CoverageStartedAt: end.CoverageStartedAt,
+		FinalizedAt:       finalizedAt,
+		Resource:          &resource,
+		Metadata:          end.Metadata.Clone(),
+		Outcome:           &frozenOutcome,
+		EndToken:          &endToken,
+	}
+}
+
+func enrichLegacyFinalizeIntent(intent state.FinalizeIntent, end *api.StreamEnd, outcome api.SourceOutcome) state.FinalizeIntent {
+	replay := newFinalizeIntent(intent.FinalizeID, intent.TargetID, intent.FinalizedAt, end, outcome)
+	intent.StreamKind = replay.StreamKind
+	intent.Resource = replay.Resource
+	intent.Metadata = replay.Metadata
+	intent.Outcome = replay.Outcome
+	intent.EndToken = replay.EndToken
+	return intent
+}
+
+func finalizeIntentMatchesEvent(intent state.FinalizeIntent, end *api.StreamEnd, outcome api.SourceOutcome) bool {
+	return intent.StreamRef == end.StreamRef.ID &&
+		intent.StreamKind == end.StreamRef.Kind &&
+		intent.Revision == end.Revision &&
+		intent.Resource != nil && *intent.Resource == end.Resource &&
+		intent.Metadata.Equal(end.Metadata) &&
+		intent.Outcome != nil && intent.Outcome.Equal(outcome) &&
+		intent.EndToken != nil && intent.EndToken.Equal(end.EndToken)
+}
+
+func finalizeRequest(intent state.FinalizeIntent) api.FinalizeRequest {
+	return api.FinalizeRequest{
+		FinalizeID:        intent.FinalizeID,
+		TargetID:          intent.TargetID,
+		StreamRef:         api.StreamRef{ID: intent.StreamRef, Kind: intent.StreamKind},
+		Revision:          intent.Revision,
+		CoverageStartedAt: intent.CoverageStartedAt,
+		Resource:          *intent.Resource,
+		Metadata:          intent.Metadata.Clone(),
+		Outcome:           intent.Outcome.Clone(),
+		FinalizedAt:       intent.FinalizedAt,
+	}
 }
 
 func (p *Pipeline) acknowledgeEndWithRetry(ctx context.Context, token api.EndToken) error {
@@ -521,6 +645,10 @@ func (p *Pipeline) beginRetry() func() {
 	return func() { p.changeRetryCount(-1) }
 }
 
+// changeRetryCount moves the active-retry counter and forwards the transition
+// to OnRetryStateChange. retryNotifying serializes the callback outside the
+// lock so concurrent scope changes coalesce into one callback per transition
+// (drainRetryStateChanges re-reads state under the lock until it is stable).
 func (p *Pipeline) changeRetryCount(delta int) {
 	p.retryMu.Lock()
 	p.activeRetries += delta
@@ -556,6 +684,9 @@ func (p *Pipeline) drainRetryStateChanges() {
 	}
 }
 
+// retireWorker drops the End-carrying worker from the active map and records
+// a handoff so the next revision of the same stream ID waits for this worker
+// to finish flushing before its own records are consumed.
 func (p *Pipeline) retireWorker(worker *worker) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -577,6 +708,10 @@ func (p *Pipeline) clearHandoff(worker *worker) {
 	}
 }
 
+// Close marks the Pipeline closed, waits for in-flight admissions, closes
+// worker inputs, drains buffered events, and closes the Sink. If ctx expires
+// first, workers are canceled and their queued events are released; the
+// returned error joins the deadline and Sink close errors.
 func (p *Pipeline) Close(ctx context.Context) error {
 	p.mu.Lock()
 	shouldClose := false
@@ -638,6 +773,10 @@ func (p *Pipeline) fail(err error) {
 	}
 }
 
+// admit charges the event against the global and per-sandbox byte budgets
+// and applies the per-sandbox rate limit. Under the "drop" policy, rejected
+// events are acknowledged as intentional drops; under "block", admission
+// waits for budget release.
 func (p *Pipeline) admit(ctx context.Context, worker *worker, event api.SourceEvent) (*admittedEvent, error) {
 	if event.End != nil {
 		return &admittedEvent{event: event}, nil
@@ -691,7 +830,7 @@ func (p *Pipeline) drop(ctx context.Context, worker *worker, delivery *api.Deliv
 	}
 	worker.outcomeMu.Lock()
 	worker.dropOutcome.HadDrops = true
-	worker.dropOutcome.LossReasons = addReason(worker.dropOutcome.LossReasons, reason)
+	worker.dropOutcome.LossReasons = api.AddLossReason(worker.dropOutcome.LossReasons, reason)
 	worker.outcomeMu.Unlock()
 	p.metrics.drops.Add(context.Background(), 1)
 	return nil
@@ -709,6 +848,31 @@ func (p *Pipeline) limiter(sandboxID string) *rate.Limiter {
 	return limiter
 }
 
+func (p *Pipeline) retainLimiter(sandboxID string) {
+	if p.cfg.PerSandboxRateLimit <= 0 {
+		return
+	}
+	p.budgetMu.Lock()
+	p.limiterUsers[sandboxID]++
+	p.budgetMu.Unlock()
+}
+
+func (p *Pipeline) releaseLimiter(sandboxID string) {
+	if p.cfg.PerSandboxRateLimit <= 0 {
+		return
+	}
+	p.budgetMu.Lock()
+	if p.limiterUsers[sandboxID] <= 1 {
+		delete(p.limiterUsers, sandboxID)
+		delete(p.limiters, sandboxID)
+	} else {
+		p.limiterUsers[sandboxID]--
+	}
+	p.budgetMu.Unlock()
+}
+
+// release returns admitted bytes to the budgets and wakes a blocked
+// admission.
 func (p *Pipeline) release(bytes int64, sandboxID string) {
 	if bytes == 0 {
 		return
@@ -734,7 +898,7 @@ func (w *worker) mergeDropOutcome(outcome api.SourceOutcome) api.SourceOutcome {
 	if drops.HadDrops {
 		outcome.HadDrops = true
 		for _, reason := range drops.LossReasons {
-			outcome.LossReasons = addReason(outcome.LossReasons, reason)
+			outcome.LossReasons = api.AddLossReason(outcome.LossReasons, reason)
 		}
 	}
 	return outcome
@@ -745,16 +909,10 @@ func eventBytes(delivery *api.Delivery) int64 {
 	for key, value := range delivery.Record.Attributes {
 		size += int64(len(key) + len(value))
 	}
-	return size
-}
-
-func addReason(reasons []string, reason string) []string {
-	for _, existing := range reasons {
-		if existing == reason {
-			return reasons
-		}
+	for key, value := range delivery.Metadata {
+		size += int64(len(key) + len(value))
 	}
-	return append(reasons, reason)
+	return size
 }
 
 func newPipelineMetrics() (pipelineMetrics, error) {
@@ -778,13 +936,84 @@ func eventStream(event api.SourceEvent) api.StreamRef {
 	return event.End.StreamRef
 }
 
+func eventResource(event api.SourceEvent) api.Resource {
+	if event.Delivery != nil {
+		return event.Delivery.Record.Resource
+	}
+	return event.End.Resource
+}
+
+func eventMetadata(event api.SourceEvent) api.StreamMetadata {
+	if event.Delivery != nil {
+		return event.Delivery.Metadata
+	}
+	return event.End.Metadata
+}
+
+func cloneSourceEventMetadata(event api.SourceEvent) api.SourceEvent {
+	if event.Delivery != nil {
+		delivery := *event.Delivery
+		delivery.Metadata = delivery.Metadata.Clone()
+		event.Delivery = &delivery
+	}
+	if event.End != nil {
+		end := *event.End
+		end.Metadata = end.Metadata.Clone()
+		event.End = &end
+	}
+	return event
+}
+
 func compatible(source, sink api.Capabilities) bool {
-	for _, sourceKind := range source.RecordKinds {
-		for _, sinkKind := range sink.RecordKinds {
-			if sourceKind == sinkKind {
-				return true
-			}
+	if len(source.RecordKinds) == 0 || len(sink.RecordKinds) == 0 {
+		return false
+	}
+	accepted := make(map[api.RecordKind]struct{}, len(sink.RecordKinds))
+	for _, kind := range sink.RecordKinds {
+		if kind != "" {
+			accepted[kind] = struct{}{}
 		}
 	}
-	return false
+	for _, sourceKind := range source.RecordKinds {
+		if sourceKind == "" {
+			return false
+		}
+		if _, ok := accepted[sourceKind]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSourceEvent(event api.SourceEvent) error {
+	if !event.Valid() {
+		return errors.New("invalid source event")
+	}
+	if event.Delivery != nil {
+		delivery := event.Delivery
+		if delivery.StreamRef.ID == "" || delivery.StreamRef.Kind == "" {
+			return errors.New("delivery has an invalid stream reference")
+		}
+		if delivery.Record.Kind != delivery.StreamRef.Kind {
+			return fmt.Errorf("record kind %q does not match stream kind %q", delivery.Record.Kind, delivery.StreamRef.Kind)
+		}
+		if delivery.AckToken.StreamRef != delivery.StreamRef {
+			return errors.New("ack token stream reference does not match delivery")
+		}
+		if err := delivery.Metadata.Validate(); err != nil {
+			return fmt.Errorf("delivery has invalid stream metadata: %w", err)
+		}
+		return nil
+	}
+	end := event.End
+	if end.StreamRef.ID == "" || end.StreamRef.Kind == "" {
+		return errors.New("stream end has an invalid stream reference")
+	}
+	if end.EndToken.StreamRef != end.StreamRef {
+		return errors.New("end token stream reference does not match stream end")
+	}
+	if err := end.Metadata.Validate(); err != nil {
+		return fmt.Errorf("stream end has invalid metadata: %w", err)
+	}
+	return nil
 }

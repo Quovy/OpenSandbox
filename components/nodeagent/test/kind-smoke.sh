@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ cluster_created=1
 DOCKER_BUILDKIT=1 docker build -f "${repo_root}/components/nodeagent/Dockerfile" -t "${image}" "${repo_root}"
 kind load docker-image --name "${cluster_name}" "${image}"
 
-helm install nodeagent "${repo_root}/kubernetes/charts/opensandbox-node-agent" \
+helm install nodeagent "${repo_root}/manifests/charts/node-agent" \
   --namespace opensandbox-system \
   --create-namespace \
   --set-string image.repository="${image%:*}" \

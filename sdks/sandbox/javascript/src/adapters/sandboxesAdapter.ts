@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,16 @@ import type { LifecycleClient } from "../openapi/lifecycleClient.js";
 import { throwOnOpenApiFetchError } from "./openapiError.js";
 import type { paths as LifecyclePaths } from "../api/lifecycle.js";
 import { EndpointCache } from "../core/endpointCache.js";
+import { OPEN_SANDBOX_ORIGIN_HEADER } from "../core/constants.js";
 import type {
   Sandboxes,
 } from "../services/sandboxes.js";
 import type {
   CreateSnapshotRequest,
+  CreateSandboxFromTemplateRequest,
   CreateSandboxRequest,
   CreateSandboxResponse,
+  AllocationSummary,
   Endpoint,
   ListSnapshotsParams,
   ListSnapshotsResponse,
@@ -35,6 +38,12 @@ import type {
   SandboxInfo,
   SandboxMetadataPatch,
 } from "../models/sandboxes.js";
+import type {
+  CreateTemplateRequest,
+  ListTemplatesParams,
+  ListTemplatesResponse,
+  TemplateInfo,
+} from "../models/templates.js";
 
 type ApiCreateSandboxRequest =
   LifecyclePaths["/sandboxes"]["post"]["requestBody"]["content"]["application/json"];
@@ -64,13 +73,25 @@ type ApiListSnapshotsOk =
   LifecyclePaths["/snapshots"]["get"]["responses"][200]["content"]["application/json"];
 type ApiEndpointOk =
   LifecyclePaths["/sandboxes/{sandboxId}/endpoints/{port}"]["get"]["responses"][200]["content"]["application/json"];
+type ApiCreateTemplateRequest =
+  LifecyclePaths["/templates"]["post"]["requestBody"]["content"]["application/json"];
+type ApiTemplateOk =
+  LifecyclePaths["/templates/{templateId}"]["get"]["responses"][200]["content"]["application/json"];
+type ApiListTemplatesOk =
+  LifecyclePaths["/templates"]["get"]["responses"][200]["content"]["application/json"];
+
+type ApiSandboxWithAllocation = ApiGetSandboxOk & {
+  allocation?: AllocationSummary;
+};
 
 function encodeMetadataFilter(metadata: Record<string, string>): string {
   // The Lifecycle API expects a single `metadata` query parameter whose value is `k=v&k2=v2`.
-  // The query serializer will URL-encode the value (e.g. `=` -> %3D and `&` -> %26).
+  // Percent-encode keys and values before joining: the query serializer encodes the
+  // joined value once more and the server decodes its layer before splitting with
+  // `parse_qsl`, so this round-trips keys and values containing `&`, `=` or `%`.
   const parts: string[] = [];
   for (const [k, v] of Object.entries(metadata)) {
-    parts.push(`${k}=${v}`);
+    parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
   }
   return parts.join("&");
 }
@@ -122,21 +143,16 @@ export class SandboxesAdapter implements Sandboxes {
   }
 
   private mapSandboxInfo(raw: ApiGetSandboxOk): SandboxInfo {
+    const { allocation, ...sandbox } = raw as ApiSandboxWithAllocation;
     return {
-      ...(raw ?? {}),
+      ...sandbox,
+      ...(allocation == null ? {} : { allocation }),
       createdAt: this.parseIsoDate("createdAt", raw?.createdAt),
       expiresAt: this.parseOptionalIsoDate("expiresAt", raw?.expiresAt),
     } as SandboxInfo;
   }
 
-  async createSandbox(req: CreateSandboxRequest): Promise<CreateSandboxResponse> {
-    // Make the OpenAPI contract explicit so backend schema changes surface quickly.
-    const body: ApiCreateSandboxRequest = req as unknown as ApiCreateSandboxRequest;
-    const { data, error, response } = await this.client.POST("/sandboxes", {
-      body,
-    });
-    throwOnOpenApiFetchError({ error, response }, "Create sandbox failed");
-    const raw = data as ApiCreateSandboxOk | undefined;
+  private mapCreateSandboxResponse(raw: ApiCreateSandboxOk | undefined): CreateSandboxResponse {
     if (!raw || typeof raw !== "object") {
       throw new Error("Create sandbox failed: unexpected response shape");
     }
@@ -145,6 +161,76 @@ export class SandboxesAdapter implements Sandboxes {
       createdAt: this.parseIsoDate("createdAt", raw?.createdAt),
       expiresAt: this.parseOptionalIsoDate("expiresAt", raw?.expiresAt),
     } as CreateSandboxResponse;
+  }
+
+  private mapTemplateInfo(raw: ApiTemplateOk | undefined): TemplateInfo {
+    if (!raw || typeof raw !== "object") {
+      throw new Error("Template operation failed: unexpected response shape");
+    }
+    return {
+      ...(raw ?? {}),
+      createdAt: this.parseIsoDate("createdAt", raw?.createdAt),
+      updatedAt: this.parseIsoDate("updatedAt", raw?.updatedAt),
+    } as TemplateInfo;
+  }
+
+  async createSandbox(
+    req: CreateSandboxRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateSandboxResponse> {
+    // Make the OpenAPI contract explicit so backend schema changes surface quickly.
+    const normalizedRequest = { ...req };
+    const lifecycle = normalizedRequest.lifecycle;
+    if (lifecycle) {
+      const normalizedLifecycle = { ...lifecycle };
+      if (Array.isArray(normalizedLifecycle.periodic) && normalizedLifecycle.periodic.length === 0) {
+        delete normalizedLifecycle.periodic;
+      }
+      for (const [key, value] of Object.entries(normalizedLifecycle)) {
+        if (value === null || value === undefined) delete normalizedLifecycle[key];
+      }
+      const hasConfiguredHook = Object.keys(normalizedLifecycle).length > 0;
+      if (hasConfiguredHook) {
+        normalizedRequest.lifecycle = normalizedLifecycle;
+      } else {
+        delete normalizedRequest.lifecycle;
+      }
+    } else {
+      delete normalizedRequest.lifecycle;
+    }
+    const body: ApiCreateSandboxRequest = normalizedRequest as unknown as ApiCreateSandboxRequest;
+    const { data, error, response } = await this.client.POST("/sandboxes", {
+      body,
+      signal,
+    });
+    throwOnOpenApiFetchError({ error, response }, "Create sandbox failed");
+    return this.mapCreateSandboxResponse(data as ApiCreateSandboxOk | undefined);
+  }
+
+  async createSandboxFromTemplate(
+    req: CreateSandboxFromTemplateRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateSandboxResponse> {
+    // Template mode fixes the workload shape server-side; only the template id,
+    // timeout, metadata, networkPolicy, extensions and the idle policy are
+    // forwarded. The idle policy is control-plane state (OSEP-0024), so it
+    // rides the lifecycle object while hooks stay template-owned.
+    const body: ApiCreateSandboxRequest = {
+      templateId: req.templateId,
+      timeout: req.timeout,
+      metadata: req.metadata,
+      networkPolicy: req.networkPolicy,
+      extensions: req.extensions,
+      ...(req.idlePolicy == null
+        ? {}
+        : { lifecycle: { idlePolicy: req.idlePolicy } }),
+    } as unknown as ApiCreateSandboxRequest;
+    const { data, error, response } = await this.client.POST("/sandboxes", {
+      body,
+      signal,
+    });
+    throwOnOpenApiFetchError({ error, response }, "Create sandbox from template failed");
+    return this.mapCreateSandboxResponse(data as ApiCreateSandboxOk | undefined);
   }
 
   async getSandbox(sandboxId: SandboxId): Promise<SandboxInfo> {
@@ -201,9 +287,10 @@ export class SandboxesAdapter implements Sandboxes {
     return this.mapSandboxInfo(ok);
   }
 
-  async deleteSandbox(sandboxId: SandboxId): Promise<void> {
+  async deleteSandbox(sandboxId: SandboxId, signal?: AbortSignal): Promise<void> {
     const { error, response } = await this.client.DELETE("/sandboxes/{sandboxId}", {
       params: { path: { sandboxId } },
+      signal,
     });
     throwOnOpenApiFetchError({ error, response }, "Delete sandbox failed");
   }
@@ -302,33 +389,111 @@ export class SandboxesAdapter implements Sandboxes {
     throwOnOpenApiFetchError({ error, response }, "Delete snapshot failed");
   }
 
+  async createTemplate(req: CreateTemplateRequest): Promise<TemplateInfo> {
+    const body: ApiCreateTemplateRequest = req as unknown as ApiCreateTemplateRequest;
+    const { data, error, response } = await this.client.POST("/templates", {
+      body,
+    });
+    throwOnOpenApiFetchError({ error, response }, "Create template failed");
+    return this.mapTemplateInfo(data as ApiTemplateOk | undefined);
+  }
+
+  async getTemplate(templateId: string): Promise<TemplateInfo> {
+    const { data, error, response } = await this.client.GET("/templates/{templateId}", {
+      params: { path: { templateId } },
+    });
+    throwOnOpenApiFetchError({ error, response }, "Get template failed");
+    return this.mapTemplateInfo(data as ApiTemplateOk | undefined);
+  }
+
+  async listTemplates(params: ListTemplatesParams = {}): Promise<ListTemplatesResponse> {
+    const query: Record<string, string | number | undefined> = {};
+    if (params.metadata && Object.keys(params.metadata).length) {
+      query.metadata = encodeMetadataFilter(params.metadata);
+    }
+    if (params.page != null) query.page = params.page;
+    if (params.pageSize != null) query.pageSize = params.pageSize;
+
+    const { data, error, response } = await this.client.GET("/templates", {
+      params: { query },
+    });
+    throwOnOpenApiFetchError({ error, response }, "List templates failed");
+    const raw = data as ApiListTemplatesOk | undefined;
+    if (!raw || typeof raw !== "object") {
+      throw new Error("List templates failed: unexpected response shape");
+    }
+    const itemsRaw = raw.items;
+    if (!Array.isArray(itemsRaw)) throw new Error("List templates failed: unexpected items shape");
+    return {
+      ...(raw ?? {}),
+      items: itemsRaw.map((x) => this.mapTemplateInfo(x)),
+    } as ListTemplatesResponse;
+  }
+
+  async deleteTemplate(templateId: string): Promise<void> {
+    const { error, response } = await this.client.DELETE("/templates/{templateId}", {
+      params: { path: { templateId } },
+    });
+    throwOnOpenApiFetchError({ error, response }, "Delete template failed");
+  }
+
   async getSandboxEndpoint(
     sandboxId: SandboxId,
     port: number,
-    useServerProxy = false
+    useServerProxy = false,
+    signal?: AbortSignal,
   ): Promise<Endpoint> {
-    if (this.endpointCache) {
-      return this.endpointCache.getOrFetch(sandboxId, port, useServerProxy, () =>
-        this.fetchSandboxEndpoint(sandboxId, port, useServerProxy)
-      );
+    signal?.throwIfAborted();
+    const cached = this.endpointCache?.get(sandboxId, port, useServerProxy);
+    if (cached) return cached;
+    if (!this.endpointCache) {
+      return this.fetchSandboxEndpoint(sandboxId, port, useServerProxy, signal);
     }
-    return this.fetchSandboxEndpoint(sandboxId, port, useServerProxy);
+    // Signal-less dedup fetch: no single caller's signal may abort the
+    // shared request; signal callers race it locally instead.
+    const shared = this.endpointCache.getOrFetch(sandboxId, port, useServerProxy, () =>
+      this.fetchSandboxEndpoint(sandboxId, port, useServerProxy)
+    );
+    if (!signal) return shared;
+    return this.raceSignal(shared, signal);
+  }
+
+  private async raceSignal(
+    promise: Promise<Endpoint>,
+    signal: AbortSignal,
+  ): Promise<Endpoint> {
+    if (signal.aborted) throw signal.reason ?? new Error("Aborted");
+    let onAbort: (() => void) | undefined;
+    const abortPromise = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error("Aborted"));
+      signal.addEventListener("abort", onAbort, { once: true } as any);
+    });
+    try {
+      return await Promise.race([promise, abortPromise]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort as any);
+    }
   }
 
   private async fetchSandboxEndpoint(
     sandboxId: SandboxId,
     port: number,
-    useServerProxy: boolean
+    useServerProxy: boolean,
+    signal?: AbortSignal,
   ): Promise<Endpoint> {
     const { data, error, response } = await this.client.GET("/sandboxes/{sandboxId}/endpoints/{port}", {
       params: { path: { sandboxId, port }, query: { use_server_proxy: useServerProxy } },
+      signal,
     });
     throwOnOpenApiFetchError({ error, response }, "Get sandbox endpoint failed");
     const ok = data as ApiEndpointOk | undefined;
     if (!ok || typeof ok !== "object") {
       throw new Error("Get sandbox endpoint failed: unexpected response shape");
     }
-    return ok as unknown as Endpoint;
+    return {
+      ...(ok as unknown as Endpoint),
+      origin: response.headers.get(OPEN_SANDBOX_ORIGIN_HEADER) ?? undefined,
+    };
   }
 
   invalidateEndpointCache(sandboxId: SandboxId): void {
@@ -348,6 +513,9 @@ export class SandboxesAdapter implements Sandboxes {
     if (!ok || typeof ok !== "object") {
       throw new Error("Get signed endpoint failed: unexpected response shape");
     }
-    return ok as unknown as Endpoint;
+    return {
+      ...(ok as unknown as Endpoint),
+      origin: response.headers.get(OPEN_SANDBOX_ORIGIN_HEADER) ?? undefined,
+    };
   }
 }

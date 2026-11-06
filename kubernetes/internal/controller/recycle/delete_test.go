@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,9 +41,9 @@ func TestDeleteRecycler(t *testing.T) {
 			wantNeedDelete: false,
 		},
 		{
-			name:           "PodWithDeletionTimestamp_Succeeded",
+			name:           "PodWithDeletionTimestamp_Recycling",
 			pod:            &corev1.Pod{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &now}},
-			wantState:      StateSucceeded,
+			wantState:      StateRecycling,
 			wantNeedDelete: false,
 		},
 		{
@@ -55,7 +55,7 @@ func TestDeleteRecycler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := NewDeleteRecycler()
+			d := newDeleteRecycler()
 			status, err := d.TryRecycle(context.Background(), &sandboxv1alpha1.Pool{}, tt.pod, &Spec{ID: "sbx1"})
 			assert.NoError(t, err)
 			assert.Equal(t, tt.wantState, status.State)

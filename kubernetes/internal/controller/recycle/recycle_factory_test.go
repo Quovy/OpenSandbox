@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ func TestNewHandler(t *testing.T) {
 		{
 			name:        "DefaultIsDelete",
 			pool:        &sandboxv1alpha1.Pool{},
-			wantHandler: &DeleteRecycler{},
+			wantHandler: &deleteRecycler{},
 		},
 		{
 			name: "Noop",
@@ -43,7 +43,7 @@ func TestNewHandler(t *testing.T) {
 					},
 				},
 			},
-			wantHandler: &NoopRecycler{},
+			wantHandler: &noopRecycler{},
 		},
 		{
 			name: "Delete",
@@ -54,7 +54,7 @@ func TestNewHandler(t *testing.T) {
 					},
 				},
 			},
-			wantHandler: &DeleteRecycler{},
+			wantHandler: &deleteRecycler{},
 		},
 		{
 			name: "Restart_NilConfig",
@@ -76,7 +76,7 @@ func TestNewHandler(t *testing.T) {
 					},
 				},
 			},
-			wantHandler: &DeleteRecycler{},
+			wantHandler: &deleteRecycler{},
 		},
 	}
 	for _, tt := range tests {

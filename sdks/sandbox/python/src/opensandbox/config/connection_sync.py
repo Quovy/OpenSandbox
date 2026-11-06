@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,12 +20,15 @@ This mirrors ConnectionConfig (async) but uses httpx sync transports.
 """
 
 import os
+import ssl
 from datetime import timedelta
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
+from opensandbox._httpx import SyncEventHook
 from opensandbox.transport import RetryPolicy, RetrySyncTransport
+from opensandbox.transport._deadline_sync import DeadlineSyncTransport
 
 
 class ConnectionConfigSync(BaseModel):
@@ -33,7 +36,7 @@ class ConnectionConfigSync(BaseModel):
     Synchronous connection configuration shared across all sync SDK HTTP clients.
 
     Ownership rules:
-    - If `transport` is not provided, the SDK creates a default HTTPTransport per
+    - If `transport` is not provided, the SDK creates a default transport per
       Sandbox/Manager instance and will close it.
     - If `transport` is provided, the SDK will NOT close it (user owns it).
     """
@@ -41,6 +44,7 @@ class ConnectionConfigSync(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     _owns_transport: bool = PrivateAttr(default=True)
+    _ssl_context: ssl.SSLContext | None = PrivateAttr(default=None)
 
     api_key: str | None = Field(
         default=None, description="API key for authentication with sandbox service"
@@ -53,26 +57,46 @@ class ConnectionConfigSync(BaseModel):
         default=timedelta(seconds=30),
         description="Timeout for HTTP requests to the management API",
     )
-    debug: bool = Field(default=False, description="Enable debug logging for HTTP requests")
-    user_agent: str = Field(
-        default="OpenSandbox-Python-SDK/0.1.15", description="User agent string"
+    debug: bool = Field(
+        default=False, description="Enable debug logging for HTTP requests"
     )
-    headers: dict[str, str] = Field(default_factory=dict, description="User defined headers")
+    user_agent: str = Field(
+        default="OpenSandbox-Python-SDK/1.2.0", description="User agent string"
+    )
+    headers: dict[str, str] = Field(
+        default_factory=dict, description="User defined headers"
+    )
+    follow_redirects: bool = Field(
+        default=False,
+        description=(
+            "Whether HTTP clients should follow redirects. Cross-origin redirects strip "
+            "headers prefixed OPEN-SANDBOX- or OPENSANDBOX-, but other sensitive custom "
+            "headers may still be forwarded."
+        ),
+    )
+    event_hooks: dict[str, list[SyncEventHook]] = Field(
+        default_factory=dict,
+        description=(
+            "Additional httpx event hooks for SDK-created sync clients. SDK security "
+            "hooks run after configured request hooks."
+        ),
+    )
 
     transport: httpx.BaseTransport | None = Field(
         default=None,
         description=(
             "Shared httpx transport instance used by all HTTP clients within "
-            "a Sandbox/Manager instance. When unset the SDK builds an "
-            "HTTPTransport wrapped by RetrySyncTransport honoring "
-            "`retry_policy`."
+            "a Sandbox/Manager instance. When unset the SDK builds a "
+            "deadline-aware transport honoring `retry_policy`. Caller-provided "
+            "transports must honor request timeouts."
         ),
     )
     retry_policy: RetryPolicy = Field(
         default_factory=RetryPolicy,
         description=(
-            "Retry policy applied to non-streaming requests going through "
-            "the shared transport. Pass RetryPolicy.disabled() for fast-fail."
+            "Retry policy applied to requests going through the shared "
+            "transport. Streaming (SSE) requests only get its wake-timeout "
+            "retry. Pass RetryPolicy.disabled() for fast-fail."
         ),
     )
     use_server_proxy: bool = Field(
@@ -101,6 +125,10 @@ class ConnectionConfigSync(BaseModel):
             "Also honored via OPENSANDBOX_DISABLE_METRICS=1."
         ),
     )
+    enable_tracing: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry tracing for SDK operations.",
+    )
 
     _ENV_API_KEY = "OPEN_SANDBOX_API_KEY"
     _ENV_DOMAIN = "OPEN_SANDBOX_DOMAIN"
@@ -114,37 +142,63 @@ class ConnectionConfigSync(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(self) -> "ConnectionConfigSync":
-        """
-        Ensure a transport exists for this SDK resource.
+    @property
+    def owns_transport(self) -> bool:
+        """True when this config created (and may close) its transport."""
+        return self._owns_transport
 
-        When `transport` is missing, return a copy whose `transport` is
-        a retry-wrapped HTTPTransport (unless the policy has no
-        wrapper-only knobs, in which case the raw transport is used).
-        When present, return self unchanged.
+    def new_owned_transport(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> httpx.BaseTransport:
         """
-        if self.transport is not None:
-            return self
+        Build a fresh transport stack owned by the caller.
+
+        Same stack as `with_transport_if_missing` builds by default; the
+        shared `transport` on this config is never touched. Callers that
+        close what they build (e.g. adapter clients) can do so safely.
+        """
+        if self._ssl_context is None:
+            self._ssl_context = httpx.create_ssl_context()
+        ssl_context = self._ssl_context
         inner = httpx.HTTPTransport(
+            verify=ssl_context,
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
             ),
         )
-        wrapped: httpx.BaseTransport
+        bounded = DeadlineSyncTransport(inner, ssl_context)
         if self.retry_policy.wraps_transport():
-            wrapped = RetrySyncTransport(
-                inner, self.retry_policy, owns_inner=True
-            )
-        else:
-            wrapped = inner
-        config = self.model_copy(update={"transport": wrapped})
+            return RetrySyncTransport(bounded, self.retry_policy, owns_inner=True)
+        return bounded
+
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfigSync":
+        if self.transport is not None:
+            return self
+        config = self.model_copy(
+            update={
+                "transport": self.new_owned_transport(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                    keepalive_expiry=keepalive_expiry,
+                )
+            }
+        )
         config._owns_transport = True
         return config
 
     def close_transport_if_owned(self) -> None:
-        """Close the transport only if it was created by default_factory."""
         if self.transport is None or not self._owns_transport:
             return
         try:
@@ -174,7 +228,11 @@ class ConnectionConfigSync(BaseModel):
         return self.domain or os.getenv(self._ENV_DOMAIN, self._DEFAULT_DOMAIN)
 
     def get_base_url(self) -> str:
-        domain = self.get_domain()
+        # Same normalization as ConnectionConfig.get_base_url().
+        domain = self.get_domain().rstrip("/")
+        version_suffix = f"/{self._API_VERSION}"
+        if domain.endswith(version_suffix):
+            domain = domain[: -len(version_suffix)]
         if domain.startswith("http://") or domain.startswith("https://"):
             return f"{domain}/{self._API_VERSION}"
         return f"{self.protocol}://{domain}/{self._API_VERSION}"

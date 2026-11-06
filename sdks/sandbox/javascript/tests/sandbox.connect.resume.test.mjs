@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -90,9 +104,10 @@ test("Sandbox.connect wires execd and egress stacks and getEndpointUrl uses prot
       ["sbx-1", 8080],
     ],
   );
-  assert.equal(calls[2].method, "createExecdStack");
-  assert.equal(calls[2].args[0].execdBaseUrl, `https://sandbox.internal:${DEFAULT_EXECD_PORT}`);
-  assert.deepEqual(calls[2].args[0].endpointHeaders, { "x-port": String(DEFAULT_EXECD_PORT) });
+  assert.equal(calls[2].method, "createEgressStack");
+  assert.equal(calls[3].method, "createExecdStack");
+  assert.equal(calls[3].args[0].execdBaseUrl, `https://sandbox.internal:${DEFAULT_EXECD_PORT}`);
+  assert.deepEqual(calls[3].args[0].endpointHeaders, { "x-port": String(DEFAULT_EXECD_PORT) });
 });
 
 test("Sandbox.resume refreshes endpoints through connect after resuming lifecycle", async () => {

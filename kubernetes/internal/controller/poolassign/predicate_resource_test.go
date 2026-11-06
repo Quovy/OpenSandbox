@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -370,7 +370,7 @@ func TestResourcePredicate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := p.Predicate(ctx, tt.sbx, tt.pool)
 			if got != tt.expect {
-				t.Errorf("resourcePredicate.Predicate() = %v, want %v", got, tt.expect)
+				t.Errorf("resourcePredicate.predicate() = %v, want %v", got, tt.expect)
 			}
 		})
 	}

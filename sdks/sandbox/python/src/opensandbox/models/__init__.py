@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ OpenSandbox data models.
 Core Pydantic models for sandbox operations.
 """
 
-from opensandbox.models.diagnostics import DiagnosticContent
+from opensandbox.models.diagnostics import DiagnosticContent, DiagnosticContext
 from opensandbox.models.execd import (
     CommandLogs,
     CommandStatus,
@@ -46,6 +46,7 @@ from opensandbox.models.isolated import (
     CreateIsolatedSessionRequest,
     EnvPassthroughSpec,
     IsolatedCapabilities,
+    IsolatedOverlaySpec,
     IsolatedRunOpts,
     IsolatedSessionInfo,
     IsolatedSessionState,
@@ -54,6 +55,7 @@ from opensandbox.models.isolated import (
 )
 from opensandbox.models.sandboxes import (
     PVC,
+    ActivityProbe,
     Credential,
     CredentialAuth,
     CredentialBinding,
@@ -70,18 +72,24 @@ from opensandbox.models.sandboxes import (
     CredentialVaultState,
     CustomHeaderEntry,
     Host,
+    IdlePolicy,
     InlineCredentialSource,
+    LifecycleHook,
     NetworkPolicy,
     NetworkRule,
     PagedSandboxInfos,
     PaginationInfo,
+    PeriodicLifecycleHook,
     PlatformSpec,
+    RenewalPolicy,
+    SandboxAllocation,
     SandboxCreateResponse,
     SandboxEndpoint,
     SandboxFilter,
     SandboxImageAuth,
     SandboxImageSpec,
     SandboxInfo,
+    SandboxLifecycle,
     SandboxMetrics,
     SandboxState,
     SandboxStatus,
@@ -91,6 +99,7 @@ from opensandbox.models.sandboxes import (
 __all__ = [
     # Execution models
     "DiagnosticContent",
+    "DiagnosticContext",
     "Execution",
     "ExecutionLogs",
     "OutputMessage",
@@ -105,6 +114,7 @@ __all__ = [
     "CreateIsolatedSessionRequest",
     "EnvPassthroughSpec",
     "IsolatedCapabilities",
+    "IsolatedOverlaySpec",
     "IsolatedRunOpts",
     "IsolatedSessionInfo",
     "IsolatedSessionState",
@@ -121,6 +131,7 @@ __all__ = [
     "SearchEntry",
     # Sandbox models
     "SandboxInfo",
+    "SandboxAllocation",
     "SandboxStatus",
     "SandboxState",
     "NetworkPolicy",
@@ -128,6 +139,12 @@ __all__ = [
     "CredentialProxyConfig",
     "CredentialSubstitution",
     "InlineCredentialSource",
+    "LifecycleHook",
+    "PeriodicLifecycleHook",
+    "SandboxLifecycle",
+    "IdlePolicy",
+    "ActivityProbe",
+    "RenewalPolicy",
     "Credential",
     "CredentialMatch",
     "CustomHeaderEntry",

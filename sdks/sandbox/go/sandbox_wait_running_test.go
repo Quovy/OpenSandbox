@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -96,4 +96,23 @@ func TestWaitUntilReady_RespectsContextCancellationDuringBackoff(t *testing.T) {
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.LessOrEqual(t, elapsed, 500*time.Millisecond, "WaitUntilReady should stop quickly on ctx cancel")
+}
+
+func TestWaitUntilReady_TimeoutDoesNotOvershootByPollingInterval(t *testing.T) {
+	sb := &Sandbox{id: "sbx-ready-timeout"}
+
+	start := time.Now()
+	err := sb.WaitUntilReady(context.Background(), ReadyOptions{
+		Timeout:         20 * time.Millisecond,
+		PollingInterval: 2 * time.Second,
+		HealthCheck: func(context.Context, *Sandbox) (bool, error) {
+			return false, nil
+		},
+	})
+	elapsed := time.Since(start)
+
+	var timeoutErr *SandboxReadyTimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	require.Equal(t, "20ms", timeoutErr.Elapsed)
+	require.LessOrEqual(t, elapsed, 500*time.Millisecond, "final sleep must be clamped to the remaining timeout budget")
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -684,13 +684,6 @@ func hasPostStopHook(task *types.Task) bool {
 
 func postStopRequired(task *types.Task, status types.Status) bool {
 	return hasPostStopHook(task) && !statusHasPostStopFinished(status)
-}
-
-func postStopFinished(task *types.Task) bool {
-	if task == nil {
-		return false
-	}
-	return statusHasPostStopFinished(task.Status)
 }
 
 func statusHasPostStopFinished(status types.Status) bool {

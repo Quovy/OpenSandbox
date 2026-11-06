@@ -24,9 +24,7 @@ Make sure your server host has:
 - FUSE support enabled
 - writable local mount root for OSSFS (default `storage.ossfs_mount_root=/mnt/ossfs`)
 
-`storage.ossfs_mount_root` is **optional** if you use the default `/mnt/ossfs`.
-Even with on-demand mounting, the runtime still needs a deterministic host-side
-base directory to place dynamic mounts (`<mount_root>/<bucket>/<subPath?>`).
+`storage.ossfs_mount_root` is **optional** if you use the default `/mnt/ossfs`. Even with on-demand mounting, the runtime still needs a deterministic host-side base directory to place dynamic mounts (`<mount_root>/<bucket>/<subPath?>`).
 
 Optional config example:
 
@@ -61,7 +59,7 @@ pip install -e sdks/sandbox/python
 ```bash
 export SANDBOX_DOMAIN=localhost:8080
 export SANDBOX_API_KEY=your-api-key
-export SANDBOX_IMAGE=ubuntu:24.04
+export SANDBOX_IMAGE=ubuntu
 
 export OSS_BUCKET=your-bucket
 export OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
@@ -82,7 +80,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import OSSFS, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu:24.04",
+    image="ubuntu",
     volumes=[
         Volume(
             name="oss-data",
@@ -115,6 +113,5 @@ sandbox = await Sandbox.create(
 
 ## References
 
-- [OSEP-0003: Volume and VolumeBinding Support](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0003-volume-and-volumebinding-support.md)
 - [Sandbox Lifecycle API Spec](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/sandbox-lifecycle.yml)
 - [Source code on GitHub](https://github.com/opensandbox-group/OpenSandbox/tree/main/examples/docker-ossfs-volume-mount)

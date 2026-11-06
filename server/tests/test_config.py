@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 import textwrap
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from opensandbox_server import config as config_module
+from opensandbox_server.cli import render_full_config
 from opensandbox_server.config import (
     AppConfig,
     LogConfig,
@@ -25,6 +26,8 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
     EgressConfig,
+    EgressUpstreamProxyConfig,
+    ExecdInitResources,
     GatewayConfig,
     GatewayRouteModeConfig,
     IngressConfig,
@@ -32,6 +35,8 @@ from opensandbox_server.config import (
     SecureAccessConfig,
     SecureAccessKey,
     ServerConfig,
+    POSTGRESQL_DSN_ENV_VAR,
+    PostgreSQLStoreConfig,
     StoreConfig,
     StorageConfig,
 )
@@ -76,6 +81,7 @@ def test_load_config_from_file(tmp_path, monkeypatch):
     assert loaded.server.max_sandbox_timeout_seconds == 172800
     assert loaded.runtime.type == "kubernetes"
     assert loaded.runtime.execd_image == "opensandbox/execd:test"
+    assert loaded.runtime.execd_run_as_init is False
     assert loaded.ingress is not None
     assert loaded.ingress.mode == "gateway"
     assert loaded.ingress.gateway is not None
@@ -151,6 +157,33 @@ def test_load_config_without_env_uses_toml_api_key(tmp_path, monkeypatch):
     assert loaded.server.api_key == "toml-secret-key"
 
 
+def test_runtime_execd_run_as_init_parses_from_toml(tmp_path):
+    toml = """
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        execd_run_as_init = true
+        """
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.runtime.execd_run_as_init is True
+
+
+def test_runtime_execd_run_as_init_defaults_false(tmp_path):
+    toml = """
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        """
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.runtime.execd_run_as_init is False
+
+
 def test_docker_runtime_disallows_kubernetes_block():
     server_cfg = ServerConfig()
     runtime_cfg = RuntimeConfig(type="docker", execd_image="busybox:latest")
@@ -162,6 +195,44 @@ def test_docker_runtime_disallows_kubernetes_block():
 def test_server_config_defaults_include_max_sandbox_timeout():
     server_cfg = ServerConfig()
     assert server_cfg.max_sandbox_timeout_seconds is None
+
+
+def test_kubernetes_pool_acquisition_timeout_defaults_and_validates():
+    kubernetes_cfg = config_module.KubernetesRuntimeConfig()
+    assert kubernetes_cfg.pool_acquisition_timeout_seconds == 30
+
+    with pytest.raises(ValueError):
+        config_module.KubernetesRuntimeConfig(pool_acquisition_timeout_seconds=0)
+
+
+def test_kubernetes_template_publish_secrets_defaults():
+    """native templates fall back to the S3 secret; the OCI publish secret
+    for overlaybd templates is opt-in and defaults to unset."""
+    kubernetes_cfg = config_module.KubernetesRuntimeConfig()
+    assert kubernetes_cfg.template_s3_publish_secret == "sandbox-oss-credentials"
+    assert kubernetes_cfg.template_oci_publish_secret is None
+
+    configured = config_module.KubernetesRuntimeConfig(
+        template_oci_publish_secret="registry-credentials"
+    )
+    assert configured.template_oci_publish_secret == "registry-credentials"
+
+    with pytest.raises(ValueError):
+        config_module.KubernetesRuntimeConfig(template_oci_publish_secret="")
+
+
+def test_kubernetes_template_oci_publish_secret_from_toml():
+    app_cfg = config_module.AppConfig.model_validate(
+        {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "runtime": {"type": "kubernetes", "execd_image": "opensandbox/execd:latest"},
+            "kubernetes": {
+                "template_oci_publish_secret": "registry-credentials",
+            },
+        }
+    )
+    assert app_cfg.kubernetes is not None
+    assert app_cfg.kubernetes.template_oci_publish_secret == "registry-credentials"
 
 
 def test_server_config_uvicorn_tuning_defaults():
@@ -231,6 +302,34 @@ def test_store_defaults_to_sqlite():
     assert cfg.path.endswith("opensandbox.db")
 
 
+def test_postgresql_store_requires_dsn():
+    with pytest.raises(ValidationError, match="must be set"):
+        StoreConfig(type="postgresql")
+
+
+def test_postgresql_store_validates_pool_size():
+    with pytest.raises(ValidationError, match="min_pool_size"):
+        PostgreSQLStoreConfig(
+            dsn=SecretStr("postgresql://localhost/opensandbox"),
+            min_pool_size=3,
+            max_pool_size=2,
+        )
+
+
+def test_postgresql_store_snapshot_recovery_interval_is_positive():
+    config = PostgreSQLStoreConfig(
+        dsn=SecretStr("postgresql://localhost/opensandbox"),
+    )
+
+    assert config.snapshot_recovery_interval_seconds == 15
+
+    with pytest.raises(ValueError):
+        PostgreSQLStoreConfig(
+            dsn=SecretStr("postgresql://localhost/opensandbox"),
+            snapshot_recovery_interval_seconds=0,
+        )
+
+
 def test_renew_intent_defaults():
     cfg = AppConfig(runtime=RuntimeConfig(type="docker", execd_image="opensandbox/execd:latest"))
     ar = cfg.renew_intent
@@ -240,6 +339,59 @@ def test_renew_intent_defaults():
     assert ar.redis.dsn is None
     assert ar.redis.queue_key == "opensandbox:renew:intent"
     assert ar.redis.consumer_concurrency == 8
+
+
+def test_idle_pause_defaults():
+    cfg = AppConfig(runtime=RuntimeConfig(type="docker", execd_image="opensandbox/execd:latest"))
+    ip = cfg.automation.idle_pause
+    assert ip.enabled is False
+    assert ip.sweep_interval_seconds == 15
+    assert ip.activity_ttl_seconds == 1800
+    assert ip.redis.dsn is None
+    assert ip.redis.lock_ttl_seconds == 30
+
+
+def test_idle_pause_redis_requires_dsn_when_enabled():
+    from opensandbox_server.config import IdlePauseConfig
+
+    with pytest.raises(ValidationError):
+        IdlePauseConfig(enabled=True)
+    with pytest.raises(ValidationError):
+        IdlePauseConfig(enabled=True, redis={"dsn": "   "})
+    ok = IdlePauseConfig(enabled=True, redis={"dsn": "redis://x", "lock_ttl_seconds": 45})
+    assert ok.redis.lock_ttl_seconds == 45
+
+
+def test_load_config_idle_pause_dotted_redis_keys(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [automation.idle_pause]
+        enabled = true
+        sweep_interval_seconds = 10
+        activity_ttl_seconds = 3600
+        redis.dsn = "redis://example:6379/2"
+        redis.lock_ttl_seconds = 45
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    ip = loaded.automation.idle_pause
+    assert ip.enabled is True
+    assert ip.sweep_interval_seconds == 10
+    assert ip.activity_ttl_seconds == 3600
+    assert ip.redis.dsn == "redis://example:6379/2"
+    assert ip.redis.lock_ttl_seconds == 45
 
 
 def test_renew_intent_redis_requires_dsn_when_enabled():
@@ -306,6 +458,114 @@ def test_load_config_store_block(tmp_path, monkeypatch):
     loaded = config_module.load_config(config_path)
     assert loaded.store.type == "sqlite"
     assert loaded.store.path == str(db_path)
+
+
+def test_load_config_postgresql_dsn_from_environment(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    monkeypatch.setenv(
+        POSTGRESQL_DSN_ENV_VAR,
+        "postgresql://opensandbox:secret@postgres.example/opensandbox",
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            min_pool_size = 2
+            max_pool_size = 4
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.store.type == "postgresql"
+    assert loaded.store.postgresql.dsn is not None
+    assert (
+        loaded.store.postgresql.dsn.get_secret_value()
+        == "postgresql://opensandbox:secret@postgres.example/opensandbox"
+    )
+    assert loaded.store.postgresql.min_pool_size == 2
+    assert loaded.store.postgresql.max_pool_size == 4
+
+
+def test_postgresql_dsn_environment_overrides_toml(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    monkeypatch.setenv(POSTGRESQL_DSN_ENV_VAR, "postgresql://environment/opensandbox")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            dsn = "postgresql://toml/opensandbox"
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.store.postgresql.dsn is not None
+    assert loaded.store.postgresql.dsn.get_secret_value() == "postgresql://environment/opensandbox"
+
+
+def test_postgresql_dsn_is_redacted_from_validation_errors(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    secret_dsn = "postgresql://opensandbox:sensitive-password@postgres/opensandbox"
+    monkeypatch.setenv(POSTGRESQL_DSN_ENV_VAR, secret_dsn)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [store]
+            type = "postgresql"
+
+            [store.postgresql]
+            min_pool_size = 3
+            max_pool_size = 2
+
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        config_module.load_config(config_path)
+
+    assert secret_dsn not in str(exc_info.value)
+
+
+def test_full_config_includes_store_sections(tmp_path) -> None:
+    config_path = render_full_config(tmp_path / "generated.toml")
+
+    content = config_path.read_text()
+    assert "[store]" in content
+    assert "[store.postgresql]" in content
+    assert "min_pool_size" in content
+
+
+def test_full_config_documents_container_runtime_network_modes(tmp_path) -> None:
+    """`osb config init` renders pydantic field descriptions, so they must list every accepted mode."""
+    config_path = render_full_config(tmp_path / "generated.toml")
+
+    content = config_path.read_text()
+    for mode in ("host", "bridge", "none", "pasta", "slirp4netns"):
+        assert mode in content
 
 
 def test_load_config_renew_intent_legacy_redis_subtable(tmp_path, monkeypatch):
@@ -714,7 +974,6 @@ def test_secure_runtime_empty_type_is_valid():
 
 
 def test_secure_runtime_gvisor_with_docker_runtime_is_valid():
-    """gVisor with docker_runtime should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="gvisor",
         docker_runtime="runsc",
@@ -738,7 +997,6 @@ def test_secure_runtime_gvisor_with_k8s_runtime_class_is_valid():
 
 
 def test_secure_runtime_kata_with_runtimes_is_valid():
-    """Kata with both runtimes should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="kata",
         docker_runtime="kata-runtime",
@@ -750,7 +1008,6 @@ def test_secure_runtime_kata_with_runtimes_is_valid():
 
 
 def test_secure_runtime_firecracker_with_k8s_runtime_is_valid():
-    """Firecracker with k8s_runtime_class should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="firecracker",
         docker_runtime="",
@@ -762,7 +1019,6 @@ def test_secure_runtime_firecracker_with_k8s_runtime_is_valid():
 
 
 def test_secure_runtime_firecracker_without_k8s_runtime_raises_error():
-    """Firecracker without k8s_runtime_class should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="firecracker",
@@ -773,7 +1029,6 @@ def test_secure_runtime_firecracker_without_k8s_runtime_raises_error():
 
 
 def test_secure_runtime_gvisor_without_any_runtime_raises_error():
-    """gVisor without any runtime configured should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="gvisor",
@@ -784,7 +1039,6 @@ def test_secure_runtime_gvisor_without_any_runtime_raises_error():
 
 
 def test_secure_runtime_kata_without_any_runtime_raises_error():
-    """Kata without any runtime configured should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="kata",
@@ -795,13 +1049,11 @@ def test_secure_runtime_kata_without_any_runtime_raises_error():
 
 
 def test_secure_runtime_invalid_type_raises_error():
-    """Invalid type should raise ValidationError."""
     with pytest.raises(Exception):
         config_module.SecureRuntimeConfig(type="invalid_runtime")
 
 
 def test_app_config_with_secure_runtime():
-    """AppConfig should parse secure_runtime section."""
     cfg = AppConfig(
         runtime={"type": "docker", "execd_image": "execd:v1"},
         secure_runtime={
@@ -816,7 +1068,6 @@ def test_app_config_with_secure_runtime():
 
 
 def test_app_config_without_secure_runtime():
-    """AppConfig without secure_runtime should have None."""
     cfg = AppConfig(
         runtime={"type": "docker", "execd_image": "execd:v1"},
     )
@@ -872,7 +1123,6 @@ def test_docker_runtime_with_firecracker_raises_error():
 
 
 def test_kubernetes_runtime_with_firecracker_is_valid():
-    """Kubernetes runtime with Firecracker should be valid."""
     cfg = AppConfig(
         runtime={"type": "kubernetes", "execd_image": "execd:v1"},
         kubernetes={"namespace": "default"},
@@ -891,12 +1141,668 @@ def test_egress_config_mode_literal():
     base = EgressConfig(image="opensandbox/egress:v1")
     assert base.mode == EGRESS_MODE_DNS
     assert base.disable_ipv6 is True
+    assert base.readiness_timeout_seconds == 30.0
+    assert base.requests is None
+    assert base.limits is None
     cfg = EgressConfig(image="opensandbox/egress:v1", mode=EGRESS_MODE_DNS_NFT)
     assert cfg.mode == EGRESS_MODE_DNS_NFT
 
 
+def test_egress_config_otlp_endpoint_default_and_http_urls():
+    base = EgressConfig(image="opensandbox/egress:v1")
+    assert base.otlp_endpoint is None
+    for endpoint in (
+        "http://otel-collector.observability:4318",
+        "https://otel-collector.observability:4318",
+    ):
+        cfg = EgressConfig(image="opensandbox/egress:v1", otlp_endpoint=endpoint)
+        assert cfg.otlp_endpoint == endpoint
+
+
+def test_egress_config_empty_otlp_endpoint_normalizes_to_none():
+    cfg = EgressConfig(image="opensandbox/egress:v1", otlp_endpoint="")
+    assert cfg.otlp_endpoint is None
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "grpc://otel-collector:4317",
+        "otel-collector.observability:4318",
+        "unix:///var/run/otel.sock",
+        "http://",
+        "https://",
+        "http:///v1/metrics",
+        "https:///v1/metrics",
+    ],
+)
+def test_egress_config_rejects_non_http_otlp_endpoint(endpoint):
+    with pytest.raises(ValidationError, match=r"otlp_endpoint must be an http\(s\) URL"):
+        EgressConfig(image="opensandbox/egress:v1", otlp_endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    ("resource_name", "quantity"),
+    [
+        ("cpu", "1"),
+        ("memory", "1Gi"),
+        ("ephemeral-storage", "1Gi"),
+        ("hugepages-2Mi", "2Mi"),
+        ("nvidia.com/gpu", "1"),
+    ],
+)
+def test_egress_config_accepts_kubernetes_container_resource_names(
+    resource_name, quantity
+):
+    config = EgressConfig(
+        requests={resource_name: quantity},
+        limits={resource_name: quantity},
+    )
+
+    assert config.requests == {resource_name: quantity}
+
+
+@pytest.mark.parametrize(
+    "resource_name",
+    [
+        "",
+        "gpu",
+        "bad resource name",
+        "hugepages-invalid",
+        "/gpu",
+        "example.com/",
+        "Example.com/gpu",
+        "example..com/gpu",
+        "requests.example.com/gpu",
+        f"{'a' * 64}.com/gpu",
+        f"example.com/{'a' * 64}",
+    ],
+)
+def test_egress_config_rejects_invalid_kubernetes_container_resource_names(
+    resource_name,
+):
+    with pytest.raises(
+        ValidationError,
+        match=r"invalid Kubernetes container resource name",
+    ):
+        EgressConfig(requests={resource_name: "1"})
+
+
+@pytest.mark.parametrize(
+    ("requests", "limits"),
+    [
+        ({"cpu": "500m"}, {"cpu": "250m"}),
+        ({"memory": "1Gi"}, {"memory": "512Mi"}),
+    ],
+)
+def test_egress_config_rejects_requests_greater_than_limits(requests, limits):
+    with pytest.raises(
+        ValidationError,
+        match=r"resource request .* must not exceed limit",
+    ):
+        EgressConfig(requests=requests, limits=limits)
+
+
+def test_execd_init_resources_preserve_existing_unvalidated_quantity_semantics():
+    resources = ExecdInitResources(requests={"cpu": "not-a-quantity"})
+
+    assert resources.requests == {"cpu": "not-a-quantity"}
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    ["not-a-quantity", "-1", "NaN", "1K"],
+)
+@pytest.mark.parametrize("resource_kind", ["requests", "limits"])
+def test_egress_config_rejects_invalid_kubernetes_resource_quantities(
+    resource_kind, quantity
+):
+    with pytest.raises(
+        ValidationError,
+        match=r"invalid Kubernetes resource quantity for 'cpu'",
+    ):
+        EgressConfig.model_validate({resource_kind: {"cpu": quantity}})
+
+
+def test_egress_config_readiness_timeout_must_be_positive():
+    cfg = EgressConfig(readiness_timeout_seconds=75.5)
+    assert cfg.readiness_timeout_seconds == 75.5
+
+    with pytest.raises(ValidationError):
+        EgressConfig(readiness_timeout_seconds=0)
+
+
+def test_load_config_with_egress_readiness_timeout(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+
+        [egress]
+        image = "opensandbox/egress:test"
+        readiness_timeout_seconds = 75.5
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.readiness_timeout_seconds == 75.5
+
+
+def test_load_config_with_egress_resources(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            requests = { cpu = "25m", memory = "64Mi" }
+            limits = { cpu = "250m", memory = "256Mi" }
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.requests == {"cpu": "25m", "memory": "64Mi"}
+    assert loaded.egress.limits == {"cpu": "250m", "memory": "256Mi"}
+
+
+@pytest.mark.parametrize(
+    ("resource_config", "error"),
+    [
+        ('requests = { gpu = "1" }', "invalid Kubernetes container resource name"),
+        (
+            'requests = { cpu = "500m" }\nlimits = { cpu = "250m" }',
+            "must not exceed limit",
+        ),
+    ],
+)
+def test_load_config_rejects_invalid_egress_resources_at_startup(
+    tmp_path, monkeypatch, resource_config, error
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            {resource_config}
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError, match=error):
+        config_module.load_config(config_path)
+
+
+# Expected results verified against the egress Go parseUpstreamProxy
+# (components/egress/pkg/mitmproxy/upstream.go); `%C3%A9` is intentionally
+# stricter than Go.
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://proxy.local:3128",
+        "https://proxy.local",
+        "http://[::1]:3128",
+        "HTTP://proxy:3128",
+        "Https://proxy",
+        "http://pro_xy:3128",
+        "http://pro!xy:3128",
+        "http://proxy:",
+        "http://proxy.local:3128/",
+        "http://[fe80::1%25eth0]:3128",
+    ],
+)
+def test_egress_upstream_proxy_accepts_valid_urls(url):
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(url=url),
+    )
+    assert cfg.upstream_proxy is not None
+    assert cfg.upstream_proxy.url == url
+    assert cfg.upstream_proxy.authorization is None
+
+
+def test_egress_upstream_proxy_authorization_is_secret():
+    cfg = EgressConfig(
+        image="opensandbox/egress:v1",
+        mode=EGRESS_MODE_DNS_NFT,
+        upstream_proxy=EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            authorization=SecretStr("Basic s3cr3t-value"),
+        ),
+    )
+    assert cfg.upstream_proxy is not None
+    assert isinstance(cfg.upstream_proxy.authorization, SecretStr)
+    assert (
+        cfg.upstream_proxy.authorization.get_secret_value()
+        == "Basic s3cr3t-value"
+    )
+    assert "s3cr3t-value" not in repr(cfg)
+    assert "s3cr3t-value" not in str(cfg)
+
+
+def test_egress_upstream_proxy_defaults_to_none():
+    cfg = EgressConfig(image="opensandbox/egress:v1")
+    assert cfg.upstream_proxy is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "proxy:3128",
+        "ftp://proxy:21",
+        "http://:3128",
+        "http://proxy:3128/x",
+        "http://proxy:3128?x=1",
+        "http://proxy:3128#f",
+        "http://proxy:0",
+        "http://proxy:70000",
+        "http://proxy:abc",
+        "http://proxy\\corp:3128",
+        "http://exa\tmple.com:3128",
+        "http://exa\rmple.com:3128",
+        "http://exa\x00mple:3128",
+        "http://exa\x7fmple:3128",
+        "http://pro%xy:3128",
+        "http://proxy%20name:3128",
+        "http://pro%C3%A9xy:3128",
+        "http://prox y:3128",
+        "http://proxy|a:3128",
+        "http://proxy{a}:3128",
+        "http://proxy^a:3128",
+        "http://proxy`a:3128",
+    ],
+)
+def test_egress_upstream_proxy_rejects_invalid_urls(url):
+    with pytest.raises(ValidationError):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(url=url),
+        )
+
+
+def test_egress_upstream_proxy_userinfo_error_does_not_leak_credentials():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://user:s3cr3t@proxy:3128"
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_authorization_rejects_newlines_without_leak():
+    with pytest.raises(ValidationError) as exc_info:
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            mode=EGRESS_MODE_DNS_NFT,
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128",
+                authorization=SecretStr("Basic s3cr3t\nInjected: x"),
+            ),
+        )
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("authorization", ["   ", "\t"])
+def test_egress_upstream_proxy_whitespace_authorization_normalizes_to_none(
+    authorization,
+):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", authorization=SecretStr(authorization)
+    )
+    assert cfg.authorization is None
+
+
+def test_load_config_with_egress_upstream_proxy(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            authorization = "Basic dGVzdDp0ZXN0"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.url == "http://proxy.local:3128"
+    assert loaded.egress.upstream_proxy.authorization is not None
+    assert (
+        loaded.egress.upstream_proxy.authorization.get_secret_value()
+        == "Basic dGVzdDp0ZXN0"
+    )
+
+
+def test_load_config_rejects_upstream_proxy_userinfo_without_leak(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "http://user:s3cr3t@proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        config_module.load_config(config_path)
+
+    assert "s3cr3t" not in str(exc_info.value)
+
+
+def test_egress_upstream_proxy_requires_dns_nft_mode():
+    with pytest.raises(ValidationError, match='egress.mode = "dns\\+nft"'):
+        EgressConfig(
+            image="opensandbox/egress:v1",
+            upstream_proxy=EgressUpstreamProxyConfig(
+                url="http://proxy.local:3128"
+            ),
+        )
+
+
+def test_load_config_rejects_upstream_proxy_without_dns_nft(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+
+            [egress.upstream_proxy]
+            url = "http://proxy.local:3128"
+            """
+        )
+    )
+
+    with pytest.raises(ValidationError, match="dns\\+nft"):
+        config_module.load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/ssl/certs/upstream-ca.pem",
+        " /opt/ca/proxy.pem ",
+        "/var/lib/ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_valid(path):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_cert_path=path
+    )
+    assert cfg.ca_cert_path == path.strip()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "   ",
+        "relative/ca.pem",
+        "./ca.pem",
+        "ca.pem",
+        "C:\\ca\\proxy.pem",
+        "/has:colon/ca.pem",
+        "/bad/\x00ca.pem",
+    ],
+)
+def test_egress_upstream_proxy_ca_cert_path_invalid(path):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_cert_path=path
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "corp-proxy-ca",
+        " proxy-ca.ns1 ",
+        "a",
+        "ca-bundle.example.org",
+        "ca-" + "b" * 60,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_valid(name):
+    cfg = EgressUpstreamProxyConfig(
+        url="http://proxy.local:3128", ca_secret_name=name
+    )
+    assert cfg.ca_secret_name == name.strip()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "   ",
+        "UPPER_CASE",
+        "has_underscore",
+        "-leading-dash",
+        "trailing-dash-",
+        "a..b",
+        "a" * 64,
+        "a" * 254,
+    ],
+)
+def test_egress_upstream_proxy_ca_secret_name_invalid(name):
+    with pytest.raises(ValidationError):
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128", ca_secret_name=name
+        )
+
+
+def test_egress_upstream_proxy_ca_fields_default_to_none():
+    cfg = EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    assert cfg.ca_cert_path is None
+    assert cfg.ca_secret_name is None
+
+
+def test_load_config_with_egress_upstream_proxy_ca_cert_path_docker(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert (
+        loaded.egress.upstream_proxy.ca_cert_path
+        == "/etc/ssl/private-ca/upstream.pem"
+    )
+
+
+def test_load_config_with_egress_upstream_proxy_ca_secret_name_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    loaded = config_module.load_config(config_path)
+
+    assert loaded.egress is not None
+    assert loaded.egress.upstream_proxy is not None
+    assert loaded.egress.upstream_proxy.ca_secret_name == "corp-proxy-ca"
+
+
+def test_load_config_rejects_ca_secret_name_on_docker(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "docker"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_secret_name = "corp-proxy-ca"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_secret_name requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_load_config_rejects_ca_cert_path_on_kubernetes(
+    tmp_path, monkeypatch
+):
+    _reset_config(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            [runtime]
+            type = "kubernetes"
+            execd_image = "opensandbox/execd:test"
+
+            [egress]
+            image = "opensandbox/egress:test"
+            mode = "dns+nft"
+
+            [egress.upstream_proxy]
+            url = "https://proxy.local:8443"
+            ca_cert_path = "/etc/ssl/private-ca/upstream.pem"
+            """
+        )
+    )
+
+    with pytest.raises(
+        ValidationError, match="ca_cert_path requires runtime.type"
+    ):
+        config_module.load_config(config_path)
+
+
+def test_upstream_proxy_egress_env_emits_extra_ca_only_when_ca_source_set():
+    from opensandbox_server.services.helpers import (
+        upstream_proxy_egress_env,
+    )
+
+    no_ca = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(url="http://proxy.local:3128")
+    )
+    assert "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA" not in no_ca
+
+    with_path = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_cert_path="/etc/ssl/certs/ca.pem",
+        )
+    )
+    assert (
+        with_path["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
+
+    with_secret = upstream_proxy_egress_env(
+        EgressUpstreamProxyConfig(
+            url="http://proxy.local:3128",
+            ca_secret_name="corp-proxy-ca",
+        )
+    )
+    assert (
+        with_secret["OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"]
+        == "/etc/ssl/certs/opensandbox-upstream-extra-ca.pem"
+    )
+
+
 def test_log_config_defaults():
-    """LogConfig should have sensible defaults."""
     cfg = LogConfig()
     assert cfg.level == "INFO"
     assert cfg.file_enabled is False
@@ -907,7 +1813,6 @@ def test_log_config_defaults():
 
 
 def test_log_config_resolved_file_path():
-    """resolved_file_path() should return None when file_enabled=False."""
     cfg = LogConfig(file_enabled=False)
     assert cfg.resolved_file_path() is None
 
@@ -921,7 +1826,6 @@ def test_log_config_resolved_file_path():
 
 
 def test_log_config_resolved_access_file_path():
-    """resolved_access_file_path() should return default path when file_enabled."""
     # file_enabled=False always returns None
     cfg = LogConfig(file_enabled=False, access_file_path="/path/access.log")
     assert cfg.resolved_access_file_path() is None
@@ -962,7 +1866,6 @@ def test_log_config_file_backup_count_validation():
 
 
 def test_app_config_log_defaults():
-    """AppConfig should include default LogConfig."""
     cfg = AppConfig(
         runtime=RuntimeConfig(type="docker", execd_image="test:latest")
     )
@@ -1555,4 +2458,3 @@ class TestSecureAccessEnvOverride:
 
         with pytest.raises(ValidationError, match="not found in secure_access.keys"):
             config_module.load_config(config_path)
-

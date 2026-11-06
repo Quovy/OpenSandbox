@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,33 +17,38 @@ package controller
 // Event reasons for BatchSandbox and Pool controllers.
 const (
 	// Pod lifecycle (used by both BatchSandbox and Pool controllers)
-	EventReasonFailedCreate     = "FailedCreate"
-	EventReasonSuccessfulCreate = "SuccessfulCreate"
-	EventReasonFailedDelete     = "FailedDelete"
-	EventReasonSuccessfulDelete = "SuccessfulDelete"
+	eventReasonFailedCreate     = "FailedCreate"
+	eventReasonSuccessfulCreate = "SuccessfulCreate"
+	eventReasonFailedDelete     = "FailedDelete"
+	eventReasonSuccessfulDelete = "SuccessfulDelete"
 
 	// Pool allocation — recorded on BatchSandbox by pool-controller
-	EventReasonScheduled = "Scheduled"
+	eventReasonScheduled = "Scheduled"
 
 	// Pool assignment — recorded on BatchSandbox by batchsandbox-controller
-	EventReasonPoolAssigned     = "PoolAssigned"
-	EventReasonFailedPoolAssign = "FailedPoolAssign"
+	eventReasonPoolAssigned     = "PoolAssigned"
+	eventReasonFailedPoolAssign = "FailedPoolAssign"
 
 	// Pod release — recorded on BatchSandbox
-	EventReasonPodReleased   = "PodReleased"
-	EventReasonFailedRelease = "FailedRelease"
+	eventReasonPodReleased   = "PodReleased"
+	eventReasonFailedRelease = "FailedRelease"
+
+	// Image pull stuck recovery — recorded on BatchSandbox
+	eventReasonReplacedStuckPod          = "ReplacedStuckPod"
+	eventReasonPodRecoveryLimitReached   = "PodRecoveryLimitReached"
+	eventReasonImagePullPermanentFailure = "ImagePullPermanentFailure"
 
 	// Pod eviction — recorded on Pool
-	EventReasonPodEvicted = "PodEvicted"
+	eventReasonPodEvicted = "PodEvicted"
 
 	// Rolling update — recorded on Pool
-	EventReasonPodUpdated = "PodUpdated"
+	eventReasonPodUpdated = "PodUpdated"
 
 	// Allocation result — recorded on Pool
-	EventReasonAllocationSucceeded = "AllocationSucceeded"
-	EventReasonAllocationFailed    = "AllocationFailed"
+	eventReasonAllocationSucceeded = "AllocationSucceeded"
+	eventReasonAllocationFailed    = "AllocationFailed"
 
 	// Pod recycle — recorded on Pool
-	EventReasonPodRecycled      = "PodRecycled"
-	EventReasonFailedRecyclePod = "FailedRecyclePod"
+	eventReasonPodRecycled      = "PodRecycled"
+	eventReasonFailedRecyclePod = "FailedRecyclePod"
 )

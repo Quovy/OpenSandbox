@@ -1,0 +1,342 @@
+name: Umbrella Packages
+
+# Reusable package fan-out for the unified umbrella release (OSEP-0016):
+# one job per registry, build + publish in the same run. With
+# publish=false the builds run as a rehearsal only. Registry legs run in
+# parallel; publish steps are idempotent (already-published versions are
+# skipped).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Umbrella version, e.g. 1.1.0'
+        required: true
+        type: string
+      channel:
+        description: 'stable | rc — rc publishes npm under a separate dist-tag'
+        required: false
+        type: string
+        default: stable
+      publish:
+        description: 'Publish packages to public registries'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PyPI — build all five packages, then publish in dependency order
+  # ---------------------------------------------------------------------------
+
+  pypi:
+    name: PyPI packages
+    runs-on: ubuntu-latest
+    permissions:
+      # job-scoped: workflow-level privileged permissions break some forks
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Build packages
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
+          HATCH_VCS_PRETEND_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          (cd sdks/sandbox/python && uv run python scripts/generate_api.py)
+          for dir in server cli sdks/sandbox/python sdks/code-interpreter/python sdks/mcp/sandbox/python; do
+            echo "::group::uv build $dir"
+            (cd "$dir" && uv build)
+            echo "::endgroup::"
+          done
+
+      - name: Smoke-import server wheel before publish
+        run: |
+          set -euo pipefail
+          # the wheel must import standalone (guards against hatchling
+          # silently dropping ignored paths)
+          printf '[runtime]\ntype = "docker"\nexecd_image = "opensandbox/execd:latest"\n' > "$HOME/.sandbox.toml"
+          uv venv "$RUNNER_TEMP/server-smoke"
+          uv pip install --quiet --python "$RUNNER_TEMP/server-smoke/bin/python" server/dist/opensandbox_server-*.whl
+          "$RUNNER_TEMP/server-smoke/bin/python" -c "import opensandbox_server.main"
+          rm -f "$HOME/.sandbox.toml"
+
+      # publish in dependency order (server → SDK → dependents → CLI)
+      - name: Publish PyPI packages
+        if: ${{ inputs.publish }}
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          publish_one() {
+            local name="$1" dist="$2"
+            if pip index versions "$name" 2>/dev/null | grep -qE "(^|[ ,])${VERSION}([ ,]|\$)"; then
+              echo "::warning::${name} ${VERSION} is already on PyPI — skipping publish"
+              return 0
+            fi
+            echo "::group::uv publish ${name}"
+            uv publish "$dist"/*
+            echo "::endgroup::"
+          }
+          publish_one opensandbox-server            server/dist
+          publish_one opensandbox                   sdks/sandbox/python/dist
+          publish_one opensandbox-code-interpreter  sdks/code-interpreter/python/dist
+          publish_one opensandbox-mcp               sdks/mcp/sandbox/python/dist
+          publish_one opensandbox-cli               cli/dist
+
+      - name: Rollback ledger (on failure)
+        if: failure()
+        run: |
+          cat <<'EOF' >&2
+          ::error::PyPI publish failed partway. Yank the versions that landed
+          ::error::via PyPI project settings (no scriptable API); packages
+          ::error::later in the dependency order did not publish.
+          ::error::
+          ::error::File a P0 release incident with this run link before remediating.
+          EOF
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # npm — install, build, pack, publish both SDKs
+  # ---------------------------------------------------------------------------
+
+  npm:
+    name: npm packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+          run_install: false
+
+      - name: Install workspace dependencies
+        working-directory: sdks
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and pack SDKs
+        run: |
+          set -euo pipefail
+          pnpm --filter "@alibaba-group/opensandbox..." \
+               --filter "@alibaba-group/opensandbox-code-interpreter..." \
+               --sort run build
+          pack_one() {
+            local name="$1" dir="$2"
+            echo "::group::pnpm pack $name"
+            mkdir -p "packs/$name"
+            (cd "$dir" && pnpm pack --pack-destination "$GITHUB_WORKSPACE/packs/$name")
+            echo "::endgroup::"
+          }
+          pack_one sandbox           sdks/sandbox/javascript
+          pack_one code-interpreter  sdks/code-interpreter/javascript
+
+      - name: Publish npm packages
+        if: ${{ inputs.publish }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          DIST_TAG="latest"
+          [ "${{ inputs.channel }}" = "rc" ] && DIST_TAG="rc"
+          publish_one() {
+            local tarball="$1" package="$2"
+            if npm view "${package}@${VERSION}" version >/dev/null 2>&1; then
+              echo "::warning::${package} ${VERSION} is already on npm — skipping publish"
+              return 0
+            fi
+            echo "::group::npm publish ${package} (dist-tag: ${DIST_TAG})"
+            pnpm publish "$tarball" --access public --no-git-checks --tag "$DIST_TAG"
+            echo "::endgroup::"
+          }
+          publish_one "packs/sandbox/$(ls packs/sandbox | grep '\.tgz$' | head -1)" \
+            "@alibaba-group/opensandbox"
+          publish_one "packs/code-interpreter/$(ls packs/code-interpreter | grep '\.tgz$' | head -1)" \
+            "@alibaba-group/opensandbox-code-interpreter"
+
+      - name: Rollback ledger (on failure)
+        if: failure()
+        run: |
+          cat <<'EOF' >&2
+          ::error::npm publish failed partway. Revocation for versions that
+          ::error::landed: npm unpublish <pkg>@$VERSION (within 72h) else
+          ::error::npm deprecate <pkg>@$VERSION "yanked".
+          ::error::
+          ::error::File a P0 release incident with this run link before remediating.
+          EOF
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # NuGet — restore, pack, publish both SDKs
+  # ---------------------------------------------------------------------------
+
+  nuget:
+    name: NuGet packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore
+        run: |
+          dotnet restore sdks/sandbox/csharp/src/OpenSandbox/OpenSandbox.csproj
+          dotnet restore sdks/code-interpreter/csharp/src/OpenSandbox.CodeInterpreter/OpenSandbox.CodeInterpreter.csproj
+
+      - name: Pack SDKs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/sandbox artifacts/code-interpreter
+          dotnet pack sdks/sandbox/csharp/src/OpenSandbox/OpenSandbox.csproj \
+            --configuration Release \
+            --no-restore \
+            -p:ContinuousIntegrationBuild=true \
+            --output ./artifacts/sandbox
+          dotnet pack sdks/code-interpreter/csharp/src/OpenSandbox.CodeInterpreter/OpenSandbox.CodeInterpreter.csproj \
+            --configuration Release \
+            --no-restore \
+            -p:ContinuousIntegrationBuild=true \
+            --output ./artifacts/code-interpreter
+
+      - name: Publish NuGet packages
+        if: ${{ inputs.publish }}
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # skip-check against the flat-container index (search API lags
+          # the feed by tens of minutes)
+          flat_versions() {
+            curl -fsSL \
+              "https://api.nuget.org/v3-flatcontainer/$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')/index.json" \
+              2>/dev/null
+          }
+          publish_one() {
+            local dir="$1" package="$2"
+            if flat_versions "$package" | grep -q "\"${VERSION}\""; then
+              echo "::warning::${package} ${VERSION} is already on NuGet — skipping publish"
+              return 0
+            fi
+            echo "::group::nuget push ${package}"
+            dotnet nuget push "${dir}/*.nupkg" \
+              --api-key "$NUGET_API_KEY" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --skip-duplicate
+            echo "::endgroup::"
+          }
+          publish_one artifacts/sandbox            Alibaba.OpenSandbox
+          publish_one artifacts/code-interpreter   Alibaba.OpenSandbox.CodeInterpreter
+
+      - name: Rollback ledger (on failure)
+        if: failure()
+        run: |
+          cat <<'EOF' >&2
+          ::error::NuGet publish failed partway. Revocation for versions that
+          ::error::landed: dotnet nuget delete <pkg> $VERSION --source
+          ::error::https://api.nuget.org/v3/index.json (within 72h).
+          ::error::
+          ::error::File a P0 release incident with this run link before remediating.
+          EOF
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Maven Central
+  # ---------------------------------------------------------------------------
+
+  maven:
+    name: Maven Central (Kotlin/JVM)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Build Kotlin/JVM multi-project
+        working-directory: sdks/sandbox/kotlin
+        run: |
+          ./gradlew build
+          echo "project.version=$(sed -n 's/^project\.version=//p' gradle.properties)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to Maven Central
+        if: ${{ inputs.publish }}
+        working-directory: sdks/sandbox/kotlin
+        env:
+          VERSION: ${{ inputs.version }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALUSERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_MAVENCENTRALPASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.ORG_GRADLE_PROJECT_SIGNINGINMEMORYKEYPASSWORD }}
+        run: |
+          set -euo pipefail
+          # the BOM POM on Central is the already-released marker
+          if curl -fsSI -o /dev/null \
+            "https://repo1.maven.org/maven2/com/alibaba/opensandbox/sandbox-bom/${VERSION}/sandbox-bom-${VERSION}.pom"; then
+            echo "::warning::com.alibaba.opensandbox:sandbox-bom:${VERSION} is already on Maven Central — skipping publish"
+            exit 0
+          fi
+          ./gradlew publishAndReleaseToMavenCentral
+
+      - name: Rollback ledger (on failure)
+        if: failure()
+        run: |
+          cat <<'EOF' >&2
+          ::error::Maven Central publish failed. A Central release that was
+          ::error::not dropped stays unpublished but its version number is
+          ::error::burned; drop the failed release in Central's portal before
+          ::error::re-running.
+          ::error::
+          ::error::File a P0 release incident with this run link before remediating.
+          EOF
+          exit 1

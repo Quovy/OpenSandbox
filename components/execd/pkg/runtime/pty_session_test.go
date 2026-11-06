@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,9 +28,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/alibaba/opensandbox/internal/safego"
+
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
 )
 
-// replayContains polls the replay buffer until it contains substr or timeout expires.
 func replayContains(t *testing.T, s *ptySession, substr string, timeout time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -164,7 +165,6 @@ func TestPTYSession_ANSISequences(t *testing.T) {
 	defer detach()
 	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
 
-	// Send printf with explicit ESC bytes via $'\033'.
 	_, err := s.WriteStdin([]byte("printf $'\\033[1;32mGREEN\\033[0m\\n'\n"))
 	require.NoError(t, err)
 
@@ -222,7 +222,6 @@ func TestPTYSession_ReconnectReplay(t *testing.T) {
 	require.NoError(t, s.StartPTY())
 	t.Cleanup(func() { s.close() })
 
-	// First connection — drain output so replay buffer fills.
 	stdoutR1, _, detach1 := s.AttachOutput()
 	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR1) }) //nolint:errcheck
 
@@ -236,14 +235,12 @@ func TestPTYSession_ReconnectReplay(t *testing.T) {
 	detach1()
 	time.Sleep(50 * time.Millisecond)
 
-	// Reconnect — replay from offset 0 should return the same bytes we snapshotted.
 	replay, replayOff := s.replay.ReadFrom(0)
 	require.Equal(t, snapshotOff, replayOff)
 	// The new snapshot may be larger (more output arrived), but must contain snapshot.
 	require.True(t, strings.HasPrefix(string(replay), string(snapshot)) || len(replay) >= len(snapshot),
 		"replay should contain at least the original snapshot bytes")
 
-	// Second connection.
 	stdoutR2, _, detach2 := s.AttachOutput()
 	defer detach2()
 	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR2) }) //nolint:errcheck
@@ -256,7 +253,6 @@ func TestPTYSession_ReconnectReplay(t *testing.T) {
 	require.True(t, replayContains(t, s, "second_output", 5*time.Second),
 		"expected 'second_output' in replay buffer")
 
-	// Delta replay from offset-after-first should contain only new bytes.
 	newData, _ := s.replay.ReadFrom(offsetAfterFirst)
 	require.True(t, strings.Contains(string(newData), "second_output"),
 		"delta replay should contain 'second_output', got %q", string(newData))
@@ -273,7 +269,6 @@ func TestPTYSession_SendSIGINT(t *testing.T) {
 	defer detach()
 	safego.Go(func() { _, _ = io.Copy(io.Discard, stdoutR) }) //nolint:errcheck
 
-	// Start a sleep inside the PTY.
 	_, err := s.WriteStdin([]byte("sleep 30\n"))
 	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond)
@@ -281,7 +276,6 @@ func TestPTYSession_SendSIGINT(t *testing.T) {
 	// SIGINT interrupts the sleep; bash continues.
 	s.SendSignal("SIGINT")
 
-	// Bash itself should still be alive.
 	require.Eventually(t, func() bool {
 		return s.IsRunning()
 	}, 2*time.Second, 50*time.Millisecond, "bash should still be running after SIGINT")
@@ -360,7 +354,6 @@ func TestPTYSession_CustomCommand(t *testing.T) {
 	require.True(t, waitForLine(stdoutCh, "hello_command", 5*time.Second),
 		"expected 'hello_command' from custom command on stdout")
 
-	// After the command exits, the session should no longer be running.
 	require.Eventually(t, func() bool {
 		return !s.IsRunning()
 	}, 3*time.Second, 50*time.Millisecond, "session should exit after custom command completes")
@@ -388,7 +381,6 @@ func TestPTYSession_ControllerCRUD(t *testing.T) {
 	require.ErrorIs(t, c.DeletePTYSession(id), ErrContextNotFound)
 }
 
-// waitForLine reads from ch until target is found or timeout expires.
 func waitForLine(ch <-chan string, target string, timeout time.Duration) bool {
 	deadline := time.After(timeout)
 	for {
@@ -400,5 +392,142 @@ func waitForLine(ch <-chan string, target string, timeout time.Duration) bool {
 		case <-deadline:
 			return false
 		}
+	}
+}
+
+func TestPTYSessionEnvDefaultsTerm(t *testing.T) {
+	t.Setenv("EXECD_ENVS", "")
+	applyTestBinding(t, &binding.RuntimeBinding{SandboxID: "sandbox-1"})
+
+	t.Setenv("TERM", "")
+	require.Equal(
+		t,
+		[]string{"TERM=" + defaultPTYTerm},
+		terminalEntries(ptySessionEnv()),
+	)
+}
+
+func TestPTYSessionEnvKeepsExistingTerm(t *testing.T) {
+	t.Setenv("EXECD_ENVS", "")
+	applyTestBinding(t, &binding.RuntimeBinding{SandboxID: "sandbox-1"})
+
+	t.Setenv("TERM", "xterm")
+	require.Equal(t, []string{"TERM=xterm"}, terminalEntries(ptySessionEnv()))
+}
+
+func terminalEntries(env []string) []string {
+	var found []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "TERM=") {
+			found = append(found, kv)
+		}
+	}
+	return found
+}
+
+// When the shell exits, the PTY master still holds output the reader has not
+// consumed yet, e.g. because the attached client reads slowly. That output
+// must still reach the replay buffer.
+func TestPTYSession_KeepsOutputBufferedWhenShellExits(t *testing.T) {
+	requireBash(t)
+
+	const outputBytes = 600000
+	s := newPTYSession(uuidString(), "", "head -c 600000 /dev/zero | tr '\\0' a; printf END")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+
+	stdoutR, _, detach := s.AttachOutput()
+	defer detach()
+	safego.Go(func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := stdoutR.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	})
+
+	select {
+	case <-s.OutputDone():
+	case <-time.After(30 * time.Second):
+		t.Fatal("PTY output was not drained")
+	}
+	data, _ := s.replay.ReadFrom(0)
+	require.Equal(t, outputBytes+len("END"), len(data))
+	require.True(t, strings.HasSuffix(string(data), "END"))
+}
+
+// A client that is attached but stopped reading blocks the broadcast
+// goroutine; the session must still end once the shell exits.
+func TestPTYSession_EndsWhileClientStopsReading(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	select {
+	case <-s.Done():
+	case <-time.After(ptyDrainTimeout + 5*time.Second):
+		t.Fatal("session did not end after the shell exited")
+	}
+}
+
+// The shell is reaped before its output is drained, so its PID may be reused
+// meanwhile: the session must stop signalling it right away.
+func TestPTYSession_StopsSignallingOnceShellIsReaped(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	require.Eventually(t, func() bool { return !s.IsRunning() },
+		ptyDrainTimeout/2, 10*time.Millisecond,
+		"session still signalable while its output drains")
+}
+
+// Input that arrives after the shell is reaped, while its output drains, is
+// dropped as a terminal would, rather than failing the client's stdin write.
+func TestPTYSession_DropsStdinOnceShellIsReaped(t *testing.T) {
+	requireBash(t)
+
+	s := newPTYSession(uuidString(), "", "echo started")
+	require.NoError(t, s.StartPTY())
+	t.Cleanup(func() { s.close() })
+	_, _, detach := s.AttachOutput()
+	defer detach()
+
+	require.Eventually(t, func() bool { return !s.IsRunning() },
+		ptyDrainTimeout/2, 10*time.Millisecond)
+	select {
+	case <-s.Done():
+		t.Fatal("session ended before its output drained")
+	default:
+	}
+
+	// More than the tty input queue holds, so a write that reached the master
+	// would block until the drain ends and then fail.
+	line := []byte(strings.Repeat("a", 1023) + "\n")
+	written := make(chan error, 1)
+	safego.Go(func() {
+		for range 64 {
+			if _, err := s.WriteStdin(line); err != nil {
+				written <- err
+				return
+			}
+		}
+		written <- nil
+	})
+	select {
+	case err := <-written:
+		require.NoError(t, err)
+	case <-time.After(ptyDrainTimeout / 2):
+		t.Fatal("stdin write blocked while the output drained")
 	}
 }

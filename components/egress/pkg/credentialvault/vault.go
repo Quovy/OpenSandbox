@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ package credentialvault
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +27,17 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/hostselector"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmpassthrough"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 )
@@ -41,8 +48,9 @@ const (
 )
 
 var (
-	ErrNotFound = errors.New("credential vault not found")
-	ErrExists   = errors.New("credential vault already exists")
+	ErrNotFound         = errors.New("credential vault not found")
+	ErrExists           = errors.New("credential vault already exists")
+	ErrRevisionConflict = errors.New("credential vault revision conflict")
 
 	headerFieldNamePattern = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+\-.^_` + "`" + `|~]+$`)
 	hostnameLabelPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -64,25 +72,67 @@ var (
 	}
 )
 
+var activeSnapshotTagFallback atomic.Uint64
+
 type Store struct {
-	mu           sync.RWMutex
-	exists       bool
-	revision     int64
-	credentials  map[string]record
-	bindings     map[string]Binding
-	mitmGate     *mitmproxy.HealthGate
-	requireToken func() bool
-	sources      *SourceRegistry
+	mu                sync.RWMutex
+	exists            bool
+	revision          int64
+	credentials       map[string]record
+	bindings          map[string]Binding
+	activeTag         string
+	activeSnapshot    *ActiveSnapshot
+	mutationTag       string
+	mitmGate          *mitmproxy.HealthGate
+	requireToken      func() bool
+	sources           *SourceRegistry
+	strictMatch       bool
+	liveAdmission     bool
+	staticPassthrough mitmpassthrough.Config
 }
 
 type record struct {
 	Name       string
 	SourceType string
 	Source     CredentialSource
-	Revision   int64
+	// raw is the credential's source object exactly as delivered — what the
+	// internal relay GET returns so consumers can round-trip the revision.
+	raw      json.RawMessage
+	Revision int64
 }
 
 type CreateRequest struct {
+	Credentials []Credential `json:"credentials"`
+	Bindings    []Binding    `json:"bindings"`
+}
+
+// ReplaceRequest is a full-revision replace (relay PUT): the complete vault
+// JSON plus an optional revision precondition. With no vault present the
+// replace creates one. When expectedRevision is absent, Revision (the relay
+// GET's top-level field) is tolerated as the precondition, so a GET body can
+// be edited and PUT straight back; both present and differing is an error.
+type ReplaceRequest struct {
+	ExpectedRevision *int64 `json:"expectedRevision,omitempty"`
+	Revision         *int64 `json:"revision,omitempty"`
+	CreateRequest
+}
+
+// precondition resolves the effective revision precondition of a replace.
+func (req ReplaceRequest) precondition() (*int64, error) {
+	switch {
+	case req.ExpectedRevision == nil:
+		return req.Revision, nil
+	case req.Revision == nil || *req.Revision == *req.ExpectedRevision:
+		return req.ExpectedRevision, nil
+	default:
+		return nil, fmt.Errorf("ambiguous revision precondition: expectedRevision %d and revision %d differ", *req.ExpectedRevision, *req.Revision)
+	}
+}
+
+// FullRevision is the complete vault revision INCLUDING credential values —
+// the internal relay shape only (what a server-side PATCH merges against).
+type FullRevision struct {
+	Revision    int64        `json:"revision"`
 	Credentials []Credential `json:"credentials"`
 	Bindings    []Binding    `json:"bindings"`
 }
@@ -201,6 +251,14 @@ type InjectionSubstitution struct {
 	In          []string `json:"in"`
 }
 
+// NewLiveStore freezes the live runtime's static passthrough policy.
+func NewLiveStore(gate *mitmproxy.HealthGate, requireToken func() bool, config mitmpassthrough.Config) *Store {
+	store := NewStore(gate, requireToken)
+	store.liveAdmission = true
+	store.staticPassthrough = config
+	return store
+}
+
 func NewStore(mitmGate *mitmproxy.HealthGate, requireToken func() bool) *Store {
 	return NewStoreWithRegistry(mitmGate, requireToken, nil)
 }
@@ -214,9 +272,11 @@ func NewStoreWithRegistry(mitmGate *mitmproxy.HealthGate, requireToken func() bo
 	return &Store{
 		credentials:  make(map[string]record),
 		bindings:     make(map[string]Binding),
+		mutationTag:  newActiveSnapshotTag(),
 		mitmGate:     mitmGate,
 		requireToken: requireToken,
 		sources:      registry,
+		strictMatch:  constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireScopedMatch)),
 	}
 }
 
@@ -227,37 +287,40 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 		return State{}, ErrExists
 	}
 
-	credentials := make(map[string]record, len(req.Credentials))
-	bindings := make(map[string]Binding, len(req.Bindings))
-	for _, c := range req.Credentials {
-		rec, err := v.normalizeCredential(c, 1)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := credentials[rec.Name]; ok {
-			return State{}, fmt.Errorf("duplicate credential name %q", rec.Name)
-		}
-		credentials[rec.Name] = rec
-	}
-	for _, b := range req.Bindings {
-		nb, err := normalizeBinding(b)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := bindings[nb.Name]; ok {
-			return State{}, fmt.Errorf("duplicate binding name %q", nb.Name)
-		}
-		bindings[nb.Name] = nb
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
+	credentials, bindings, err := v.buildCreate(req, pol, 1)
+	if err != nil {
 		return State{}, err
 	}
-
-	v.exists = true
-	v.revision = 1
-	v.credentials = credentials
-	v.bindings = bindings
+	v.publishLocked(true, 1, credentials, bindings)
 	return v.sanitizedLocked(), nil
+}
+
+// Replace installs req as the complete vault revision: creates at revision 1
+// when no vault exists, otherwise swaps all credentials and bindings and
+// advances the revision. expectedRevision, when resolved, is the
+// create-or-replace precondition (ErrRevisionConflict on mismatch, including
+// a missing vault). Returns the sanitized state and whether it created.
+func (v *Store) Replace(req ReplaceRequest, pol *policy.NetworkPolicy) (State, bool, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	expected, err := req.precondition()
+	if err != nil {
+		return State{}, false, err
+	}
+	created := !v.exists
+	if expected != nil && (created || *expected != v.revision) {
+		return State{}, false, fmt.Errorf("%w: expectedRevision %d does not match current revision %d", ErrRevisionConflict, *expected, v.revision)
+	}
+	next := int64(1)
+	if !created {
+		next = v.revision + 1
+	}
+	credentials, bindings, err := v.buildCreate(req.CreateRequest, pol, next)
+	if err != nil {
+		return State{}, false, err
+	}
+	v.publishLocked(true, next, credentials, bindings)
+	return v.sanitizedLocked(), created, nil
 }
 
 func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, error) {
@@ -267,27 +330,36 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 		return State{}, ErrNotFound
 	}
 	if req.ExpectedRevision != nil && *req.ExpectedRevision != v.revision {
-		return State{}, fmt.Errorf("expectedRevision %d does not match current revision %d", *req.ExpectedRevision, v.revision)
+		return State{}, fmt.Errorf("%w: expectedRevision %d does not match current revision %d", ErrRevisionConflict, *req.ExpectedRevision, v.revision)
 	}
 
 	nextRevision := v.revision + 1
-	credentials := cloneCredentialRecords(v.credentials)
-	bindings := cloneCredentialBindings(v.bindings)
-
-	if err := v.applyCredentialMutations(credentials, req.Credentials, nextRevision); err != nil {
+	credentials, bindings, err := v.buildPatch(req, pol, nextRevision)
+	if err != nil {
 		return State{}, err
 	}
-	if err := applyBindingMutations(bindings, req.Bindings); err != nil {
-		return State{}, err
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
-		return State{}, err
-	}
-
-	v.revision = nextRevision
-	v.credentials = credentials
-	v.bindings = bindings
+	v.publishLocked(true, nextRevision, credentials, bindings)
 	return v.sanitizedLocked(), nil
+}
+
+// Reload installs an exact revision from durable state — the egress-restart
+// recovery path (vault file → memory at registration). The full validation
+// pipeline runs against pol; on error the store keeps its previous contents
+// and the caller treats the subject's vault as degraded. Per-credential
+// metadata revisions are not part of the file format: after a reload every
+// record carries the reloaded file revision.
+func (v *Store) Reload(revision int64, req CreateRequest, pol *policy.NetworkPolicy) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if revision < 1 {
+		return fmt.Errorf("vault reload revision %d must be positive", revision)
+	}
+	credentials, bindings, err := v.buildCreate(req, pol, revision)
+	if err != nil {
+		return err
+	}
+	v.publishLocked(true, revision, credentials, bindings)
+	return nil
 }
 
 func (v *Store) Delete() error {
@@ -296,10 +368,7 @@ func (v *Store) Delete() error {
 	if !v.exists {
 		return ErrNotFound
 	}
-	v.exists = false
-	v.revision = 0
-	v.credentials = make(map[string]record)
-	v.bindings = make(map[string]Binding)
+	v.publishLocked(false, 0, make(map[string]record), make(map[string]Binding))
 	return nil
 }
 
@@ -312,30 +381,35 @@ func (v *Store) Sanitized() (State, error) {
 	return v.sanitizedLocked(), nil
 }
 
-func (v *Store) sanitizedLocked() State {
-	state := State{
-		Revision:    v.revision,
-		Credentials: make([]Metadata, 0, len(v.credentials)),
-		Bindings:    make([]BindingMetadata, 0, len(v.bindings)),
+// Full returns the complete revision including credential values — internal
+// relay surface only; the server strips values on public reads.
+func (v *Store) Full() (FullRevision, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if !v.exists {
+		return FullRevision{}, ErrNotFound
 	}
-	for _, c := range v.credentials {
-		state.Credentials = append(state.Credentials, Metadata{
-			Name:       c.Name,
-			SourceType: c.SourceType,
-			Revision:   c.Revision,
+	full := FullRevision{
+		Revision:    v.revision,
+		Credentials: make([]Credential, 0, len(v.credentials)),
+		Bindings:    make([]Binding, 0, len(v.bindings)),
+	}
+	for _, r := range v.credentials {
+		full.Credentials = append(full.Credentials, Credential{
+			Name:   r.Name,
+			Source: append(json.RawMessage(nil), r.raw...),
 		})
 	}
 	for _, b := range v.bindings {
-		state.Bindings = append(state.Bindings, BindingMetadata{
-			Name:     b.Name,
-			Revision: v.revision,
-			Match:    b.Match,
-			Auth:     sanitizeAuth(b.Auth),
-		})
+		full.Bindings = append(full.Bindings, cloneBinding(b))
 	}
-	sort.Slice(state.Credentials, func(i, j int) bool { return state.Credentials[i].Name < state.Credentials[j].Name })
-	sort.Slice(state.Bindings, func(i, j int) bool { return state.Bindings[i].Name < state.Bindings[j].Name })
-	return state
+	sort.Slice(full.Credentials, func(i, j int) bool { return full.Credentials[i].Name < full.Credentials[j].Name })
+	sort.Slice(full.Bindings, func(i, j int) bool { return full.Bindings[i].Name < full.Bindings[j].Name })
+	return full, nil
+}
+
+func (v *Store) sanitizedLocked() State {
+	return sanitizedState(v.revision, v.credentials, v.bindings)
 }
 
 func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
@@ -343,54 +417,47 @@ func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
 }
 
 func (v *Store) ActiveSnapshotWithContext(ctx context.Context) (ActiveSnapshot, error) {
+	snapshot, _, _, err := v.ActiveSnapshotIfChanged(ctx, "")
+	return snapshot, err
+}
+
+// ActiveSnapshotIfChanged atomically compares the caller's opaque snapshot tag
+// with the active vault and renders credentials only when the tag differs.
+// The comparison and rendering share one read lock so a mutation cannot make
+// the returned revision and snapshot disagree.
+func (v *Store) ActiveSnapshotIfChanged(
+	ctx context.Context,
+	knownTag string,
+) (ActiveSnapshot, string, bool, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	if !v.exists {
-		return ActiveSnapshot{}, ErrNotFound
+		return ActiveSnapshot{}, "", false, ErrNotFound
 	}
-	snapshot := ActiveSnapshot{
-		Revision: v.revision,
-		Bindings: make([]ActiveBinding, 0, len(v.bindings)),
+	if knownTag != "" && knownTag == v.activeTag {
+		return ActiveSnapshot{Revision: v.revision}, v.activeTag, false, nil
 	}
-	redactions := make(map[string]struct{})
-	names := make([]string, 0, len(v.bindings))
-	for name := range v.bindings {
-		names = append(names, name)
+	if v.activeSnapshot != nil {
+		return cloneActiveSnapshot(*v.activeSnapshot), v.activeTag, true, nil
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		b := v.bindings[name]
-		headers, values, err := renderInjectionHeaders(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, err
-		}
-		substitutions, substitutionValues, err := renderSubstitutions(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, err
-		}
-		snapshot.Bindings = append(snapshot.Bindings, ActiveBinding{
-			Name:          b.Name,
-			Match:         b.Match,
-			Headers:       headers,
-			Substitutions: substitutions,
-		})
-		values = append(values, substitutionValues...)
-		for _, value := range values {
-			if value != "" {
-				redactions[value] = struct{}{}
-			}
-		}
+	snapshot, err := renderActiveSnapshot(ctx, v.revision, v.credentials, v.bindings)
+	if err != nil {
+		return ActiveSnapshot{}, "", false, err
 	}
-	for value := range redactions {
-		snapshot.Redactions = append(snapshot.Redactions, value)
+	return snapshot, v.activeTag, true, nil
+}
+
+func newActiveSnapshotTag() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
 	}
-	sort.Slice(snapshot.Redactions, func(i, j int) bool {
-		if len(snapshot.Redactions[i]) != len(snapshot.Redactions[j]) {
-			return len(snapshot.Redactions[i]) > len(snapshot.Redactions[j])
-		}
-		return snapshot.Redactions[i] < snapshot.Redactions[j]
-	})
-	return snapshot, nil
+	return fmt.Sprintf(
+		"fallback-%x-%x-%x",
+		os.Getpid(),
+		time.Now().UnixNano(),
+		activeSnapshotTagFallback.Add(1),
+	)
 }
 
 func (v *Store) ValidateActiveAgainstPolicy(pol *policy.NetworkPolicy) error {
@@ -443,11 +510,26 @@ func (v *Store) validateCandidate(credentials map[string]record, bindings map[st
 }
 
 func (v *Store) validateBindingPolicy(b Binding, pol *policy.NetworkPolicy) error {
+	if v.liveAdmission && slices.Contains(b.Match.Schemes, "https") {
+		for _, host := range b.Match.Hosts {
+			// Match the snapshot's exclusion of wildcards with an empty DNS language.
+			if strings.HasPrefix(host, "*.") && len(host[2:]) > 251 {
+				continue
+			}
+			selector, err := hostselector.ParseCanonical(host)
+			if err != nil {
+				return fmt.Errorf("binding %q host %q: invalid credential TLS selector: %w", b.Name, host, err)
+			}
+			if v.staticPassthrough.Overlaps(selector) {
+				return fmt.Errorf("binding %q host %q: credential TLS binding overlaps static passthrough", b.Name, host)
+			}
+		}
+	}
 	for _, host := range b.Match.Hosts {
 		if !explicitAllowCoversHost(pol, host) {
 			return fmt.Errorf("binding %q host %q is not allowed by egress policy", b.Name, host)
 		}
-		if bindingHostMatchesIgnoreHosts(host) {
+		if !v.liveAdmission && bindingHostMatchesIgnoreHosts(host) {
 			return fmt.Errorf("binding %q host %q matches mitmproxy ignore_hosts", b.Name, host)
 		}
 	}
@@ -459,14 +541,16 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 	if name == "" {
 		return record{}, fmt.Errorf("credential name cannot be blank")
 	}
-	source, err := v.sources.Create(c.Source)
+	raw := append(json.RawMessage(nil), c.Source...)
+	source, err := v.sources.Create(raw)
 	if err != nil {
 		return record{}, fmt.Errorf("credential %q: %w", name, err)
 	}
-	return record{Name: name, SourceType: source.Type(), Source: source, Revision: revision}, nil
+	return record{Name: name, SourceType: source.Type(), Source: source, raw: raw, Revision: revision}, nil
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	b = cloneBinding(b)
 	b.Name = strings.TrimSpace(b.Name)
 	if b.Name == "" {
 		return Binding{}, fmt.Errorf("binding name cannot be blank")
@@ -478,6 +562,29 @@ func normalizeBinding(b Binding) (Binding, error) {
 		return Binding{}, fmt.Errorf("binding %q: %w", b.Name, err)
 	}
 	return b, nil
+}
+
+func (v *Store) normalizeBinding(b Binding) (Binding, error) {
+	methodsExplicit := len(b.Match.Methods) > 0
+	pathsExplicit := len(b.Match.Paths) > 0
+	normalized, err := normalizeBinding(b)
+	if err != nil {
+		return Binding{}, err
+	}
+	if v.strictMatch {
+		if !methodsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.methods must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		if !pathsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.paths must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		for _, path := range normalized.Match.Paths {
+			if path == "/*" {
+				return Binding{}, fmt.Errorf("binding %q: match.paths must not contain /* when scoped-match enforcement is enabled", normalized.Name)
+			}
+		}
+	}
+	return normalized, nil
 }
 
 func normalizeMatch(m *Match) error {
@@ -887,7 +994,7 @@ func (v *Store) applyCredentialMutations(credentials map[string]record, mutation
 	return nil
 }
 
-func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
+func (v *Store) applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
 	if mutations == nil {
 		return nil
 	}
@@ -907,7 +1014,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 		delete(bindings, name)
 	}
 	for _, raw := range mutations.Replace {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}
@@ -922,7 +1029,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 	}
 	addSeen := make(map[string]struct{})
 	for _, raw := range mutations.Add {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}
@@ -952,7 +1059,7 @@ func cloneCredentialRecords(in map[string]record) map[string]record {
 func cloneCredentialBindings(in map[string]Binding) map[string]Binding {
 	out := make(map[string]Binding, len(in))
 	for k, v := range in {
-		out[k] = v
+		out[k] = cloneBinding(v)
 	}
 	return out
 }
@@ -1248,7 +1355,7 @@ func WriteError(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, ErrExists):
 		http.Error(w, err.Error(), http.StatusConflict)
-	case strings.Contains(err.Error(), "expectedRevision"):
+	case errors.Is(err, ErrRevisionConflict):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default:
 		http.Error(w, err.Error(), http.StatusBadRequest)

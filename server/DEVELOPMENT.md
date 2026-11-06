@@ -23,7 +23,7 @@ level = "DEBUG"
 
 [runtime]
 type = "docker"
-execd_image = "opensandbox/execd:v1.0.22"
+execd_image = "opensandbox/execd:v1.1.0"
 
 [docker]
 network_mode = "bridge"
@@ -42,6 +42,21 @@ uv run pyright                                   # type check
 uv run pytest --cov=opensandbox_server --cov-report=term  # with coverage
 ```
 
+### FastPath stub regeneration
+
+The gRPC stubs under `opensandbox_server/services/fast_sandbox/generated/` are generated from the fast-sandbox repo's `api/proto/v2/fastpath.proto`. Regenerate them after fast-sandbox proto changes (version must match `grpcio-tools` in `pyproject.toml` — currently protobuf Python 7.35.x / grpcio 1.83.x):
+
+```bash
+# from the server/ directory; <proto-dir> holds fastpath.proto
+uv run python -m grpc_tools.protoc \
+  -I <proto-dir> \
+  --python_out=opensandbox_server/services/fast_sandbox/generated \
+  --grpc_python_out=opensandbox_server/services/fast_sandbox/generated \
+  <proto-dir>/fastpath.proto
+```
+
+Then post-process both files to match the checked-in style: prepend the pyright banner (`# pyright: reportAttributeAccessIssue=false` + "protobuf-generated modules expose dynamic attributes.") and rewrite the grpc module's `import fastpath_pb2 as fastpath__pb2` to `from . import fastpath_pb2 as fastpath__pb2` (relative import).
+
 ## Architecture
 
 Layered architecture:
@@ -57,12 +72,12 @@ Layered architecture:
 Client → POST /sandboxes
   → Auth Middleware validates API key
   → lifecycle.create_sandbox() receives CreateSandboxRequest
-  → sandbox_service.create_sandbox_async(request)
-  → Returns 202 Accepted with Pending status immediately
-  → Background thread provisions the sandbox
+  → await sandbox_service.create_sandbox(request)
+  → Runtime provisions the sandbox and waits for readiness
+  → Returns 202 Accepted with Running status
 ```
 
-Async provisioning avoids blocking API requests during slow operations (image pull, container start). Sandbox stored in pending state first, transitions to running when ready.
+Creation is synchronous from the client's perspective: the request remains open while the runtime provisions the sandbox. Docker moves blocking provisioning work to a worker thread but awaits its result; Kubernetes waits for the workload to be Running with an IP address. Provisioning failures are returned by the create request rather than a background Pending-to-Running flow.
 
 ### Expiration System
 

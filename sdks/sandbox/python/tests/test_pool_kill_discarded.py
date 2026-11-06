@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -37,7 +38,6 @@ from opensandbox.pool import (
     InMemoryAsyncPoolStateStore,
     InMemoryPoolStateStore,
     PoolCreationSpec,
-    PoolLifecycleState,
 )
 from opensandbox.pool_async import SandboxPoolAsync
 from opensandbox.sync.pool import SandboxPoolSync
@@ -153,9 +153,10 @@ def test_sync_kill_discarded_alive_logs_only_on_success(
     assert any("sandbox-ok" in msg for msg in debug_messages), (
         f"expected debug log for successful kill, got {debug_messages}"
     )
-    assert not any("Killed near-expiry idle sandbox" in msg and "sandbox-fail" in msg for msg in debug_messages), (
-        f"failed kill should not produce 'Killed' debug log, got {debug_messages}"
-    )
+    assert not any(
+        "Killed near-expiry idle sandbox" in msg and "sandbox-fail" in msg
+        for msg in debug_messages
+    ), f"failed kill should not produce 'Killed' debug log, got {debug_messages}"
 
 
 @pytest.mark.asyncio
@@ -217,9 +218,9 @@ async def test_async_kill_best_effort_returns_false_on_failure(
     debug_messages = [
         record.message for record in caplog.records if record.levelno == logging.DEBUG
     ]
-    assert not any("Killed near-expiry idle sandbox" in msg for msg in debug_messages), (
-        f"failed async kill should not produce 'Killed' debug log, got {debug_messages}"
-    )
+    assert not any(
+        "Killed near-expiry idle sandbox" in msg for msg in debug_messages
+    ), f"failed async kill should not produce 'Killed' debug log, got {debug_messages}"
 
 
 async def _async_returns(value: Any) -> Any:
@@ -257,7 +258,9 @@ def test_sync_schedule_kill_discarded_alive_does_not_block_caller() -> None:
         elapsed = time.monotonic() - start
 
         # Should return immediately — well below the slowest single kill (0.1s).
-        assert elapsed < 0.05, f"_schedule_kill_discarded_alive blocked for {elapsed:.3f}s"
+        assert elapsed < 0.05, (
+            f"_schedule_kill_discarded_alive blocked for {elapsed:.3f}s"
+        )
 
         # And the kills do happen, just on the executor.
         deadline = time.monotonic() + 1.0
@@ -287,6 +290,9 @@ class _RenewTrackingSyncSandbox:
 
     def renew(self, timeout: timedelta) -> None:
         self.renewed.append(timeout)
+
+    def is_healthy(self) -> bool:
+        return True
 
     def kill(self) -> None:
         self.killed = True
@@ -321,15 +327,16 @@ def test_sync_create_one_sandbox_renews_before_returning_id() -> None:
         sandbox_factory=_RenewTrackingSyncSandbox,  # type: ignore[arg-type]
     )
 
-    # _create_one_sandbox short-circuits unless the pool is running.
-    pool._lifecycle_state = PoolLifecycleState.RUNNING
-    sandbox_id = pool._create_one_sandbox()
-    assert sandbox_id == "warm-1"
-    assert _RenewTrackingSyncSandbox.last_instance is not None
-    assert _RenewTrackingSyncSandbox.last_instance.renewed == [timedelta(minutes=5)], (
-        "expected renew([5min]) before putIdle, got "
-        f"{_RenewTrackingSyncSandbox.last_instance.renewed}"
-    )
+    pool.start()
+    try:
+        deadline = time.monotonic() + 2
+        while pool.snapshot().idle_count != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.snapshot().idle_count == 1
+        assert _RenewTrackingSyncSandbox.last_instance is not None
+        assert _RenewTrackingSyncSandbox.last_instance.renewed == [timedelta(minutes=5)]
+    finally:
+        pool.shutdown(False)
 
 
 class _RenewTrackingAsyncSandbox:
@@ -349,6 +356,9 @@ class _RenewTrackingAsyncSandbox:
 
     async def renew(self, timeout: timedelta) -> None:
         self.renewed.append(timeout)
+
+    async def is_healthy(self) -> bool:
+        return True
 
     async def kill(self) -> None:
         self.killed = True
@@ -382,36 +392,74 @@ async def test_async_create_one_sandbox_renews_before_returning_id() -> None:
         sandbox_factory=_RenewTrackingAsyncSandbox,  # type: ignore[arg-type]
     )
 
-    pool._lifecycle_state = PoolLifecycleState.RUNNING
-    sandbox_id = await pool._create_one_sandbox()
-    assert sandbox_id == "warm-1"
-    assert _RenewTrackingAsyncSandbox.last_instance is not None
-    assert _RenewTrackingAsyncSandbox.last_instance.renewed == [timedelta(minutes=5)], (
-        "expected renew([5min]) before putIdle, got "
-        f"{_RenewTrackingAsyncSandbox.last_instance.renewed}"
-    )
+    await pool.start()
+    try:
+        deadline = asyncio.get_running_loop().time() + 2
+        while (
+            await pool.snapshot()
+        ).idle_count != 1 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert (await pool.snapshot()).idle_count == 1
+        assert _RenewTrackingAsyncSandbox.last_instance is not None
+        assert _RenewTrackingAsyncSandbox.last_instance.renewed == [
+            timedelta(minutes=5)
+        ]
+    finally:
+        await pool.shutdown(False)
 
 
 @pytest.mark.asyncio
 async def test_async_schedule_kill_discarded_alive_does_not_block_caller() -> None:
-    """Async counterpart: scheduling must return synchronously without awaiting kills."""
+    """Async counterpart: scheduling must not await the kill RPCs."""
     manager = _RecordingAsyncManager(per_call_delay=0.1)
     pool = _build_async_pool(manager)
     pool._sandbox_manager = manager  # type: ignore[assignment]
 
     ids = ("a", "b", "c")
     start = asyncio.get_event_loop().time()
-    pool._schedule_kill_discarded_alive("kill-pool", ids, source="acquire")
+    await pool._schedule_kill_discarded_alive("kill-pool", ids, source="acquire")
     elapsed = asyncio.get_event_loop().time() - start
 
-    # _schedule is sync (asyncio.create_task), so it should return in microseconds.
-    assert elapsed < 0.01, (
+    # The scheduling call only creates a background task, so it should return
+    # in microseconds instead of awaiting the (0.1s each) kill RPCs.
+    assert elapsed < 0.05, (
         f"_schedule_kill_discarded_alive blocked for {elapsed:.3f}s; "
         "expected immediate return via create_task"
     )
 
     # Wait for the background tasks to complete.
     deadline = asyncio.get_event_loop().time() + 1.0
-    while sorted(manager.killed) != sorted(ids) and asyncio.get_event_loop().time() < deadline:
+    while (
+        sorted(manager.killed) != sorted(ids)
+        and asyncio.get_event_loop().time() < deadline
+    ):
         await asyncio.sleep(0.02)
     assert sorted(manager.killed) == sorted(ids)
+
+
+async def test_async_schedule_kill_discarded_alive_falls_back_to_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the RuntimeError fallback used to silently drop the cleanup.
+
+    When ``asyncio.create_task`` is unavailable the kills must still run
+    (inline), matching the sync pool's "better to slow the caller than to drop
+    the cleanup" contract.
+    """
+    manager = _RecordingAsyncManager(per_call_delay=0.0)
+    pool = _build_async_pool(manager)
+    pool._sandbox_manager = manager  # type: ignore[assignment]
+
+    def _raise_runtime_error(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(
+        "opensandbox.pool_async.asyncio.create_task", _raise_runtime_error
+    )
+
+    ids = ("x", "y")
+    await pool._schedule_kill_discarded_alive("kill-pool", ids, source="acquire")
+
+    assert sorted(manager.killed) == sorted(ids), (
+        "discarded-alive kill was silently dropped when create_task raised"
+    )

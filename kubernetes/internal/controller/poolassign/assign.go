@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,31 +26,40 @@ type Predicate interface {
 	Predicate(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool) bool
 }
 
-// PredicateWithReason extends Predicate with rejection diagnostics.
-type PredicateWithReason interface {
+// predicateWithReason extends predicate with rejection diagnostics.
+type predicateWithReason interface {
 	Predicate
 	Reason(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool) string
 }
 
-type Scorer interface {
+// predicateWithFailureCode exposes a stable identifier for a rejected predicate.
+type predicateWithFailureCode interface {
+	Predicate
+	FailureCode() string
+}
+
+const FailureCodeCapacityExhausted = "PoolCapacityExhausted"
+
+type scorer interface {
 	Score(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pool *sandboxv1alpha1.Pool) float64
 }
 
-type Assigner interface {
+type assigner interface {
 	AssignPool(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, pools []*sandboxv1alpha1.Pool) (string, error)
 }
 
-// PoolRejection records why a specific pool was rejected during assignment.
-type PoolRejection struct {
-	PoolName string
-	Reasons  []string
+// poolRejection records why a specific pool was rejected during assignment.
+type poolRejection struct {
+	PoolName     string
+	Reasons      []string
+	FailureCodes []string
 }
 
 // NoEligiblePoolError is returned when no pool passes all predicates.
 type NoEligiblePoolError struct {
 	SandboxName string
 	TotalPools  int
-	Rejections  []PoolRejection
+	Rejections  []poolRejection
 }
 
 func (e *NoEligiblePoolError) Error() string {
@@ -60,4 +69,17 @@ func (e *NoEligiblePoolError) Error() string {
 		fmt.Fprintf(&sb, "\n  %s: %s", r.PoolName, strings.Join(r.Reasons, "; "))
 	}
 	return sb.String()
+}
+
+// CapacityExhausted reports whether at least one Pool matched every predicate
+// except capacity. Pools that also fail image, resource, label, or node
+// predicates do not make the assignment a capacity failure.
+func (e *NoEligiblePoolError) CapacityExhausted() bool {
+	for _, rejection := range e.Rejections {
+		if len(rejection.FailureCodes) == 1 &&
+			rejection.FailureCodes[0] == FailureCodeCapacityExhausted {
+			return true
+		}
+	}
+	return false
 }

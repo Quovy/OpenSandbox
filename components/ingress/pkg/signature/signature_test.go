@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -129,11 +129,11 @@ func TestVerifySignature_ExpiryComparisonAvoidsUint64Overflow(t *testing.T) {
 	assert.NoError(t, v.VerifySignature(sig, sb, port, exp))
 }
 
-func TestHTTPStatusForErr(t *testing.T) {
-	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForErr(fmt.Errorf("%w: x", ErrUnauthorized)))
-	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForErr(ErrAccessExpired))
-	assert.Equal(t, http.StatusBadRequest, HTTPStatusForErr(fmt.Errorf("bad format")))
-	assert.Equal(t, 0, HTTPStatusForErr(nil))
+func TestHTTPStatusForIngressErr(t *testing.T) {
+	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(fmt.Errorf("%w: x", ErrUnauthorized)))
+	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrAccessExpired))
+	assert.Equal(t, http.StatusBadRequest, HTTPStatusForIngressErr(fmt.Errorf("bad format")))
+	assert.Equal(t, 0, HTTPStatusForIngressErr(nil))
 	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrSecureHeaderMismatch))
 	assert.Equal(t, http.StatusUnauthorized, HTTPStatusForIngressErr(ErrSignatureRequired))
 	assert.Equal(t, http.StatusServiceUnavailable, HTTPStatusForIngressErr(ErrVerifierNotConfigured))

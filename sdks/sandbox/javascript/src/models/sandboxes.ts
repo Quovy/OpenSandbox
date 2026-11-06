@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,17 +50,23 @@ export type ResourceLimits = Record<string, string>;
 
 export type NetworkRuleAction = "allow" | "deny";
 
-export interface NetworkRule extends Record<string, unknown> {
-  /**
-   * Whether to allow or deny matching targets.
-   */
-  action: NetworkRuleAction;
-  /**
-   * FQDN or wildcard domain (e.g., "example.com", "*.example.com").
-   * IP/CIDR is not supported in the egress MVP.
-   */
-  target: string;
-}
+/**
+ * An egress rule: `target`, `ports`, or both. The union encodes that
+ * invariant at compile time (`target` used to be required).
+ *
+ * - `target`: FQDN, wildcard domain ("*.example.com"), IP, or CIDR.
+ * - `ports`: TCP destination ports (each 1-65535, at least one, at most 256
+ *   per rule — enforced server-side). Without a target the rule applies
+ *   across all IPv4/IPv6 destinations, but under `defaultAction: deny` the
+ *   DNS proxy only matches domain rules, so hostname lookups still fail —
+ *   this shape serves direct-IP clients.
+ * - A domain `target` combined with `ports` is rejected (domain rules have
+ *   no port dimension).
+ */
+export type NetworkRule = (
+  | { action: NetworkRuleAction; target: string; ports?: number[] }
+  | { action: NetworkRuleAction; target?: string; ports: number[] }
+) & Record<string, unknown>;
 
 export interface NetworkPolicy extends Record<string, unknown> {
   /**
@@ -426,6 +432,24 @@ export interface SandboxStatus extends Record<string, unknown> {
   message?: string;
 }
 
+/**
+ * Current runtime-confirmed Pool allocation for a sandbox.
+ */
+export interface AllocationSummary extends Record<string, unknown> {
+  /**
+   * Confirmed allocation mode.
+   */
+  mode: "pool";
+  /**
+   * Concrete Pool reference currently allocated to the sandbox.
+   */
+  poolRef: string;
+  /**
+   * Current confirmed allocation state.
+   */
+  state: "allocated";
+}
+
 export interface SandboxInfo extends Record<string, unknown> {
   id: SandboxId;
   image?: ImageSpec;
@@ -436,6 +460,10 @@ export interface SandboxInfo extends Record<string, unknown> {
   extensions?: Record<string, string>;
   status: SandboxStatus;
   /**
+   * Current runtime-confirmed Pool allocation, when available.
+   */
+  allocation?: AllocationSummary;
+  /**
    * Sandbox creation time.
    */
   createdAt: Date;
@@ -443,6 +471,108 @@ export interface SandboxInfo extends Record<string, unknown> {
    * Sandbox expiration time (server-side TTL).
    */
   expiresAt: Date | null;
+}
+
+export interface LifecycleHook extends Record<string, unknown> {
+  /** Command and arguments executed without implicit shell expansion. */
+  command: string[];
+  /** Maximum execution time in seconds, up to 3 hours (10800 seconds). Defaults to 60. */
+  timeoutSeconds?: number;
+}
+
+export interface PeriodicLifecycleHook extends Record<string, unknown> {
+  /** Name unique among periodic hooks in this sandbox. */
+  name: string;
+  /** Five-field cron expression or descriptor such as `@hourly` or `@every 30s`. */
+  schedule: string;
+  /** Command and arguments executed without implicit shell expansion. */
+  command: string[];
+  /** Maximum execution time in seconds, up to 300. Defaults to 60. */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Application-declared activity probe (OSEP-0024).
+ *
+ * Endpoint inside the sandbox that answers `{"active": bool, "message"?: string}`
+ * with 200 while work is in progress. When the sandbox is otherwise idle, the
+ * server issues `GET {path}` on `{port}`; a busy answer counts as activity and
+ * resets the idle clock, while an explicit "not active", any failure, or a
+ * timeout records nothing.
+ */
+export interface ActivityProbe extends Record<string, unknown> {
+  /** Sandbox port serving the probe endpoint. */
+  port: number;
+  /**
+   * Absolute HTTP path of the probe endpoint. Must start with `/` and must not
+   * contain whitespace or control characters.
+   */
+  path: string;
+  /** Probe request budget in seconds (1-10). Defaults to 2. */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Idle behavior declared by the sandbox (OSEP-0024, fast-sandbox only).
+ *
+ * With `idleTimeoutSeconds`, the sandbox is auto-paused after that many seconds
+ * without ingress-observed activity. Without it, the policy is wake-only: the
+ * sandbox is never auto-paused, but a (manually) paused sandbox wakes on access.
+ * Omitting the whole policy preserves non-automated behavior exactly.
+ */
+export interface IdlePolicy extends Record<string, unknown> {
+  /**
+   * Idle threshold X in seconds (30-86400): the sandbox is auto-paused after X
+   * continuously idle seconds. Required together with `onIdle`; absent together
+   * with it means a wake-only policy.
+   */
+  idleTimeoutSeconds?: number;
+  /**
+   * Action taken at the idle threshold. Only `pause` exists today. Required
+   * with, and only valid with, `idleTimeoutSeconds`.
+   */
+  onIdle?: "pause";
+  /** Whether incoming traffic may wake the sandbox from `Paused`. Defaults to true. */
+  wakeOnAccess?: boolean;
+  /** Application-declared activity probe (relevant only with auto-pause). */
+  activeProbe?: ActivityProbe;
+}
+
+/**
+ * Renew-on-access behavior (OSEP-0009): observed access moves the expiration
+ * to `max(now + extendSeconds, current)`. Control-plane policy; supersedes the
+ * deprecated `extensions["access.renew.extend.seconds"]` key.
+ */
+export interface RenewalPolicy extends Record<string, unknown> {
+  /**
+   * Extension window X in seconds (300-86400) for each access-driven renewal.
+   */
+  extendSeconds: number;
+}
+
+/** Extensible container for sandbox lifecycle configuration. */
+export interface SandboxLifecycle extends Record<string, unknown> {
+  /**
+   * Runs after execd is ready and before the user entrypoint on every container
+   * start. A failed or timed-out hook prevents the user entrypoint from starting.
+   */
+  preStart?: LifecycleHook;
+  /**
+   * Scheduled hooks run while the sandbox is running. Runs of the same named hook
+   * never overlap; a scheduled run is skipped while its previous run is active.
+   */
+  periodic?: PeriodicLifecycleHook[];
+  /**
+   * Auto-pause and wake-on-access behavior (OSEP-0024). Supported only by the
+   * fast-sandbox backend; other backends reject the field. Control-plane
+   * policy: it never reaches the guest.
+   */
+  idlePolicy?: IdlePolicy;
+  /**
+   * Renew-on-access behavior (OSEP-0009). Control-plane policy; supersedes
+   * the deprecated `extensions["access.renew.extend.seconds"]` key.
+   */
+  renewalPolicy?: RenewalPolicy;
 }
 
 export interface CreateSandboxRequest extends Record<string, unknown> {
@@ -462,6 +592,7 @@ export interface CreateSandboxRequest extends Record<string, unknown> {
   resourceRequests?: ResourceLimits;
   env?: Record<string, string>;
   metadata?: Record<string, string>;
+  lifecycle?: SandboxLifecycle;
   /**
    * Optional outbound network policy for the sandbox.
    */
@@ -475,6 +606,35 @@ export interface CreateSandboxRequest extends Record<string, unknown> {
    */
   volumes?: Volume[];
   extensions?: Record<string, unknown>;
+}
+
+export interface CreateSandboxFromTemplateRequest extends Record<string, unknown> {
+  /**
+   * Succeeded fsb template to create the sandbox from.
+   *
+   * Template mode fixes the workload shape on the server: only metadata,
+   * network policy, extensions and the idle policy may accompany the template
+   * id, and the timeout is required.
+   */
+  templateId: string;
+  /**
+   * Sandbox timeout in seconds (server semantics). Required in template mode.
+   */
+  timeout: number;
+  metadata?: Record<string, string>;
+  /**
+   * Optional outbound network policy for the sandbox.
+   */
+  networkPolicy?: NetworkPolicy;
+  /**
+   * Optional idle behavior (OSEP-0024, fast-sandbox only). Control-plane
+   * state, not workload shape, so template mode accepts it.
+   */
+  idlePolicy?: IdlePolicy;
+  /**
+   * Opaque extension parameters passed through to the server as-is.
+   */
+  extensions?: Record<string, string>;
 }
 
 export interface CreateSandboxResponse extends Record<string, unknown> {
@@ -553,6 +713,37 @@ export interface Endpoint extends Record<string, unknown> {
    * (e.g. when the server requires them for routing or auth). Omit or empty if not required.
    */
   headers?: Record<string, string>;
+  /**
+   * Origin of the sandbox taken from the server's `OPEN-SANDBOX-ORIGIN`
+   * response header (see {@link SandboxOrigin}). Omitted when the server
+   * does not send it.
+   */
+  origin?: string;
+}
+
+/**
+ * Origin backing a sandbox.
+ *
+ * The protocol defines a single origin value: `template` (reported by the
+ * server via the `OPEN-SANDBOX-ORIGIN` response header, and set locally when
+ * the sandbox was explicitly created from a template). Anything else -
+ * including sandboxes created from an image or a snapshot - is `unknown`.
+ *
+ * The server may introduce new values in future versions; treat a missing or
+ * unknown value as "not template-backed" and keep using the egress sidecar.
+ */
+export enum SandboxOrigin {
+  /**
+   * Runs on a fsb golden-image template (no sandbox-side egress sidecar;
+   * egress policy and the Credential Vault go through the lifecycle
+   * control plane).
+   */
+  TEMPLATE = "template",
+  /**
+   * The origin could not be determined (create from an image or snapshot,
+   * or an older server that does not send the header).
+   */
+  UNKNOWN = "unknown",
 }
 
 export interface ListSandboxesParams {

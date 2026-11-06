@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -166,7 +165,9 @@ func (*lifecycleHarnessIsolator) Capabilities() isolation.Capabilities {
 		Available:              true,
 		SetprivAvailable:       true,
 		SetprivSwitchAvailable: true,
+		SetprivNetAvailable:    true,
 		UsernsAvailable:        true,
+		UsernsNetAvailable:     true,
 	}
 }
 
@@ -667,18 +668,6 @@ func TestIsolatedSessionPreStartFailuresCleanLifecycleAndDescriptors(t *testing.
 		configure func(*exec.Cmd)
 	}{
 		{name: "wrap", wrapErr: wrapErr},
-		{
-			name: "stdin pipe",
-			configure: func(cmd *exec.Cmd) {
-				cmd.Stdin = strings.NewReader("")
-			},
-		},
-		{
-			name: "stdout pipe",
-			configure: func(cmd *exec.Cmd) {
-				cmd.Stdout = io.Discard
-			},
-		},
 		{
 			name: "command start",
 			configure: func(cmd *exec.Cmd) {

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,28 +15,16 @@
 package utils
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
-
-const (
-	prometheusOperatorVersion = "v0.77.1"
-	prometheusOperatorURL     = "https://github.com/prometheus-operator/prometheus-operator/" +
-		"releases/download/%s/bundle.yaml"
-
-	certmanagerVersion = "v1.16.3"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
-)
-
-func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
-}
 
 // Run executes the provided command within this context
 func Run(cmd *exec.Cmd) (string, error) {
@@ -58,111 +46,6 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// InstallPrometheusOperator installs the prometheus Operator to be used to export the enabled metrics.
-func InstallPrometheusOperator() error {
-	url := fmt.Sprintf(prometheusOperatorURL, prometheusOperatorVersion)
-	cmd := exec.Command("kubectl", "create", "-f", url)
-	_, err := Run(cmd)
-	return err
-}
-
-// UninstallPrometheusOperator uninstalls the prometheus
-func UninstallPrometheusOperator() {
-	url := fmt.Sprintf(prometheusOperatorURL, prometheusOperatorVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
-	}
-}
-
-// IsPrometheusCRDsInstalled checks if any Prometheus CRDs are installed
-// by verifying the existence of key CRDs related to Prometheus.
-func IsPrometheusCRDsInstalled() bool {
-	// List of common Prometheus CRDs
-	prometheusCRDs := []string{
-		"prometheuses.monitoring.coreos.com",
-		"prometheusrules.monitoring.coreos.com",
-		"prometheusagents.monitoring.coreos.com",
-	}
-
-	cmd := exec.Command("kubectl", "get", "crds", "-o", "custom-columns=NAME:.metadata.name")
-	output, err := Run(cmd)
-	if err != nil {
-		return false
-	}
-	crdList := GetNonEmptyLines(output)
-	for _, crd := range prometheusCRDs {
-		for _, line := range crdList {
-			if strings.Contains(line, crd) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
-	}
-}
-
-// InstallCertManager installs the cert manager bundle.
-func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		return err
-	}
-	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
-	// was re-installed after uninstalling on a cluster.
-	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
-		"--for", "condition=Available",
-		"--namespace", "cert-manager",
-		"--timeout", "5m",
-	)
-
-	_, err := Run(cmd)
-	return err
-}
-
-// IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
-// by verifying the existence of key CRDs related to Cert Manager.
-func IsCertManagerCRDsInstalled() bool {
-	// List of common Cert Manager CRDs
-	certManagerCRDs := []string{
-		"certificates.cert-manager.io",
-		"issuers.cert-manager.io",
-		"clusterissuers.cert-manager.io",
-		"certificaterequests.cert-manager.io",
-		"orders.acme.cert-manager.io",
-		"challenges.acme.cert-manager.io",
-	}
-
-	// Execute the kubectl command to get all CRDs
-	cmd := exec.Command("kubectl", "get", "crds")
-	output, err := Run(cmd)
-	if err != nil {
-		return false
-	}
-
-	// Check if any of the Cert Manager CRDs are present
-	crdList := GetNonEmptyLines(output)
-	for _, crd := range certManagerCRDs {
-		for _, line := range crdList {
-			if strings.Contains(line, crd) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
 // LoadImageToKindClusterWithName loads a local docker image to the kind cluster.
 // When E2E_MODE is not "kind" this is a no-op: the image is expected to live in
 // a registry the target cluster can pull from, so there is no Kind node to
@@ -179,6 +62,100 @@ func LoadImageToKindClusterWithName(name string) error {
 	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
 	cmd := exec.Command("kind", kindOptions...)
 	_, err := Run(cmd)
+	return err
+}
+
+// LocalDockerPlatform returns the "linux/<arch>" platform string matching the
+// local docker daemon (and therefore the kind node architecture). It falls
+// back to the test binary architecture when the daemon cannot be queried.
+func LocalDockerPlatform() string {
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Arch}}").Output()
+	if err == nil {
+		if arch := strings.TrimSpace(string(out)); arch != "" {
+			return "linux/" + arch
+		}
+	}
+	return "linux/" + runtime.GOARCH
+}
+
+// PullImageWithPlatform pulls <name> pinned to the local daemon platform so
+// only the architecture the kind node runs on is downloaded.
+func PullImageWithPlatform(name string) error {
+	cmd := exec.Command("docker", "pull", "--platform", LocalDockerPlatform(), name)
+	_, err := Run(cmd)
+	return err
+}
+
+// LoadPulledImageToKindClusterWithName imports a pulled docker image into the
+// kind node via ctr, because "kind load" fails on single-platform pulls
+// (kubernetes-sigs/kind#4255).
+//
+// The archive must be saved with "docker save --platform": a plain
+// "docker save" of an image pulled from a multi-arch tag exports an OCI
+// archive whose index nests the full manifest list, referencing platforms
+// whose blobs were never pulled. containerd 1.x kind nodes (v1.22/v1.28)
+// fetch every manifest reachable from that nested index while unpacking and
+// fail with "content digest ...: not found"; containerd 2.x nodes filter
+// platforms correctly, which is why only some K8s matrix jobs failed.
+// --digests is intentionally omitted: docker's attestation manifests have no
+// name annotation and unpacking them fails on containerd 1.x with "no
+// processor for media-type application/vnd.in-toto+json", so without
+// --digests ctr simply skips creating records for them.
+func LoadPulledImageToKindClusterWithName(name string) error {
+	if IsExternal() {
+		_, _ = fmt.Fprintf(GinkgoWriter, "skipping image import for %q (E2E_MODE=%s)\n", name, Mode())
+		return nil
+	}
+	cluster := "kind"
+	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
+		cluster = v
+	}
+	node := fmt.Sprintf("%s-control-plane", cluster)
+
+	// runImport streams the saved archive into the node's containerd and
+	// returns an error describing which side failed.
+	runImport := func(saveArgs []string) error {
+		importCmd := exec.Command("docker", "exec", "--privileged", "-i", node,
+			"ctr", "--namespace=k8s.io", "images", "import", "--snapshotter=overlayfs", "-")
+		importErrBuf := &bytes.Buffer{}
+		importCmd.Stderr = importErrBuf
+
+		saveCmd := exec.Command("docker", saveArgs...)
+		saveErrBuf := &bytes.Buffer{}
+		saveCmd.Stderr = saveErrBuf
+
+		pipeReader, pipeWriter := io.Pipe()
+		saveCmd.Stdout = pipeWriter
+		importCmd.Stdin = pipeReader
+
+		var importErr error
+		importDone := make(chan struct{})
+		go func() {
+			defer close(importDone)
+			importErr = importCmd.Run()
+		}()
+
+		saveErr := saveCmd.Run()
+		_ = pipeWriter.Close()
+		<-importDone
+		_ = pipeReader.Close()
+
+		if saveErr != nil {
+			return fmt.Errorf("%q failed with error %q: %w", strings.Join(saveArgs, " "), strings.TrimSpace(saveErrBuf.String()), saveErr)
+		}
+		if importErr != nil {
+			return fmt.Errorf("%q failed with error %q: %w", strings.Join(importCmd.Args, " "), strings.TrimSpace(importErrBuf.String()), importErr)
+		}
+		return nil
+	}
+
+	// Flatten the archive to a single platform so containerd 1.x nodes can
+	// import it. Fall back to a full save on docker versions without
+	// "save --platform" (< 27.5).
+	err := runImport([]string{"save", "--platform", LocalDockerPlatform(), name})
+	if err != nil && strings.Contains(err.Error(), "unknown flag") {
+		err = runImport([]string{"save", name})
+	}
 	return err
 }
 
@@ -204,56 +181,4 @@ func GetProjectDir() (string, error) {
 	}
 	wd = strings.ReplaceAll(wd, "/test/e2e", "")
 	return wd, nil
-}
-
-// UncommentCode searches for target in the file and remove the comment prefix
-// of the target content. The target content may span multiple lines.
-func UncommentCode(filename, target, prefix string) error {
-	// false positive
-	// nolint:gosec
-	content, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("failed to read file %q: %w", filename, err)
-	}
-	strContent := string(content)
-
-	idx := strings.Index(strContent, target)
-	if idx < 0 {
-		return fmt.Errorf("unable to find the code %q to be uncomment", target)
-	}
-
-	out := new(bytes.Buffer)
-	_, err = out.Write(content[:idx])
-	if err != nil {
-		return fmt.Errorf("failed to write to output: %w", err)
-	}
-
-	scanner := bufio.NewScanner(bytes.NewBufferString(target))
-	if !scanner.Scan() {
-		return nil
-	}
-	for {
-		if _, err = out.WriteString(strings.TrimPrefix(scanner.Text(), prefix)); err != nil {
-			return fmt.Errorf("failed to write to output: %w", err)
-		}
-		// Avoid writing a newline in case the previous line was the last in target.
-		if !scanner.Scan() {
-			break
-		}
-		if _, err = out.WriteString("\n"); err != nil {
-			return fmt.Errorf("failed to write to output: %w", err)
-		}
-	}
-
-	if _, err = out.Write(content[idx+len(target):]); err != nil {
-		return fmt.Errorf("failed to write to output: %w", err)
-	}
-
-	// false positive
-	// nolint:gosec
-	if err = os.WriteFile(filename, out.Bytes(), 0644); err != nil {
-		return fmt.Errorf("failed to write file %q: %w", filename, err)
-	}
-
-	return nil
 }

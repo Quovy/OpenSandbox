@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import (
 	"testing"
 )
 
-// requireBash skips the test when bash is not on PATH.
 func requireBash(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("bash"); err != nil {

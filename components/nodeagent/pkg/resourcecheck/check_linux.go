@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/config"
 	"golang.org/x/sys/unix"
 )
@@ -36,15 +37,17 @@ func validateHost(cfg config.Config) error {
 	} else if limit.Cur < 1024 {
 		errs = append(errs, fmt.Errorf("file-descriptor soft limit %d is below 1024", limit.Cur))
 	}
-	for path, minimum := range map[string]uint64{
-		"/proc/sys/fs/inotify/max_user_instances": 16,
-		"/proc/sys/fs/inotify/max_user_watches":   1024,
-	} {
-		value, err := readUint(path)
-		if err != nil {
-			errs = append(errs, err)
-		} else if value < minimum {
-			errs = append(errs, fmt.Errorf("%s=%d is below required reserve %d", path, value, minimum))
+	if cfg.HasSource(api.SourceNameContainerLogs) {
+		for path, minimum := range map[string]uint64{
+			"/proc/sys/fs/inotify/max_user_instances": 16,
+			"/proc/sys/fs/inotify/max_user_watches":   1024,
+		} {
+			value, err := readUint(path)
+			if err != nil {
+				errs = append(errs, err)
+			} else if value < minimum {
+				errs = append(errs, fmt.Errorf("%s=%d is below required reserve %d", path, value, minimum))
+			}
 		}
 	}
 	if err := checkDiskReserve(cfg.StateDir, reserveFor(cfg.StateMaxBytes)); err != nil {
@@ -87,6 +90,10 @@ func checkDiskReserve(path string, reserve uint64) error {
 	return nil
 }
 
+// reserveFor derives the disk reserve required before accepting a byte
+// budget: 5% of the limit, clamped to [16 MiB, 256 MiB], so a small state
+// directory still keeps headroom and a huge budget never withholds too much
+// of the disk from other workloads.
 func reserveFor(limit int64) uint64 {
 	reserve := uint64(limit / 20)
 	if reserve < 16<<20 {

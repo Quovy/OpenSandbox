@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,13 @@ using openapi-python-client, which generates httpx-based async clients
 that support custom httpx.AsyncClient injection.
 """
 
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-APACHE_2_LICENSE_HEADER = """#\n# Copyright 2026 Alibaba Group Holding Ltd.\n#\n# Licensed under the Apache License, Version 2.0 (the "License");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an "AS IS" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n"""
+APACHE_2_LICENSE_HEADER = """#\n# Copyright 2026 The OpenSandbox Authors\n#\n# Licensed under the Apache License, Version 2.0 (the "License");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an "AS IS" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n"""
 
 
 def run_command(cmd: list[str], description: str) -> subprocess.CompletedProcess:
@@ -304,9 +305,95 @@ def add_license_headers(root: Path) -> None:
 
 
 
+def post_process_execd_filesystem(root: Path) -> None:
+    """Keep filesystem generation aligned with base-URL identity routing."""
+    # Identity clients reuse the ordinary operations with a scoped base URL.
+    # Avoid shipping duplicate operations that are not used by the adapters.
+    identity_operations = root / "api/filesystem_identity"
+    if identity_operations.exists():
+        shutil.rmtree(identity_operations)
+
+    # Execd returns an empty 200 body unless verbose is supported and enabled.
+    # Preserve this compatibility fix whenever the transport is regenerated.
+    replace_operation = root / "api/filesystem/replace_content.py"
+    if replace_operation.exists():
+        content = replace_operation.read_text(encoding="utf-8")
+        branch = "    if response.status_code == 200:\n"
+        guarded_branch = branch + "        if not response.content:\n            return None\n"
+        if guarded_branch not in content:
+            if branch not in content:
+                raise ValueError("Generated replace_content has no expected 200 response branch")
+            replace_operation.write_text(content.replace(branch, guarded_branch, 1), encoding="utf-8")
+
+
+_ERROR_RESPONSE_PARSE = re.compile(
+    r"^(    if response\.status_code == (\d{3}):\n)"
+    r"        (response_\2 = ErrorResponse\.from_dict\(response\.json\(\)\))\n",
+    re.MULTILINE,
+)
+
+
+def tolerate_unparsable_error_bodies(root: Path) -> None:
+    """Leave error bodies that are not an ErrorResponse unparsed.
+
+    A gateway or proxy can answer with an HTML, plain-text or empty body. The
+    generated parser would raise while decoding it, and the SDK would report
+    that as an invalid argument without the status code. Returning ``None``
+    lets ``handle_api_error`` raise ``SandboxApiException`` with the status and
+    the raw body instead.
+    """
+    replacement = (
+        r"\1        try:\n"
+        r"            \3\n"
+        r"        except (ValueError, TypeError, KeyError):\n"
+        r"            return None\n"
+    )
+    for path in root.rglob("*.py"):
+        content = path.read_text(encoding="utf-8")
+        updated = _ERROR_RESPONSE_PARSE.sub(replacement, content)
+        if updated != content:
+            path.write_text(updated, encoding="utf-8")
+
+
+def redact_credential_reprs() -> None:
+    """Keep write-only credential values out of generated-model reprs.
+
+    attrs synthesizes ``__repr__`` over any class-level definition, so a
+    module-level override is appended instead: ``InlineCredentialSource.value``
+    is write-only material and must never surface in logs, exception messages
+    (pydantic/attrs reprs included), or debug output.
+    """
+    redaction = (
+        "\n\n"
+        "# Redacted repr: the credential value is write-only and must never\n"
+        "# surface in logs, exception messages, or debug output. attrs would\n"
+        "# overwrite a class-level __repr__, so the override is applied on the\n"
+        "# class object after definition.\n"
+        "def _redacted_repr(self: InlineCredentialSource) -> str:\n"
+        '    return f"{type(self).__name__}(value=***)"\n'
+        "\n\n"
+        "InlineCredentialSource.__repr__ = _redacted_repr  # type: ignore[method-assign]\n"
+    )
+    for rel in (
+        "src/opensandbox/api/lifecycle/models/inline_credential_source.py",
+        "src/opensandbox/api/egress/models/inline_credential_source.py",
+    ):
+        path = Path(rel)
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8")
+        if "_redacted_repr" in content:
+            continue
+        path.write_text(content.rstrip("\n") + "\n" + redaction, encoding="utf-8")
+        print(f"✅ Redacted credential repr in {rel}")
+
+
 def post_process_generated_code() -> None:
     """Post-process the generated code to ensure proper package structure."""
     print("\n🔧 Post-processing generated code...")
+    post_process_execd_filesystem(Path("src/opensandbox/api/execd"))
+    redact_credential_reprs()
+    tolerate_unparsable_error_bodies(Path("src/opensandbox/api"))
 
     # Ensure API directory has __init__.py
     api_dir = Path("src/opensandbox/api")

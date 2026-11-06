@@ -41,6 +41,7 @@ When multi-tenancy is active:
 3. Sandbox lifecycle operations (create/list/get/delete) use the resolved namespace.
 4. List operations only return sandboxes within the authenticated tenant's namespace.
 5. Proxy routes (`/sandboxes/{id}/proxy/...`) also require `OPEN-SANDBOX-API-KEY` in multi-tenant mode.
+6. Create stamps `opensandbox.io/tenant=<name>` on the workload. When several tenants share one namespace, list/get/delete/proxy hide other tenants' labeled sandboxes (`404`). Unlabeled legacy sandboxes stay visible until they expire.
 
 ## Configuration
 
@@ -136,6 +137,10 @@ Response (401):
 
 The HTTP provider caches results per key using the server-suggested `ttl`. On TTL expiry it re-fetches synchronously. If the endpoint is unreachable, stale entries are served up to `max_stale_seconds`, after which requests fail with 503.
 
+::: warning HTTP provider skips startup namespace validation
+The HTTP provider resolves tenants per API key and cannot enumerate all tenants at startup, so the fail-fast namespace check is skipped for it (a warning is logged instead). The file provider, which loads the full `tenants.toml` at startup, still fails fast when any tenant namespace is missing or inaccessible. With the HTTP provider, ensure namespaces exist and are accessible before issuing tenant API keys.
+:::
+
 ## Namespace Setup
 
 Before onboarding a tenant, the cluster admin must prepare the target namespace.
@@ -163,6 +168,17 @@ spec:
     pods: "20"
 ```
 
+#### Quota exhaustion behavior
+
+When the namespace quota is exhausted, `POST /v1/sandboxes` fails fast with `403 KUBERNETES::QUOTA_EXCEEDED` instead of waiting for the sandbox-creation timeout and returning `KUBERNETES::POD_READY_TIMEOUT`:
+
+- **Count quotas** (`count/sandboxes.agents.x-k8s.io`): the Sandbox create is rejected by Kubernetes admission immediately.
+- **Compute quotas** (`requests.cpu`, `requests.memory`, `pods`): the Sandbox is created, but its Pod cannot be admitted; the server surfaces the rejection from the workload status (`ReconcilerError`) as soon as the controller records it (typically within a second).
+
+The response body uses the standard `ErrorResponse` shape, and `message` carries the Kubernetes admission details, e.g. `exceeded quota: tenant-quota, requested: requests.cpu=1, used: requests.cpu=8, limited: requests.cpu=8`. SDK clients surface this as a typed error with HTTP status 403. Raise the quota or free capacity, then retry — no server restart is needed.
+
+This fail-fast contract currently applies to the `agent-sandbox` workload provider (`[kubernetes] workload_provider = "agent-sandbox"`). With the default `batchsandbox` provider, the controller does not yet propagate admission rejections onto the CR status, so quota exhaustion still waits for the sandbox creation timeout and returns `KUBERNETES::POD_READY_TIMEOUT`.
+
 ### 3. LimitRange (recommended)
 
 ```yaml
@@ -181,6 +197,21 @@ spec:
       memory: 512Mi
     type: Container
 ```
+
+The `Container` defaults apply to every container that omits the corresponding resource setting, including the OpenSandbox egress sidecar. Configure smaller, sidecar-specific values in the lifecycle server so egress containers do not inherit defaults intended for sandbox workloads.
+
+### 4. Egress sidecar resources (recommended)
+
+Add Kubernetes resource settings to the server's `[egress]` configuration:
+
+```toml
+[egress]
+image = "opensandbox/egress:v1.1.7"
+requests = { cpu = "25m", memory = "64Mi" }
+limits = { cpu = "250m", memory = "256Mi" }
+```
+
+Requests and limits can be configured independently. These values are a starting point for basic DNS/nft enforcement; benchmark your workload and allow more headroom when using Credential Vault or transparent mitmproxy. If your `LimitRange` defines minimum values, the egress settings must satisfy them.
 
 ### 5. Server RBAC
 

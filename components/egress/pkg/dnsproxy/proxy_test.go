@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,12 @@
 package dnsproxy
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,11 +125,72 @@ func TestForwardAddsEDNS0BufferSize(t *testing.T) {
 	query := new(dns.Msg)
 	query.SetQuestion("example.com.", dns.TypeA)
 
-	resp, failure, err := proxy.forward(query)
+	resp, failure, err := proxy.forward(query, "udp")
 	require.NoError(t, err)
 	require.Empty(t, failure, "a successful forward must not report a failure reason")
 	require.Len(t, resp.Answer, 1)
 	require.Equal(t, uint16(4096), <-seen)
+}
+
+func TestResolveDomain(t *testing.T) {
+	t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+	resetNameserverExemptCache(t)
+	t.Cleanup(func() { resetNameserverExemptCache(t) })
+	for _, outcome := range []string{"success", "servfail", "truncated", "negative", "mixed-negative", "timeout"} {
+		t.Run(outcome, func(t *testing.T) {
+			conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			server := &dns.Server{PacketConn: conn, Handler: dns.HandlerFunc(func(writer dns.ResponseWriter, query *dns.Msg) {
+				response := new(dns.Msg)
+				response.SetReply(query)
+				if outcome == "negative" {
+					response.Rcode = dns.RcodeNameError
+				} else if query.Question[0].Qtype == dns.TypeA {
+					response.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 40}, A: net.ParseIP("192.0.2.1")}}
+				} else {
+					switch outcome {
+					case "success":
+						response.Answer = []dns.RR{&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 50}, AAAA: net.ParseIP("2001:db8::1")}}
+					case "servfail":
+						response.Rcode = dns.RcodeServerFailure
+					case "truncated":
+						response.Truncated = true
+					case "mixed-negative":
+						response.Rcode = dns.RcodeNameError
+					case "timeout":
+						return
+					}
+				}
+				_ = writer.WriteMsg(response)
+			})}
+			ready := make(chan struct{})
+			server.NotifyStartedFunc = func() { close(ready) }
+			go func() { _ = server.ActivateAndServe() }()
+			t.Cleanup(func() { _ = server.Shutdown() })
+			<-ready
+			proxy := &Proxy{upstreams: []string{conn.LocalAddr().String()}, upstreamExchangeTimeout: 5 * time.Second}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			started := time.Now()
+			ips, err := proxy.ResolveDomain(ctx, "example.com")
+			require.Less(t, time.Since(started), 2*time.Second, "caller deadline must bound upstream exchange")
+			switch outcome {
+			case "success":
+				require.NoError(t, err)
+				require.Equal(t, []nftables.ResolvedIP{
+					{Addr: netip.MustParseAddr("192.0.2.1"), TTL: 40 * time.Second},
+					{Addr: netip.MustParseAddr("2001:db8::1"), TTL: 50 * time.Second},
+				}, ips)
+			case "negative":
+				require.NoError(t, err)
+				require.Empty(t, ips)
+			default:
+				require.Error(t, err)
+				require.Empty(t, ips, "partial A results must not renew after AAAA fails")
+			}
+		})
+	}
 }
 
 // A failed lookup has to be classifiable: serveDNS turns the reason into the
@@ -136,7 +202,7 @@ func TestForwardClassifiesFailures(t *testing.T) {
 		query := new(dns.Msg)
 		query.SetQuestion("example.com.", dns.TypeA)
 
-		resp, failure, err := proxy.forward(query)
+		resp, failure, err := proxy.forward(query, "udp")
 
 		require.Error(t, err)
 		require.Nil(t, resp)
@@ -158,7 +224,7 @@ func TestForwardClassifiesFailures(t *testing.T) {
 		query := new(dns.Msg)
 		query.SetQuestion("example.com.", dns.TypeA)
 
-		resp, failure, err := proxy.forward(query)
+		resp, failure, err := proxy.forward(query, "udp")
 
 		require.Error(t, err)
 		require.Nil(t, resp)
@@ -195,7 +261,7 @@ func TestForwardClassifiesFailures(t *testing.T) {
 		query := new(dns.Msg)
 		query.SetQuestion("example.com.", dns.TypeA)
 
-		resp, failure, err := proxy.forward(query)
+		resp, failure, err := proxy.forward(query, "udp")
 
 		require.Error(t, err, "SERVFAIL from the only upstream must exhaust the chain")
 		require.Nil(t, resp)
@@ -203,23 +269,90 @@ func TestForwardClassifiesFailures(t *testing.T) {
 	})
 }
 
+// failingRespWriter records every reply attempt and always fails the write, so
+// the serveDNS stages can be exercised end to end on their error path.
+type failingRespWriter struct {
+	fakeRespWriter
+	attempts int
+}
+
+func (w *failingRespWriter) WriteMsg(m *dns.Msg) error {
+	w.attempts++
+	return errors.New("simulated reply write failure")
+}
+
+// newFailingWriter returns a writer whose replies always fail, seen from ip.
+func newFailingWriter(ip string) *failingRespWriter {
+	return &failingRespWriter{fakeRespWriter: fakeRespWriter{remote: addrFromIP(ip)}}
+}
+
+// A handled query whose reply write fails used to be indistinguishable from an
+// unhandled one: every WriteMsg error in serveDNS was swallowed (issue #1704).
+// writeReply must attempt the write exactly once on every decision stage so the
+// failure is observable instead of silently lost.
+func TestServeDNSReplyWriteFailuresAreSurfaced(t *testing.T) {
+	newQuery := func() *dns.Msg {
+		q := new(dns.Msg)
+		q.SetQuestion("example.com.", dns.TypeA)
+		return q
+	}
+
+	t.Run("deny", func(t *testing.T) {
+		proxy := &Proxy{
+			effectivePolicy: policy.DefaultDenyPolicy(),
+			userPolicy:      policy.DefaultDenyPolicy(),
+		}
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "deny reply must be attempted exactly once")
+	})
+
+	t.Run("unknown source", func(t *testing.T) {
+		proxy := &Proxy{
+			effectivePolicy: policy.DefaultDenyPolicy(),
+			userPolicy:      policy.DefaultDenyPolicy(),
+		}
+		proxy.SetQueryPolicySelector(func(netip.Addr) (*QueryPolicy, string) { return nil, "" })
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "fail-closed reply must be attempted exactly once")
+	})
+
+	t.Run("upstream error", func(t *testing.T) {
+		// Exempt loopback so the dialer skips SO_MARK (see TestForwardClassifiesFailures).
+		t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+		resetNameserverExemptCache(t)
+
+		proxy := &Proxy{
+			upstreams:               []string{"127.0.0.1:1"},
+			activeUpstreams:         []string{"127.0.0.1:1"},
+			upstreamExchangeTimeout: 200 * time.Millisecond,
+		}
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "SERVFAIL reply must be attempted exactly once")
+	})
+
+	t.Run("answer after allow decision", func(t *testing.T) {
+		proxy := selectorProxy(t)
+		allowPol, err := policy.ParsePolicy(`{"defaultAction":"deny","egress":[{"action":"allow","target":"example.com"}]}`)
+		require.NoError(t, err)
+		proxy.SetQueryPolicySelector(func(netip.Addr) (*QueryPolicy, string) {
+			return &QueryPolicy{Policy: allowPol}, ""
+		})
+		w := newFailingWriter("10.0.0.9")
+		proxy.serveDNS(w, newQuery())
+		require.Equal(t, 1, w.attempts, "answer reply must be attempted exactly once")
+	})
+}
+
 func TestSetOnResolved(t *testing.T) {
 	proxy, err := New(policy.DefaultDenyPolicy(), "", nil, nil)
 	require.NoError(t, err)
-	var called bool
-	var capturedDomain string
-	var capturedIPs []nftables.ResolvedIP
-	proxy.SetOnResolved(func(domain string, ips []nftables.ResolvedIP) {
-		called = true
-		capturedDomain = domain
-		capturedIPs = ips
-	})
+	proxy.SetOnResolved(func(_ string, _ []nftables.ResolvedIP) {})
 	require.NotNil(t, proxy.onResolved, "SetOnResolved did not set callback")
 	proxy.SetOnResolved(nil)
 	require.Nil(t, proxy.onResolved, "SetOnResolved(nil) did not clear callback")
-	_ = called
-	_ = capturedDomain
-	_ = capturedIPs
 }
 
 func TestMaybeNotifyResolved_CallsCallbackWhenAOrAAAA(t *testing.T) {
@@ -313,4 +446,91 @@ func TestProxyShouldSkipOutboundLog_ClearedByEmptyList(t *testing.T) {
 	p.SetLogSkip(nil)
 	require.False(t, p.shouldSkipOutboundLog("metadata.internal"),
 		"clearing the list must re-enable logging for all hosts")
+}
+
+// startLargeAnswerUpstream serves the same answer set over UDP and TCP on one
+// port. Over UDP it truncates to the client's EDNS0 size, as resolvers do.
+func startLargeAnswerUpstream(t *testing.T, records int) string {
+	t.Helper()
+	t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+	resetNameserverExemptCache(t)
+
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		resp := new(dns.Msg)
+		resp.SetReply(r)
+		for i := range records {
+			resp.Answer = append(resp.Answer, &dns.TXT{
+				Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
+				Txt: []string{fmt.Sprintf("record-%03d-%s", i, strings.Repeat("x", 40))},
+			})
+		}
+		if _, udp := w.RemoteAddr().(*net.UDPAddr); udp {
+			size := uint16(dns.MinMsgSize)
+			if opt := r.IsEdns0(); opt != nil {
+				size = opt.UDPSize()
+			}
+			resp.Truncate(int(size))
+		}
+		_ = w.WriteMsg(resp)
+	})
+
+	packetConn, listener := listenUDPAndTCPOnOnePort(t)
+	for _, server := range []*dns.Server{
+		{PacketConn: packetConn, Handler: handler},
+		{Listener: listener, Handler: handler},
+	} {
+		started := make(chan struct{})
+		server.NotifyStartedFunc = func() { close(started) }
+		go func() { _ = server.ActivateAndServe() }()
+		t.Cleanup(func() { _ = server.Shutdown() })
+		<-started
+	}
+	return packetConn.LocalAddr().String()
+}
+
+// listenUDPAndTCPOnOnePort binds UDP and TCP on the same free port, retrying
+// when the TCP side of the port the UDP socket got is already taken.
+func listenUDPAndTCPOnOnePort(t *testing.T) (net.PacketConn, net.Listener) {
+	t.Helper()
+	for range 10 {
+		packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		listener, err := net.Listen("tcp", packetConn.LocalAddr().String())
+		if err == nil {
+			return packetConn, listener
+		}
+		_ = packetConn.Close()
+	}
+	t.Fatal("no port free for both UDP and TCP")
+	return nil, nil
+}
+
+// A client retries over TCP after a truncated UDP answer; that retry must
+// reach the upstream over TCP too, or the answer stays truncated.
+func TestServeDNSForwardsTCPQueriesOverTCP(t *testing.T) {
+	t.Cleanup(func() { resetNameserverExemptCache(t) })
+	const records = 100
+	upstream := startLargeAnswerUpstream(t, records)
+	allow, err := policy.ParsePolicy(`{"defaultAction":"deny","egress":[{"action":"allow","target":"big.example.com"}]}`)
+	require.NoError(t, err)
+	proxy := &Proxy{
+		upstreams:               []string{upstream},
+		activeUpstreams:         []string{upstream},
+		upstreamExchangeTimeout: time.Second,
+		effectivePolicy:         allow,
+		userPolicy:              allow,
+	}
+	query := new(dns.Msg)
+	query.SetQuestion("big.example.com.", dns.TypeTXT)
+
+	udpClient := &fakeRespWriter{remote: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 5353}}
+	proxy.serveDNS(udpClient, query)
+	require.Len(t, udpClient.msgs, 1)
+	require.True(t, udpClient.msgs[0].Truncated, "a UDP client gets the truncated answer and retries over TCP")
+
+	tcpClient := &fakeRespWriter{remote: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 5353}}
+	proxy.serveDNS(tcpClient, query)
+	require.Len(t, tcpClient.msgs, 1)
+	require.False(t, tcpClient.msgs[0].Truncated)
+	require.Len(t, tcpClient.msgs[0].Answer, records)
 }

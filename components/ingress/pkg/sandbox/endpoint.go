@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,28 @@
 
 package sandbox
 
+import (
+	"net/http"
+	"time"
+)
+
 // EndpointInfo is the single lookup result used by ingress routing.
 type EndpointInfo struct {
 	// Endpoint is the resolved upstream endpoint (IP/FQDN) for this sandbox.
 	Endpoint string
+
+	// UpstreamURL is a complete provider-supplied route including scheme,
+	// authority, and optional base path. Empty selects the legacy Endpoint+port
+	// behavior used by Kubernetes providers.
+	UpstreamURL string
+
+	// UpstreamHeaders are injected only after caller-supplied values with the
+	// same names have been removed. Consumers must treat this map as read-only;
+	// provider cache entries may share it with returned EndpointInfo copies.
+	UpstreamHeaders http.Header
+
+	// ExpiresAt bounds provider caches for short-lived upstream credentials.
+	ExpiresAt time.Time
 
 	// SecureAccessToken is the trimmed annotation opensandbox.io/secure-access-token value.
 	// Empty means secure access is not required.

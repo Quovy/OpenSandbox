@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,22 +59,6 @@ type Options struct {
 	Compress bool
 	// ZapOptions are additional zap options
 	ZapOptions zap.Options
-}
-
-// DefaultOptions returns default logger options
-func DefaultOptions() Options {
-	return Options{
-		Development:      false,
-		EnableFileOutput: false,
-		LogFilePath:      "/var/log/sandbox-controller/controller.log",
-		MaxSize:          100,  // 100MB
-		MaxBackups:       10,   // keep 10 old log files
-		MaxAge:           30,   // keep log files for 30 days
-		Compress:         true, // compress rotated files
-		ZapOptions: zap.Options{
-			Development: false,
-		},
-	}
 }
 
 // NewLoggerWithZapOptions creates a logger using controller-runtime's zap options

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -152,7 +152,7 @@ func TestNewEvictionHandler(t *testing.T) {
 		pool := &sandboxv1alpha1.Pool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   "pool-2",
-				Labels: map[string]string{LabelEvictionHandler: "unknown-handler"},
+				Labels: map[string]string{labelEvictionHandler: "unknown-handler"},
 			},
 		}
 		h := NewEvictionHandler(ctx, c, pool)

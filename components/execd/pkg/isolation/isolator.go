@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package isolation
 import (
 	"context"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 // Profile presets default isolation settings.
@@ -28,7 +30,6 @@ const (
 	ProfileBalanced Profile = "balanced"
 )
 
-// Valid reports whether p is a known profile name.
 func (p Profile) Valid() bool {
 	return p == ProfileStrict || p == ProfileBalanced
 }
@@ -43,7 +44,6 @@ const (
 	WorkspaceRO      WorkspaceMode = "ro"
 )
 
-// Valid reports whether m is a known workspace mode.
 func (m WorkspaceMode) Valid() bool {
 	return m == WorkspaceRW || m == WorkspaceOverlay || m == WorkspaceRO
 }
@@ -57,7 +57,6 @@ const (
 	EnvModeAllow EnvMode = "allow"
 )
 
-// Valid reports whether m is a known env passthrough mode.
 func (m EnvMode) Valid() bool {
 	return m == EnvModeDeny || m == EnvModeAllow
 }
@@ -78,17 +77,29 @@ const (
 	UidModeUserns UidMode = "userns"
 )
 
-// Valid reports whether m is a known uid mode.
 func (m UidMode) Valid() bool {
 	return m == UidModeSetpriv || m == UidModeUserns
 }
 
-// Structs
-
-// WorkspaceSpec describes a workspace directory and how it is mounted.
-type WorkspaceSpec struct {
+// OverlaySpec describes one mount destination inside the isolated namespace.
+// A WrapOptions carries one or more overlays; bubblewrap processes mounts in
+// argv order and a later mount shadows earlier ones in its subtree, so a
+// nested overlay (e.g. /workspace on top of a / root overlay) takes effect
+// at its own path.
+type OverlaySpec struct {
+	// Path is the mount destination inside the namespace. Required and
+	// absolute; duplicates across overlays are rejected.
 	Path string
+	// Mode controls how the path is mounted: rw (direct bind), ro
+	// (read-only bind), or overlay (copy-on-write).
 	Mode WorkspaceMode
+	// UpperDir is the host upper directory for overlay mode. Empty means an
+	// ephemeral tmpfs upper (the API-level persist=false). Ignored for
+	// rw/ro modes.
+	UpperDir string
+	// WorkDir is the host work directory for overlay mode. Empty defaults to
+	// UpperDir + "-work". Must be empty when UpperDir is empty.
+	WorkDir string
 }
 
 // EnvSpec controls environment variable passthrough into the namespace.
@@ -112,11 +123,19 @@ type Capabilities struct {
 	Available        bool
 	Isolator         string
 	Version          string
+	Message          string
 	SetprivAvailable bool
 	// SetprivSwitchAvailable is used internally to reject a setpriv
 	// request that selects IDs different from execd's own before side effects.
 	SetprivSwitchAvailable bool
 	UsernsAvailable        bool
+	// SetprivNetAvailable / UsernsNetAvailable report whether the uid mode
+	// can also create the private network namespace required by share_net=
+	// false (bwrap --unshare-net; its loopback setup needs CAP_NET_ADMIN in
+	// the setpriv mode). Runtime rejects such requests with a named error
+	// before starting bwrap when the mode's flag is false.
+	SetprivNetAvailable    bool
+	UsernsNetAvailable     bool
 	Profiles               []Profile
 	AllowedWorkspaces      []string
 	AllowedExtraWritable   []string
@@ -132,19 +151,33 @@ type Capabilities struct {
 
 // WrapOptions configures a single isolated execution.
 type WrapOptions struct {
-	Profile        Profile
-	Workspace      WorkspaceSpec
-	ExtraWritable  []string
-	Binds          []BindMount
+	Profile       Profile
+	Overlays      []OverlaySpec
+	ExtraWritable []string
+	Binds         []BindMount
+	// TmpDir is the session-private /tmp backing dir (absolute host path),
+	// bound to the namespace /tmp in place of the profile's segment. Empty
+	// keeps the profile default.
+	TmpDir         string
 	ShareNet       bool
 	EnvPassthrough EnvSpec
 	Uid, Gid       *uint32
 	UidMode        UidMode // "" or "setpriv" → setpriv; "userns" → user namespace
-	UpperDir       string  // empty when upper is on tmpfs (persist disabled)
-	WorkDir        string
 }
 
-// Interface
+// OverlaysCoverPath reports whether any overlay mounts over path, either
+// at path itself or at one of its ancestors: bubblewrap applies mounts in
+// argv order and a later shallower mount shadows the subtree of any earlier
+// segment, so an ancestor overlay already provides path.
+func OverlaysCoverPath(overlays []OverlaySpec, path string) bool {
+	for _, ov := range overlays {
+		p := filepath.Clean(ov.Path)
+		if p == path || p == "/" || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
 
 // Isolator wraps an *exec.Cmd in a namespace-isolated execution environment.
 type Isolator interface {

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ so multiple container runtimes (docker, kubernetes, etc.) can reuse them.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -30,7 +31,12 @@ from opensandbox_server.api.schema import Endpoint, Sandbox, SandboxFilter
 from opensandbox_server.services.constants import (
     ALLOWED_EGRESS_ENV_VARS,
     EGRESS_ENV_PREFIX,
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY,
+    OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH,
     OPEN_SANDBOX_INGRESS_HEADER,
 )
 from opensandbox_server.config import (
@@ -38,6 +44,8 @@ from opensandbox_server.config import (
     GATEWAY_ROUTE_MODE_URI,
     GATEWAY_ROUTE_MODE_WILDCARD,
     INGRESS_MODE_GATEWAY,
+    EgressConfig,
+    EgressUpstreamProxyConfig,
     IngressConfig,
 )
 
@@ -68,13 +76,13 @@ def parse_memory_limit(value: Optional[str]) -> Optional[int]:
         return None
     match = MEMORY_PATTERN.match(value)
     if not match:
-        logger.warning("Invalid memory limit format '%s'; ignoring.", value)
+        logger.warning(f"Invalid memory limit format '{value}'; ignoring.")
         return None
     amount = int(match.group(1))
     unit = (match.group(2) or "").lower()
     multiplier = MEMORY_MULTIPLIERS.get(unit)
     if not multiplier:
-        logger.warning("Unsupported memory unit '%s'; ignoring.", unit)
+        logger.warning(f"Unsupported memory unit '{unit}'; ignoring.")
         return None
     return amount * multiplier
 
@@ -90,12 +98,23 @@ def parse_nano_cpus(value: Optional[str]) -> Optional[int]:
         else:
             cpus = float(cpu_str)
     except ValueError:
-        logger.warning("Invalid CPU limit format '%s'; ignoring.", value)
+        logger.warning(f"Invalid CPU limit format '{value}'; ignoring.")
+        return None
+    if not math.isfinite(cpus):
+        logger.warning(f"CPU limit must be finite. Got '{value}'. Ignoring.")
         return None
     if cpus <= 0:
-        logger.warning("CPU limit must be positive. Got '%s'. Ignoring.", value)
+        logger.warning(f"CPU limit must be positive. Got '{value}'. Ignoring.")
         return None
-    return int(cpus * 1_000_000_000)
+    nano_cpus = cpus * 1_000_000_000
+    if not math.isfinite(nano_cpus):
+        logger.warning(f"CPU limit is too large. Got '{value}'. Ignoring.")
+        return None
+    nano_cpus = int(nano_cpus)
+    if nano_cpus > (1 << 63) - 1:
+        logger.warning(f"CPU limit is too large. Got '{value}'. Ignoring.")
+        return None
+    return nano_cpus
 
 
 def parse_gpu_request(value: Optional[str]) -> Optional[int]:
@@ -115,10 +134,10 @@ def parse_gpu_request(value: Optional[str]) -> Optional[int]:
     try:
         count = int(gpu_str)
     except ValueError:
-        logger.warning("Invalid GPU limit format '%s'; ignoring.", value)
+        logger.warning(f"Invalid GPU limit format '{value}'; ignoring.")
         return None
     if count <= 0:
-        logger.warning("GPU limit must be positive. Got '%s'. Ignoring.", value)
+        logger.warning(f"GPU limit must be positive. Got '{value}'. Ignoring.")
         return None
     return count
 
@@ -127,9 +146,10 @@ def parse_timestamp(timestamp: Optional[str]) -> datetime:
     """
     Parse RFC3339 timestamp into timezone-aware datetime. Fallback to now.
 
-    Docker often returns RFC3339Nano (up to 9 fractional digits). Python's
-    datetime.fromisoformat only supports microseconds (6 digits), so we
-    truncate the fractional part to 6 digits before parsing.
+    Docker often returns RFC3339Nano (up to 9 fractional digits, trailing
+    zeros dropped). Python 3.10's datetime.fromisoformat only accepts 3 or 6
+    fractional digits, so we truncate or pad the fractional part to 6 digits
+    before parsing.
     """
     if not timestamp or timestamp == "0001-01-01T00:00:00Z":
         return datetime.now(timezone.utc)
@@ -153,12 +173,12 @@ def parse_timestamp(timestamp: Optional[str]) -> datetime:
             frac = rest[:tz_sep]
             tz = rest[tz_sep:]
         frac = frac[:6]  # truncate to microseconds precision
-        normalized = f"{main}.{frac}{tz}" if frac else f"{main}{tz}"
+        normalized = f"{main}.{frac:0<6}{tz}" if frac else f"{main}{tz}"
 
     try:
         return datetime.fromisoformat(normalized)
     except ValueError:
-        logger.warning("Invalid timestamp '%s'; defaulting to current time.", timestamp)
+        logger.warning(f"Invalid timestamp '{timestamp}'; defaulting to current time.")
         return datetime.now(timezone.utc)
 
 
@@ -267,6 +287,70 @@ def split_egress_env(
     return sandbox_env, egress_env
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+    """Mirror the egress component's constants.IsTruthy."""
+    return bool(value) and value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def upstream_proxy_egress_env(
+    upstream_proxy: Optional[EgressUpstreamProxyConfig],
+) -> Dict[str, str]:
+    """Env entries injected into the egress sidecar for the configured
+    [egress.upstream_proxy]. Empty when no upstream proxy is configured."""
+    if upstream_proxy is None:
+        return {}
+    env = {OPENSANDBOX_EGRESS_UPSTREAM_PROXY: upstream_proxy.url}
+    if upstream_proxy.authorization is not None:
+        env[OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH] = (
+            upstream_proxy.authorization.get_secret_value()
+        )
+    if (
+        upstream_proxy.ca_cert_path is not None
+        or upstream_proxy.ca_secret_name is not None
+    ):
+        env[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA] = (
+            EGRESS_UPSTREAM_EXTRA_CA_PATH
+        )
+    return env
+
+
+def validate_upstream_proxy_request(
+    egress_config: Optional[EgressConfig],
+    *,
+    has_network_policy: bool,
+    credential_proxy_enabled: bool,
+    egress_env: Dict[str, Optional[str]],
+) -> None:
+    """Reject create requests that cannot be chained through the configured
+    [egress.upstream_proxy].
+
+    Chaining only exists inside the transparent mitmproxy path, so a sandbox
+    with a networkPolicy must enable transparent MITM, and the ssl-insecure
+    escape hatch is refused while a trusted upstream proxy chain is configured.
+    """
+    if (
+        egress_config is None
+        or egress_config.upstream_proxy is None
+        or not has_network_policy
+    ):
+        return
+    if _is_truthy(egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE)):
+        raise ValueError(
+            f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when "
+            "egress.upstream_proxy is configured"
+        )
+    if not (
+        credential_proxy_enabled
+        or _is_truthy(egress_env.get(OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT))
+    ):
+        raise ValueError(
+            "egress.upstream_proxy is configured, so sandboxes with "
+            "networkPolicy must enable transparent MITM: set "
+            "credentialProxy.enabled=true or env "
+            f"{OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT}=true"
+        )
+
+
 __all__ = [
     "parse_memory_limit",
     "parse_nano_cpus",
@@ -276,4 +360,6 @@ __all__ = [
     "format_ingress_endpoint",
     "matches_filter",
     "split_egress_env",
+    "upstream_proxy_egress_env",
+    "validate_upstream_proxy_request",
 ]

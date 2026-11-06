@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,11 +17,29 @@ Abstract workload provider interface for Kubernetes resources.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Callable, Dict, List, Any, Optional
 
 from opensandbox_server.api.schema import Endpoint, ImageSpec, NetworkPolicy, PlatformSpec, Volume
-from opensandbox_server.config import EGRESS_MODE_DNS
+from opensandbox_server.config import EgressUpstreamProxyConfig
+
+
+@dataclass(frozen=True)
+class EgressWorkloadSettings:
+    """All server- and request-derived settings needed to build an egress sidecar."""
+
+    network_policy: NetworkPolicy
+    image: str
+    mode: str
+    auth_token: Optional[str]
+    credential_proxy_enabled: bool
+    env: Dict[str, Optional[str]]
+    disable_ipv6: bool
+    resource_requests: Optional[Dict[str, str]]
+    resource_limits: Optional[Dict[str, str]]
+    otlp_endpoint: Optional[str] = None
+    upstream_proxy: Optional[EgressUpstreamProxyConfig] = None
 
 
 class WorkloadProvider(ABC):
@@ -45,16 +63,11 @@ class WorkloadProvider(ABC):
         expires_at: Optional[datetime],
         execd_image: str,
         extensions: Optional[Dict[str, str]] = None,
-        network_policy: Optional[NetworkPolicy] = None,
-        egress_image: Optional[str] = None,
+        egress_settings: Optional[EgressWorkloadSettings] = None,
         volumes: Optional[List[Volume]] = None,
         platform: Optional[PlatformSpec] = None,
         annotations: Optional[Dict[str, str]] = None,
-        egress_auth_token: Optional[str] = None,
-        egress_mode: str = EGRESS_MODE_DNS,
-        credential_proxy_enabled: bool = False,
         resource_requests: Optional[Dict[str, str]] = None,
-        egress_env: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict[str, Any]:
         """
         Create a new workload resource.
@@ -72,11 +85,7 @@ class WorkloadProvider(ABC):
             execd_image: execd daemon image
             extensions: General extension field for passing additional configuration.
                 This is a flexible field for various use cases (e.g., ``poolRef`` for pool-based creation).
-            network_policy: Optional network policy for egress traffic control.
-                When provided, an egress sidecar container will be added to the Pod.
-            egress_image: Optional egress sidecar image. Required when network_policy is provided.
-            egress_mode: Sidecar ``OPENSANDBOX_EGRESS_MODE`` (from app ``[egress].mode`` when using network policy).
-            credential_proxy_enabled: Enable transparent MITM support required by Credential Vault injection.
+            egress_settings: Complete settings for an egress sidecar, or None when the workload does not require egress policy enforcement.
             volumes: Optional list of volume mounts for the sandbox.
 
         Returns:
@@ -87,6 +96,12 @@ class WorkloadProvider(ABC):
         """
         pass
     
+    def subscribe_workload(
+        self, sandbox_id: str, namespace: str, callback: Callable[[str, Dict[str, Any]], None]
+    ) -> Optional[Callable[[], None]]:
+        """Return an unsubscribe callback, or None to use periodic checks only."""
+        return None
+
     @abstractmethod
     def get_workload(self, sandbox_id: str, namespace: str) -> Optional[Any]:
         """
@@ -128,6 +143,22 @@ class WorkloadProvider(ABC):
             List of workload objects
         """
         pass
+    
+    def list_workloads_all_namespaces(self, label_selector: str) -> List[Any]:
+        """
+        List workloads matching label selector across all namespaces.
+
+        Used by the cross-namespace sandbox lookup fallback. Providers
+        without cluster-wide read access may keep this default; the
+        fallback then simply finds nothing.
+
+        Args:
+            label_selector: Label selector query
+
+        Returns:
+            List of workload objects
+        """
+        return []
     
     @abstractmethod
     def update_expiration(self, sandbox_id: str, namespace: str, expires_at: datetime) -> None:

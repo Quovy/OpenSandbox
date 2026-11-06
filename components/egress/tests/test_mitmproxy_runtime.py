@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ Requires ``mitmdump`` on PATH (installed by CI); skipped otherwise.
 from __future__ import annotations
 
 import http.client
+import http.server
 import json
 import os
 import shutil
@@ -57,10 +58,12 @@ VAULT_PAYLOAD = json.dumps(
                     "methods": ["POST"],
                     "paths": ["/v1/chat/*"],
                 },
-                "headers": [{"name": "x-api-key", "value": "secret-api-key"}],
+                "headers": [
+                    {"name": "Authorization", "value": "Bearer synthetic-token"}
+                ],
             }
         ],
-        "redactions": ["secret-api-key"],
+        "redactions": ["Bearer synthetic-token"],
     }
 ).encode("utf-8")
 
@@ -73,6 +76,8 @@ class _VaultUnixServer:
         self.payload = payload
         self._sock: socket.socket | None = None
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._mode = "normal"
 
     def start(self) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -98,16 +103,78 @@ class _VaultUnixServer:
                 if not chunk:
                     return
                 data += chunk
+            with self._lock:
+                mode = self._mode
+            if mode == "stall":
+                time.sleep(0.4)
+            if mode == "server-error":
+                body = b"secret-bearing vault diagnostic"
+                conn.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"content-length: "
+                    + str(len(body)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + body
+                )
+                return
+            if mode == "malformed":
+                body = json.dumps(
+                    {
+                        "revision": 2,
+                        "bindings": [
+                            {
+                                "name": "deeply-malformed",
+                                "match": {
+                                    "schemes": ["http"],
+                                    "hosts": ["code.example.com"],
+                                    "methods": ["POST"],
+                                    "paths": ["/v1/chat/*"],
+                                },
+                                "headers": [
+                                    {
+                                        "name": "x-api-key",
+                                        "value": "unredacted-secret",
+                                    }
+                                ],
+                            }
+                        ],
+                        "redactions": [],
+                    }
+                ).encode("utf-8")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b'etag: "runtime-malformed"\r\n'
+                    b"content-type: application/json\r\n"
+                    b"content-length: "
+                    + str(len(body)).encode("ascii")
+                    + b"\r\n\r\n"
+                    + body
+                )
+                return
+            if b'\r\nif-none-match: "runtime-v1"\r\n' in data.lower():
+                conn.sendall(
+                    b"HTTP/1.1 304 Not Modified\r\n"
+                    b'etag: "runtime-v1"\r\n'
+                    b"content-length: 0\r\n\r\n"
+                )
+                return
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\n"
+                b'etag: "runtime-v1"\r\n'
                 b"content-type: application/json\r\n"
                 b"content-length: "
                 + str(len(self.payload)).encode("ascii")
                 + b"\r\n\r\n"
                 + self.payload
             )
+        except OSError:
+            pass
         finally:
             conn.close()
+
+    def set_mode(self, mode: str) -> None:
+        with self._lock:
+            self._mode = mode
 
     def stop(self) -> None:
         self._stop.set()
@@ -137,7 +204,55 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
         cls._vault = _VaultUnixServer(cls._vault_path, VAULT_PAYLOAD)
         cls._vault.start()
 
+        cls._upstream_hits = 0
+        cls._upstream_authorization: str | None = None
+        cls._upstream_lock = threading.Lock()
+        cls._upstream_hit = threading.Event()
+
+        class UpstreamHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                with cls._upstream_lock:
+                    cls._upstream_hits += 1
+                    cls._upstream_authorization = self.headers.get("Authorization")
+                cls._upstream_hit.set()
+                remaining = int(self.headers.get("Content-Length") or 0)
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, _format: str, *args: object) -> None:
+                pass
+
+        cls._upstream = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), UpstreamHandler
+        )
+        cls._upstream_port = cls._upstream.server_address[1]
+        cls._upstream_thread = threading.Thread(
+            target=cls._upstream.serve_forever, daemon=True
+        )
+        cls._upstream_thread.start()
+
         script = Path(__file__).parents[1] / "mitmscripts" / "system.py"
+        # Test-only routing shim, loaded after system.py: the credential
+        # binding matches the code.example.com authority, while the local
+        # upstream listens on an ephemeral port. Reroute matched requests
+        # after the credential proxy ran, keeping injected headers intact.
+        shim = Path(cls._tmp.name) / "reroute_shim.py"
+        shim.write_text(
+            "# Test-only routing shim, loaded after system.py.\n"
+            "import os\n"
+            "\n"
+            "\n"
+            "def requestheaders(flow) -> None:\n"
+            "    if flow.request.host == 'code.example.com':\n"
+            "        flow.request.host = '127.0.0.1'\n"
+            "        flow.request.port = int(os.environ['OPENSANDBOX_TEST_UPSTREAM_PORT'])\n"
+        )
         cls._port = _free_port()
         cls._proc = subprocess.Popen(
             [
@@ -148,6 +263,8 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
                 str(cls._port),
                 "-s",
                 str(script),
+                "-s",
+                str(shim),
                 "--set",
                 "stream_large_bodies=1m",
                 "--set",
@@ -156,6 +273,7 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
             env={
                 **os.environ,
                 "OPENSANDBOX_CREDENTIAL_PROXY_SOCKET": cls._vault_path,
+                "OPENSANDBOX_TEST_UPSTREAM_PORT": str(cls._upstream_port),
             },
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -190,38 +308,56 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 cls._proc.kill()
         cls._vault.stop()
+        cls._upstream.shutdown()
+        cls._upstream.server_close()
+        cls._upstream_thread.join(timeout=2)
         cls._tmp.cleanup()
 
     def _conn(self) -> http.client.HTTPConnection:
         return http.client.HTTPConnection("127.0.0.1", self._port, timeout=30)
 
-    def _request(self, path: str, body: bytes) -> tuple[int | None, bytes]:
+    def _request(
+        self,
+        path: str,
+        body: bytes,
+        authority: str = "code.example.com",
+    ) -> tuple[int | None, bytes]:
         conn = self._conn()
         try:
             conn.request(
                 "POST",
-                f"http://code.example.com{path}",
+                f"http://{authority}{path}",
                 body=body,
-                headers={"Host": "code.example.com", "content-type": "application/json"},
+                headers={"Host": authority, "content-type": "application/json"},
             )
             response = conn.getresponse()
             return response.status, response.read()
         finally:
             conn.close()
 
-    def _send_expect_continue(self, path: str, body_size: int) -> tuple[int | None, bytes]:
+    def _send_expect_continue(
+        self,
+        path: str,
+        body_size: int,
+        authority: str = "code.example.com",
+        upload_body: bool = False,
+    ) -> tuple[int | None, bytes]:
         """Send request headers with ``Expect: 100-continue`` and wait for the
         proxy's decision before uploading the body.
 
         A killed flow is closed without any response (never sends the 100),
         so this deterministically distinguishes kill from 403 even for bodies
         larger than the client send buffer.
+
+        With ``upload_body=True`` and a ``100 Continue`` decision, the body is
+        uploaded afterwards and the status of the final upstream response is
+        returned instead.
         """
         with socket.create_connection(("127.0.0.1", self._port), timeout=30) as sock:
             sock.settimeout(15)
             sock.sendall(
-                f"POST http://code.example.com{path} HTTP/1.1\r\n"
-                f"Host: code.example.com\r\n"
+                f"POST http://{authority}{path} HTTP/1.1\r\n"
+                f"Host: {authority}\r\n"
                 f"Content-Type: application/json\r\n"
                 f"Content-Length: {body_size}\r\n"
                 f"Expect: 100-continue\r\n"
@@ -240,11 +376,42 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
                 return None, b""
             status_line = response.split(b"\r\n", 1)[0]
             status_code = int(status_line.split(b" ")[1])
-            return status_code, response
+            if not upload_body or status_code != 100:
+                return status_code, response
+            try:
+                body_chunk = b"x" * 65536
+                remaining = body_size
+                while remaining > 0:
+                    size = min(len(body_chunk), remaining)
+                    sock.sendall(body_chunk[:size])
+                    remaining -= size
+            except ConnectionError:
+                return None, b""
+            response = b""
+            try:
+                while b"\r\n\r\n" not in response:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+            except ConnectionError:
+                return None, b""
+            if not response:
+                return None, b""
+            status_line = response.split(b"\r\n", 1)[0]
+            return int(status_line.split(b" ")[1]), response
 
     def _assert_proxy_alive(self) -> None:
         status, _ = self._request("/v1/chat/completions/../admin", SMALL_BODY)
         self.assertEqual(403, status)
+
+    def _upstream_hit_count(self) -> int:
+        with self._upstream_lock:
+            return self._upstream_hits
+
+    def _upstream_last_authorization(self) -> str | None:
+        with self._upstream_lock:
+            return self._upstream_authorization
 
     def _wait_for_log(self, needle: str, timeout: float = 10.0) -> bool:
         """Poll the drained mitmdump log; termlog writes are asynchronous."""
@@ -292,15 +459,56 @@ class MitmproxyRuntimeRegressionTest(unittest.TestCase):
         self._assert_no_crash()
 
     def test_large_normal_request_injects_header_at_requestheaders(self) -> None:
-        """Header injection must happen before the streamed body is forwarded;
-        the requestheaders hook fires before the 100-continue is sent, so the
-        addon log line is observable without uploading the body."""
-        status, _ = self._send_expect_continue("/v1/chat/completions", LARGE_BODY_SIZE)
-        self.assertEqual(100, status)
+        """Header injection must happen before the streamed body is forwarded:
+        the proxy answers the ``Expect: 100-continue`` handshake only after the
+        requestheaders hook completes, and the local upstream then observes the
+        injected header on the streamed upload."""
+        with self._upstream_lock:
+            type(self)._upstream_authorization = None
+        self._upstream_hit.clear()
+        status, _ = self._send_expect_continue(
+            "/v1/chat/completions", LARGE_BODY_SIZE, upload_body=True
+        )
+        self.assertEqual(204, status)
+        self.assertTrue(self._upstream_hit.wait(10))
+        self.assertEqual("Bearer synthetic-token", self._upstream_last_authorization())
         self.assertTrue(self._wait_for_log("credential proxy: applied binding="))
         merged = "\n".join(self._log)
-        self.assertIn("headers=x-api-key", merged)
-        self.assertNotIn("secret-api-key", merged)
+        self.assertIn("headers=Authorization", merged)
+        self.assertNotIn("synthetic-token", merged)
+        self._assert_no_crash()
+
+    def test_lookup_failures_deny_buffered_and_streamed_requests(self) -> None:
+        upstream_authority = f"127.0.0.1:{self._upstream_port}"
+        try:
+            for mode in ("server-error", "malformed", "stall"):
+                with self.subTest(mode=mode):
+                    self._vault.set_mode(mode)
+                    self._upstream_hit.clear()
+                    hits_before = self._upstream_hit_count()
+                    status, _ = self._request(
+                        "/v1/chat/completions", SMALL_BODY, upstream_authority
+                    )
+                    self.assertEqual(503, status)
+                    self.assertFalse(self._upstream_hit.wait(0.25))
+                    self.assertEqual(hits_before, self._upstream_hit_count())
+
+            self._vault.set_mode("server-error")
+            self._upstream_hit.clear()
+            hits_before = self._upstream_hit_count()
+            status, _ = self._send_expect_continue(
+                "/v1/chat/completions", LARGE_BODY_SIZE, upstream_authority
+            )
+            self.assertIsNone(status)
+            self.assertFalse(self._upstream_hit.wait(0.25))
+            self.assertEqual(hits_before, self._upstream_hit_count())
+        finally:
+            self._vault.set_mode("normal")
+
+        self._assert_proxy_alive()
+        merged = "\n".join(self._log)
+        self.assertNotIn("secret-bearing vault diagnostic", merged)
+        self.assertNotIn("unredacted-secret", merged)
         self._assert_no_crash()
 
 

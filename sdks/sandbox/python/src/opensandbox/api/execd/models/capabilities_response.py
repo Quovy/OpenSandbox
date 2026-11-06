@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.capabilities_response_hardening import CapabilitiesResponseHardening
+
 
 T = TypeVar("T", bound="CapabilitiesResponse")
 
@@ -34,13 +38,23 @@ class CapabilitiesResponse:
         available (bool | Unset):
         isolator (str | Unset):
         version (str | Unset):
-        message (str | Unset): Diagnostic message when isolation is unavailable
+        message (str | Unset): Diagnostic message when isolation is unavailable or degraded (for example, share_net=true
+            sessions work but no uid mode can create the private network namespace required by share_net=false)
         setpriv_available (bool | Unset): Whether sessions using uid_mode setpriv can be created with execd's default
             UID/GID. Requests that select different UID/GID values may still return 503 NOT_SUPPORTED when identity
             switching is unavailable.
         userns_available (bool | Unset): Whether sessions using uid_mode userns can be created
+        setpriv_net_available (bool | Unset): Whether sessions using uid_mode setpriv can also create the private
+            network namespace required by share_net=false (bwrap --unshare-net; its loopback setup needs CAP_NET_ADMIN in
+            the execd container). Create rejects share_net=false requests with 503 NOT_SUPPORTED when the requested mode's
+            flag is false.
+        userns_net_available (bool | Unset): Whether sessions using uid_mode userns can also create the private network
+            namespace required by share_net=false.
         commit_supported (bool | Unset):
         diff_supported (bool | Unset):
+        hardening (CapabilitiesResponseHardening | Unset): execd init-mode and workload-hardening state (OSEP-0018):
+            whether execd is the sandbox init and which of its controls are in effect. Not an isolation capability; reported
+            here so operators see enforcement state in one place.
     """
 
     available: bool | Unset = UNSET
@@ -49,8 +63,11 @@ class CapabilitiesResponse:
     message: str | Unset = UNSET
     setpriv_available: bool | Unset = UNSET
     userns_available: bool | Unset = UNSET
+    setpriv_net_available: bool | Unset = UNSET
+    userns_net_available: bool | Unset = UNSET
     commit_supported: bool | Unset = UNSET
     diff_supported: bool | Unset = UNSET
+    hardening: CapabilitiesResponseHardening | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,9 +83,17 @@ class CapabilitiesResponse:
 
         userns_available = self.userns_available
 
+        setpriv_net_available = self.setpriv_net_available
+
+        userns_net_available = self.userns_net_available
+
         commit_supported = self.commit_supported
 
         diff_supported = self.diff_supported
+
+        hardening: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.hardening, Unset):
+            hardening = self.hardening.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -85,15 +110,23 @@ class CapabilitiesResponse:
             field_dict["setpriv_available"] = setpriv_available
         if userns_available is not UNSET:
             field_dict["userns_available"] = userns_available
+        if setpriv_net_available is not UNSET:
+            field_dict["setpriv_net_available"] = setpriv_net_available
+        if userns_net_available is not UNSET:
+            field_dict["userns_net_available"] = userns_net_available
         if commit_supported is not UNSET:
             field_dict["commit_supported"] = commit_supported
         if diff_supported is not UNSET:
             field_dict["diff_supported"] = diff_supported
+        if hardening is not UNSET:
+            field_dict["hardening"] = hardening
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.capabilities_response_hardening import CapabilitiesResponseHardening
+
         d = dict(src_dict)
         available = d.pop("available", UNSET)
 
@@ -107,9 +140,20 @@ class CapabilitiesResponse:
 
         userns_available = d.pop("userns_available", UNSET)
 
+        setpriv_net_available = d.pop("setpriv_net_available", UNSET)
+
+        userns_net_available = d.pop("userns_net_available", UNSET)
+
         commit_supported = d.pop("commit_supported", UNSET)
 
         diff_supported = d.pop("diff_supported", UNSET)
+
+        _hardening = d.pop("hardening", UNSET)
+        hardening: CapabilitiesResponseHardening | Unset
+        if isinstance(_hardening, Unset):
+            hardening = UNSET
+        else:
+            hardening = CapabilitiesResponseHardening.from_dict(_hardening)
 
         capabilities_response = cls(
             available=available,
@@ -118,8 +162,11 @@ class CapabilitiesResponse:
             message=message,
             setpriv_available=setpriv_available,
             userns_available=userns_available,
+            setpriv_net_available=setpriv_net_available,
+            userns_net_available=userns_net_available,
             commit_supported=commit_supported,
             diff_supported=diff_supported,
+            hardening=hardening,
         )
 
         capabilities_response.additional_properties = d

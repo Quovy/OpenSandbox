@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,24 +30,5 @@ func TestHeadTailBuffer(t *testing.T) {
 
 	if got, want := buffer.String(), "abcd<truncated>mnop"; got != want {
 		t.Fatalf("String() = %q, want %q", got, want)
-	}
-}
-
-func TestTruncateHeadTail(t *testing.T) {
-	tests := []struct {
-		name  string
-		value string
-		want  string
-	}{
-		{name: "within limit", value: "abcdefgh", want: "abcdefgh"},
-		{name: "over limit", value: "abcdefghijkl", want: "abcd<truncated>ijkl"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := TruncateHeadTail(tt.value, 4, 4, "<truncated>"); got != tt.want {
-				t.Fatalf("TruncateHeadTail() = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }

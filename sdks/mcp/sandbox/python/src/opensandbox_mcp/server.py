@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +18,8 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.session import ServerSession
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from opensandbox import Sandbox, SandboxManager
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.execd import Execution, RunCommandOpts
@@ -50,6 +50,9 @@ class ServerState:
     sandboxes: dict[str, Sandbox] = field(default_factory=dict)
     connection_config: ConnectionConfig = field(default_factory=ConnectionConfig)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    connecting: dict[str, asyncio.Task[Sandbox | Exception]] = field(
+        default_factory=dict
+    )
 
     async def add(self, sandbox: Sandbox) -> None:
         async with self.lock:
@@ -62,6 +65,15 @@ class ServerState:
     async def remove(self, sandbox_id: str) -> Sandbox | None:
         async with self.lock:
             return self.sandboxes.pop(sandbox_id, None)
+
+
+def _discard_connecting(
+    state: ServerState, sandbox_id: str, task: asyncio.Task[Sandbox | Exception]
+) -> None:
+    # Only pop if this task is still the mapped entry (a stale callback
+    # must not evict a newer connect).
+    if state.connecting.get(sandbox_id) is task:
+        state.connecting.pop(sandbox_id)
 
 
 class StatusResponse(BaseModel):
@@ -86,14 +98,23 @@ class FileReadResponse(BaseModel):
     content: str = Field(description="File content.")
 
 
+def _borrowed_config(state: ServerState) -> ConnectionConfig:
+    """Clone the shared config for one Sandbox/Manager call without ownership
+    of the server-wide transport, so per-call close() never tears down
+    connections still used by other registered sandboxes."""
+    config = state.connection_config.model_copy()
+    config._owns_transport = False
+    return config
+
+
 def register_tools(
-    mcp: FastMCP,
+    mcp: MCPServer,
     *,
     prefix: str = "",
     state: ServerState | None = None,
     connection_config: ConnectionConfig | None = None,
 ) -> ServerState:
-    """Register sandbox tools on a FastMCP instance."""
+    """Register sandbox tools on an MCP server instance."""
     config = (connection_config or ConnectionConfig()).with_transport_if_missing()
     state = state or ServerState(connection_config=config)
     name_prefix = f"{prefix}_" if prefix else ""
@@ -106,29 +127,54 @@ def register_tools(
 
         return decorator
 
+    async def _connect_and_register(sandbox_id: str) -> Sandbox | Exception:
+        # A failure is returned, not raised: once every caller is cancelled,
+        # asyncio.shield (Python 3.14+) reports a failed task to the loop
+        # exception handler, although nobody waits for it any more.
+        try:
+            sandbox = await Sandbox.connect(
+                sandbox_id, connection_config=_borrowed_config(state)
+            )
+        except Exception as exc:
+            return exc
+        await state.add(sandbox)
+        return sandbox
+
     async def _get_or_connect_sandbox(
         sandbox_id: str,
         *,
         connect_if_missing: bool,
     ) -> Sandbox:
-        sandbox = await state.get(sandbox_id)
-        if sandbox is not None:
-            return sandbox
-        if not connect_if_missing:
-            raise ValueError(
-                "Sandbox not found in local registry. Call sandbox_connect or "
-                "set connect_if_missing=True with connection parameters."
-            )
-        sandbox = await Sandbox.connect(
-            sandbox_id, connection_config=state.connection_config
-        )
-        await state.add(sandbox)
-        return sandbox
+        # Lock held only for lookup + in-flight dedup; the connect itself
+        # runs outside the lock so a slow connect can't stall unrelated
+        # tool calls. Same-id connects still coalesce onto one task.
+        async with state.lock:
+            sandbox = state.sandboxes.get(sandbox_id)
+            if sandbox is not None:
+                return sandbox
+            task = state.connecting.get(sandbox_id)
+            if task is None:
+                if not connect_if_missing:
+                    raise ToolError(
+                        "Sandbox not found in local registry. Call sandbox_connect or "
+                        "set connect_if_missing=True with connection parameters."
+                    )
+                task = asyncio.ensure_future(_connect_and_register(sandbox_id))
+                state.connecting[sandbox_id] = task
+                task.add_done_callback(
+                    lambda t: _discard_connecting(state, sandbox_id, t)
+                )
+        # Other tool calls may be waiting on the same task, so cancelling this
+        # call (e.g. the client cancelled the request) must not cancel it.
+        result = await asyncio.shield(task)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     @tool()
     async def sandbox_create(
         image: str,
-        ctx: Context[ServerSession, None] | None = None,
+        ctx: Context[None, None] | None = None,
         *,
         auth_username: str | None = None,
         auth_password: str | None = None,
@@ -169,7 +215,7 @@ def register_tools(
             entrypoint: Entrypoint command list.
 
         Returns:
-            A dict with:
+            SandboxInfoResponse with:
                 sandbox_id: The new sandbox identifier.
                 info: Sandbox info payload from the SDK.
 
@@ -189,7 +235,9 @@ def register_tools(
         image_auth = None
         if auth_username or auth_password:
             if not auth_username or not auth_password:
-                raise ValueError("auth_username and auth_password must be provided together")
+                raise ToolError(
+                    "auth_username and auth_password must be provided together"
+                )
             image_auth = SandboxImageAuth(
                 username=auth_username,
                 password=auth_password,
@@ -213,7 +261,7 @@ def register_tools(
                 milliseconds=health_check_polling_interval_ms
             ),
             skip_health_check=skip_health_check,
-            connection_config=state.connection_config,
+            connection_config=_borrowed_config(state),
         )
         await state.add(sandbox)
         if ctx:
@@ -245,7 +293,7 @@ def register_tools(
             skip_health_check: If True, return before readiness checks complete.
 
         Returns:
-            A dict with:
+            SandboxInfoResponse with:
                 sandbox_id: The sandbox identifier.
                 info: Sandbox info payload from the SDK.
 
@@ -254,7 +302,7 @@ def register_tools(
         """
         sandbox = await Sandbox.connect(
             sandbox_id,
-            connection_config=state.connection_config,
+            connection_config=_borrowed_config(state),
             connect_timeout=timedelta(seconds=connect_timeout_seconds),
             health_check_polling_interval=timedelta(
                 milliseconds=health_check_polling_interval_ms
@@ -280,7 +328,7 @@ def register_tools(
         sandbox = await state.remove(sandbox_id)
         if sandbox is None:
             manager = await SandboxManager.create(
-                connection_config=state.connection_config
+                connection_config=_borrowed_config(state)
             )
             try:
                 await manager.kill_sandbox(sandbox_id)
@@ -309,7 +357,7 @@ def register_tools(
         if sandbox is not None:
             return await sandbox.get_info()
         manager = await SandboxManager.create(
-            connection_config=state.connection_config
+            connection_config=_borrowed_config(state)
         )
         try:
             info = await manager.get_sandbox_info(sandbox_id)
@@ -319,7 +367,7 @@ def register_tools(
 
     @tool()
     async def sandbox_list(
-        ctx: Context[ServerSession, None] | None = None,
+        ctx: Context[None, None] | None = None,
         *,
         filter: SandboxFilter | None = None,
     ) -> PagedSandboxInfos:
@@ -336,7 +384,7 @@ def register_tools(
             await ctx.report_progress(progress=0.1, total=1.0, message="Listing sandboxes")
         filter = filter or SandboxFilter()
         manager = await SandboxManager.create(
-            connection_config=state.connection_config
+            connection_config=_borrowed_config(state)
         )
         try:
             result = await manager.list_sandbox_infos(filter)
@@ -364,7 +412,7 @@ def register_tools(
         sandbox = await state.get(sandbox_id)
         if sandbox is None:
             manager = await SandboxManager.create(
-                connection_config=state.connection_config
+                connection_config=_borrowed_config(state)
             )
             try:
                 response = await manager.renew_sandbox(
@@ -438,7 +486,8 @@ def register_tools(
             connect_if_missing: Connect if sandbox not in local registry.
 
         Returns:
-            Execution result dict with id, exit_code, logs, and duration.
+            Execution result with id, exit code, and streamed logs; timing
+            lives on the ``complete`` event (``execution_time_in_millis``).
 
         Example:
             result = await command_run("sbx_123", "ls -la", working_directory="/")
@@ -729,9 +778,9 @@ def register_tools(
     return state
 
 
-def create_server(connection_config: ConnectionConfig | None = None) -> FastMCP:
+def create_server(connection_config: ConnectionConfig | None = None) -> MCPServer:
     """Create the MCP server instance for OpenSandbox."""
-    mcp = FastMCP(
+    mcp = MCPServer(
         "OpenSandbox Sandbox",
         instructions=(
             "Use these tools to create and manage isolated sandboxes. "

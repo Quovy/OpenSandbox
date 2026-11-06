@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,10 +53,11 @@ class IsolatedRunRequest:
             level signals (for example the SIGINT sent when a foreground run
             times out or is cancelled) also reach them; execd cannot signal
             individual in-namespace processes.
-            Background runs require a writable log location, so sessions with
-            a read-only (`ro`) workspace reject them with 400: there is no
-            host-visible writable location for the run's log and exit-code
-            files. rw and overlay workspaces are supported.
+            Background runs require a writable log location under the first
+            overlay, so sessions whose first overlay is read-only (`ro`) or
+            an ephemeral overlay (`persist: false`) reject them with 400.
+            rw overlays and persistent (`persist: true`) overlays are
+            supported.
     """
 
     code: str

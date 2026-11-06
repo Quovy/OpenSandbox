@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,22 +38,6 @@ func Register(h Hook) {
 	defer mu.Unlock()
 	hooks = append(hooks, h)
 }
-
-func RegisterFunc(name string, fn func(ctx context.Context) error) {
-	if fn == nil {
-		return
-	}
-	Register(funcHook{name: name, fn: fn})
-}
-
-type funcHook struct {
-	name string
-	fn   func(context.Context) error
-}
-
-func (f funcHook) Name() string { return f.name }
-
-func (f funcHook) Run(ctx context.Context) error { return f.fn(ctx) }
 
 func RunPost(ctx context.Context) error {
 	mu.Lock()

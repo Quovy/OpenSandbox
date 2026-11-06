@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -68,6 +68,11 @@ func reportSandboxCreateMetric(cfg ConnectionConfig, sandboxID, image string, du
 		if client == nil {
 			client = &http.Client{Timeout: 5 * time.Second}
 		}
+		// Metrics bypass NewClient, but must apply the same redirect protection
+		// without changing a caller-owned client or its redirect policy.
+		cloned := *client
+		cloned.CheckRedirect = protectedHeaderRedirectPolicy(client.CheckRedirect, cfg.GetAuthHeader())
+		client = &cloned
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return

@@ -7,7 +7,7 @@ description: Go client library for the OpenSandbox API covering lifecycle, execd
 
 Go client library for the [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox/) API.
 
-Covers all three OpenAPI specs:
+Provides high-level sandbox helpers and low-level clients for these API areas:
 - **Lifecycle** -- Create, manage, and destroy sandbox instances
 - **Execd** -- Execute commands, manage files, monitor metrics inside sandboxes
 - **Egress** -- Inspect and mutate sandbox network policy at runtime
@@ -23,6 +23,8 @@ go get github.com/alibaba/OpenSandbox/sdks/sandbox/go
 
 ### Create and manage a sandbox
 
+Use the high-level helper to create a sandbox, resolve its endpoint, and wait for readiness before running commands:
+
 ```go
 package main
 
@@ -31,88 +33,331 @@ import (
     "fmt"
     "log"
 
-    "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
+    opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
 )
 
-func main() {
+func run() error {
     ctx := context.Background()
-
-    lc := opensandbox.NewLifecycleClient("http://localhost:8080/v1", "your-api-key")
-
-    sbx, err := lc.CreateSandbox(ctx, opensandbox.CreateSandboxRequest{
-        Image:      opensandbox.ImageSpec{URI: "python:3.12"},
-        Entrypoint: []string{"/bin/sh"},
-        ResourceLimits: opensandbox.ResourceLimits{
-            "cpu":    "500m",
-            "memory": "512Mi",
-        },
+    ttl := 600
+    config := opensandbox.ConnectionConfig{
+        Domain: "localhost:8080",
+        Protocol: "http",
+        UseServerProxy: true,
+    }
+    sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+        Image: "python:3.12",
+        TimeoutSeconds: &ttl,
     })
     if err != nil {
-        log.Fatal(err)
+        return err
     }
-    fmt.Printf("Created sandbox: %s (state: %s)\n", sbx.ID, sbx.Status.State)
+    defer sandbox.Close()
+    defer sandbox.Kill(context.Background())
 
-    sbx, err = lc.GetSandbox(ctx, sbx.ID)
+    result, err := sandbox.RunCommand(ctx, "echo sandbox-ready", nil)
     if err != nil {
+        return err
+    }
+    fmt.Println(result.Text())
+    return nil
+}
+
+func main() {
+    if err := run(); err != nil {
         log.Fatal(err)
     }
-
-    list, err := lc.ListSandboxes(ctx, opensandbox.ListOptions{
-        States:   []opensandbox.SandboxState{opensandbox.StateRunning},
-        PageSize: 10,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Printf("Running sandboxes: %d\n", list.Pagination.TotalItems)
-
-    _ = lc.PauseSandbox(ctx, sbx.ID)
-    _ = lc.ResumeSandbox(ctx, sbx.ID)
-
-    _ = lc.DeleteSandbox(ctx, sbx.ID)
 }
 ```
 
+`ConnectSandbox` and `ResumeSandbox` check health only when you pass the optional `ReadyOptions` argument (an empty `ReadyOptions{}` uses the default check). Omitting it resolves the endpoint without a health check. Pause is asynchronous: wait until sandbox info reports `Paused` before resuming.
+
+`ConnectionConfig.APIKey` authenticates lifecycle requests. Data-plane requests carry `OPEN-SANDBOX-API-KEY` only when `UseServerProxy` is true; in direct mode the SDK removes that header from `ConnectionConfig.Headers` before sending to execd or egress because those endpoints run inside the sandbox. Use the endpoint headers returned by `GetEndpoint` for direct data-plane authentication.
+
+The following snippets go inside a function returning `error`, with the live `sandbox`, `config`, and `ctx` above. Add standard-library imports used by each snippet. Creation examples are alternatives; terminate sandboxes with `Kill` when done. `Close` currently does not terminate the sandbox.
+
 ### Run a command with streaming output
 
-```go
-exec := opensandbox.NewExecdClient("http://localhost:9090", "your-execd-token")
+`Execution.Text()` combines stdout events while preserving their line-ending bytes and any unterminated final fragment. It inserts a newline between events only when the preceding event ends in neither `\n` nor `\r`, preserving ordinary legacy stripped-line output without appending a final terminator. A trailing `\r` is always treated as a line ending, including when an older producer retained it as content while stripping another terminator.
 
-err := exec.RunCommand(ctx, opensandbox.RunCommandRequest{
+Use structured callbacks for normal command output:
+
+```go
+result, err := sandbox.RunCommand(ctx, "echo 'Hello from sandbox!'", &opensandbox.ExecutionHandlers{
+    OnStdout: func(message opensandbox.OutputMessage) error {
+        fmt.Println(message.Text)
+        return nil
+    },
+})
+if err != nil {
+    return err
+}
+if result.ExitCode == nil || *result.ExitCode != 0 {
+    return fmt.Errorf("command failed: %v", result.Error)
+}
+```
+
+Use the low-level client when you need raw SSE events or command status/log APIs. `event.Data` contains JSON; import `encoding/json` and `os` for this example:
+
+```go
+endpoint, err := sandbox.GetEndpoint(ctx, 44772)
+if err != nil {
+    return err
+}
+exec := opensandbox.NewExecdClient(
+    config.Protocol + "://" + endpoint.Endpoint, "",
+    opensandbox.WithHeaders(endpoint.Headers),
+)
+
+err = exec.RunCommand(ctx, opensandbox.RunCommandRequest{
     Command: "echo 'Hello from sandbox!'",
     Timeout: 30000,
 }, func(event opensandbox.StreamEvent) error {
-    switch event.Event {
+    var message struct{ Type, Text string }
+    if err := json.Unmarshal([]byte(event.Data), &message); err != nil {
+        return err
+    }
+    switch message.Type {
     case "stdout":
-        fmt.Print(event.Data)
+        fmt.Println(message.Text)
     case "stderr":
-        fmt.Fprintf(os.Stderr, "%s", event.Data)
+        fmt.Fprintln(os.Stderr, message.Text)
     case "execution_complete":
-        fmt.Println("\n[done]")
+        fmt.Println("[done]")
     }
     return nil
 })
+if err != nil {
+    return err
+}
 ```
+
+`RunCommandRequest.Timeout` is in **milliseconds**. Use this low-level client for `InterruptCommand`, `GetCommandStatus`, and `GetCommandLogs`, which are not exposed as high-level `Sandbox` methods.
+
+For native execution, replace the request above with the following. On Linux, it prints literal `$HOME` and keeps `hello world` as one argument:
+
+```go
+_, err = sandbox.RunCommandWithOpts(ctx, opensandbox.RunCommandRequest{
+    Argv:    []string{"printf", "%s\n", "$HOME", "hello world"},
+    Timeout: 30000,
+}, nil)
+if err != nil {
+    return err
+}
+```
+
+Native argv execution requires an updated execd. See [command execution modes](/architecture/data-plane/execd#command-execution) for executable lookup and platform behavior.
+
+### Background commands
+
+Reuse the `exec` client from the streaming example to poll status and incremental logs. Command timeout is in milliseconds and is separate from sandbox TTL.
+
+```go
+execution, err := sandbox.RunCommandWithOpts(ctx, opensandbox.RunCommandRequest{
+    Command: "for i in 1 2 3; do echo step-$i; sleep 1; done",
+    Background: true,
+    Timeout: 30_000,
+}, nil)
+if err != nil {
+    return err
+}
+if execution.ID == "" {
+    return fmt.Errorf("no command ID returned")
+}
+cursor := int64(0)
+deadline := time.Now().Add(45 * time.Second)
+for {
+    if time.Now().After(deadline) {
+        if err := exec.InterruptCommand(ctx, execution.ID); err != nil {
+            return err
+        }
+        return fmt.Errorf("command did not finish")
+    }
+    status, err := exec.GetCommandStatus(ctx, execution.ID)
+    if err != nil {
+        return err
+    }
+    logs, err := exec.GetCommandLogs(ctx, execution.ID, &cursor)
+    if err != nil {
+        return err
+    }
+    fmt.Print(logs.Output)
+    cursor = logs.Cursor
+    if !status.Running {
+        if status.ExitCode == nil || *status.ExitCode != 0 {
+            return fmt.Errorf("command failed: %s", status.Error)
+        }
+        break
+    }
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-time.After(500 * time.Millisecond):
+    }
+}
+```
+
+### Persistent shell sessions
+
+A Bash session preserves shell variables and the working directory across commands.
+
+```go
+session, err := sandbox.CreateSession(ctx)
+if err != nil {
+    return err
+}
+defer sandbox.DeleteSession(context.Background(), session.ID)
+_, err = sandbox.RunInSession(ctx, session.ID, opensandbox.RunInSessionRequest{
+    Command: "cd /tmp; export DEMO=hello",
+    Timeout: 30_000,
+}, nil)
+if err != nil {
+    return err
+}
+result, err := sandbox.RunInSession(ctx, session.ID, opensandbox.RunInSessionRequest{
+    Command: "echo \"$DEMO\"; pwd",
+    Timeout: 30_000,
+}, nil)
+if err != nil {
+    return err
+}
+fmt.Println(result.Text())
+```
+
+### Persistent environment variables
+
+Set environment variables that the runtime injects into every subsequent command and session — without hand-writing shell escaping against the sandbox env file.
+
+```go
+err := sandbox.SetEnv(ctx, "MY_TOKEN", "it's a safe value")
+```
+
+Keys must match `[A-Za-z_][A-Za-z0-9_]*`. Values without a single quote are stored verbatim; values containing a single quote use the env file's double-quoted form, in which shell-style `$NAME` sequences may be expanded when the runtime loads the file. The env file is append-only: the last write for a key wins. Returns an error if the sandbox fails to persist the variable.
+
+For filesystem/process isolation within a sandbox, see [Isolation Sessions](/guides/isolation-sessions). These are separate from Bash sessions.
+
+### File operations
+
+Upload from an `io.Reader` and close download streams after use. This example uses `strings`, `io`, and `os` from the standard library:
+
+```go
+err := sandbox.UploadFile(ctx, strings.NewReader("Hello Sandbox!"), opensandbox.UploadFileOptions{
+    Metadata: opensandbox.FileMetadata{Path: "/tmp/demo.txt", Mode: 644},
+})
+if err != nil {
+    return err
+}
+body, err := sandbox.DownloadFile(ctx, "/tmp/demo.txt", "")
+if err != nil {
+    return err
+}
+_, copyErr := io.Copy(os.Stdout, body)
+closeErr := body.Close()
+if copyErr != nil {
+    return copyErr
+}
+if closeErr != nil {
+    return closeErr
+}
+entries, err := sandbox.ListDirectory(ctx, "/tmp")
+if err != nil {
+    return err
+}
+for _, entry := range entries {
+    fmt.Println(entry.Path)
+}
+if err := sandbox.DeleteFiles(ctx, []string{"/tmp/demo.txt"}); err != nil {
+    return err
+}
+```
+
+The same upload/download methods support binary files. Pass a Range header such as `"bytes=0-1023"` to `DownloadFile` for a partial download.
+
+#### File operations with an explicit identity
+
+Bind a filesystem client to a Linux UID and GID:
+
+```go
+files, err := sandbox.FilesWithIdentity(1001, 2000)
+if err != nil {
+    return err
+}
+```
+
+The bound client exposes the usual file operations and shares the sandbox connection, authentication, and endpoint routing headers. The existing file client retains its default identity. Select the UID/GID separately for command execution.
+
+This requires Linux and an Execd version that supports filesystem execution identity. Unsupported servers return an error; requests never fall back to the default filesystem routes. Keep sandbox credentials and identity selection in the trusted backend. Linux filesystem permissions apply; this feature does not create a tenant isolation boundary. See [Execd](/architecture/data-plane/execd) for permission and workspace provisioning details.
+
+### Pause and reconnect
+
+Pause is asynchronous and runtime-dependent. Use a deadline before resuming:
+
+```go
+pauseCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+defer cancel()
+if err := sandbox.Pause(pauseCtx); err != nil {
+    return err
+}
+for {
+    info, err := sandbox.GetInfo(pauseCtx)
+    if err != nil {
+        return err
+    }
+    if info.Status.State == "Paused" {
+        break
+    }
+    if info.Status.State == "Failed" {
+        return fmt.Errorf("pause failed: %s", info.Status.Message)
+    }
+    select {
+    case <-pauseCtx.Done():
+        return pauseCtx.Err()
+    case <-time.After(time.Second):
+    }
+}
+resumed, err := opensandbox.ResumeSandbox(ctx, config, sandbox.ID(), opensandbox.ReadyOptions{})
+if err != nil {
+    return err
+}
+defer resumed.Close()
+if _, err := resumed.Renew(ctx, 30*time.Minute); err != nil {
+    return err
+}
+```
+
+Use `ConnectSandbox(ctx, config, id, opensandbox.ReadyOptions{})` to attach to an already running sandbox with a readiness check. See [Pause and Resume](/guides/pause-resume).
+
+### Resource metrics
+
+Use `metrics, err := sandbox.GetMetrics(ctx)` to read current sandbox resource usage. This is separate from [SDK creation telemetry](/sdks/observability#creation-metrics).
 
 ### Check egress policy
 
-```go
-egress := opensandbox.NewEgressClient("http://localhost:18080", "your-egress-token")
+Runtime egress reads and patches go directly to the sandbox egress sidecar. The SDK first resolves the sandbox endpoint on port `18080`, then calls the sidecar `/policy` API.
 
-policy, err := egress.GetPolicy(ctx)
+```go
+policy, err := sandbox.GetEgressPolicy(ctx)
+if err != nil {
+    return err
+}
 fmt.Printf("Mode: %s, Default: %s\n", policy.Mode, policy.Policy.DefaultAction)
 
-updated, err := egress.PatchPolicy(ctx, []opensandbox.NetworkRule{
+_, err = sandbox.PatchEgressRules(ctx, []opensandbox.NetworkRule{
     {Action: "allow", Target: "api.example.com"},
 })
+if err != nil {
+    return err
+}
 ```
+
+Template-backed sandboxes have no sandbox-side egress sidecar: the SDK detects them via the server's `OPEN-SANDBOX-ORIGIN` response header (see [Fsb Template Management](#fsb-template-management)) and routes the same `GetEgressPolicy` / `PatchEgressRules` / `DeleteEgressRules` calls through the lifecycle control plane (`/sandboxes/{sandboxId}/networkpolicy`) instead.
+
+Patch uses merge semantics:
+- Incoming rules take priority over existing rules with the same `target`.
+- Existing rules for other targets remain unchanged.
 
 ### Use Credential Vault
 
-Credential Vault injects outbound credentials from the egress sidecar while
-keeping real secrets out of sandbox environment variables, commands, files, and
-logs. Create the sandbox with `CredentialProxy` enabled, then write credentials
-and bindings through the sandbox helpers or `EgressClient`.
+Credential Vault injects outbound credentials from the egress sidecar while keeping real secrets out of sandbox environment variables, commands, files, and logs. Create the sandbox with `CredentialProxy` enabled, then write credentials and bindings through the sandbox helpers or `EgressClient`.
 
 ```go
 config := opensandbox.ConnectionConfig{
@@ -164,144 +409,237 @@ _, err = sandbox.CreateCredentialVault(ctx, opensandbox.CredentialVaultCreateReq
 })
 ```
 
-See [Credential Vault](/guides/credential-vault) for auth types, binding
-guidance, and Git/curl examples.
+See [Credential Vault](/guides/credential-vault) for auth types, binding guidance, and Git/curl examples.
 
-### Sandbox Pool (Client-Side)
-
-Use `SandboxPool` to keep an idle buffer of ready sandboxes and reduce acquire latency.
-
-::: warning Experimental
-`SandboxPool` is still evolving based on production feedback and may introduce breaking changes in future releases.
+::: warning
+Credential Vault is unavailable for template-backed sandboxes: they have no sandbox-side egress sidecar. `sandbox.CredentialVault(ctx)` returns an error for them.
 :::
 
-```go
-package main
+### Client Pool
 
-import (
-    "context"
-    "fmt"
-    "log"
-    "time"
+Use `NewSandboxPoolBuilder` with an in-memory store or the Redis adapter in `github.com/alibaba/OpenSandbox/sdks/sandbox/go/poolredis`. Go supports all four acquire policies, namespace retirement, and per-acquire TTL/health-check overrides.
 
-    opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
-)
+Go uses `ReconcileInterval` and `WarmupConcurrency`; it does not expose the
+Python/JVM/JavaScript create-QPS, initial-delay, or post-prepare-check settings.
+See [Client Pool](/guides/client-pool) for defaults, examples, and cleanup.
+Go does not currently emit built-in pool warmup traces.
+Both `SandboxManager` and `Sandbox` expose `GetDiagnosticContext`,
+`GetDiagnosticLogs`, and `GetDiagnosticEvents`; see [SDK diagnostics](/sdks/#diagnostics).
 
-func main() {
-    ctx := context.Background()
+## Lifecycle Hooks
 
-    pool, err := opensandbox.NewSandboxPoolBuilder().
-        PoolName("demo-pool").
-        OwnerID("worker-1").
-        MaxIdle(3).
-        ConnectionConfig(opensandbox.ConnectionConfig{
-            Domain: "api.opensandbox.io",
-        }).
-        CreationSpec(opensandbox.PoolCreationSpec{
-            Image: "ubuntu:24.04",
-        }).
-        StateStore(opensandbox.NewInMemoryPoolStateStore()). // single-process only
-        Build()
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    if err := pool.Start(ctx); err != nil {
-        log.Fatal(err)
-    }
-
-    failFast := opensandbox.AcquirePolicyFailFast
-    sb, err := pool.Acquire(ctx, opensandbox.AcquireOptions{
-        SandboxTimeout: 10 * time.Minute,
-        Policy:         &failFast,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    result, err := sb.RunCommand(ctx, "echo pool-ok", nil)
-    if err == nil {
-        fmt.Println(result.Text())
-    }
-
-    _ = sb.Kill(context.Background())
-    // Drain idle sandboxes before shutdown (single-process cleanup).
-    pool.ReleaseAllIdle(ctx)
-    _ = pool.Shutdown(ctx, true)
-}
-```
-
-::: tip AcquirePolicy
-`AcquirePolicy` controls what happens when the idle buffer is empty **or** the first idle candidate fails its readiness check:
-
-| Policy | Retry across idles | Fallback on exhaustion |
-|---|---|---|
-| `AcquirePolicyFailFast` | no | return `*PoolEmptyError` / `*PoolAcquireFailedError` |
-| `AcquirePolicyDirectCreate` (default) | no | create a new sandbox via lifecycle API |
-| `AcquirePolicyRetryNextIdle` | up to `MaxAcquireRetries` idles | return error |
-| `AcquirePolicyRetryNextIdleThenCreate` | up to `MaxAcquireRetries` idles | create a new sandbox |
-
-Use the `RetryNextIdle*` variants when the pool may contain a mix of healthy and stale idle sandboxes (custom templates with long cold-start; network flap left a few unreachable idles). Each failed candidate still pays up to `AcquireReadyTimeout`, so bound the retry with `MaxAcquireRetries` (default `3`) via `builder.MaxAcquireRetries(n)` or `PoolConfig.MaxAcquireRetries`.
-:::
-
-For distributed deployment with multiple processes or pods, use `RedisPoolStateStore`.
-The store accepts a caller-managed `redis.Client` and does not create or close Redis
-connections.
+Set `Lifecycle` in `SandboxCreateOptions`. `PreStart` completes before the entrypoint starts, while `Periodic` hooks run on their schedules after startup.
 
 ```go
-import (
-    "github.com/redis/go-redis/v9"
-    opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
-    "github.com/alibaba/OpenSandbox/sdks/sandbox/go/poolredis"
-)
-
-redisClient := redis.NewClient(&redis.Options{
-    Addr: "redis.example.com:6379",
-})
-
-store, err := poolredis.NewRedisPoolStateStore(poolredis.RedisPoolStateStoreConfig{
-    Client:    redisClient,
-    KeyPrefix: "opensandbox:pool:prod",
+hookTimeout := 120
+sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    Image: "ubuntu:24.04",
+    Lifecycle: &opensandbox.SandboxLifecycle{
+        PreStart: &opensandbox.LifecycleHook{
+            Command:        []string{"sh", "-c", "echo ready > /tmp/prestart.done"},
+            TimeoutSeconds: &hookTimeout,
+        },
+        Periodic: []opensandbox.PeriodicLifecycleHook{
+            {
+                Name:           "checkpoint",
+                Schedule:       "@every 5m",
+                Command:        []string{"sh", "-c", "date -u >> /tmp/checkpoints.log"},
+                TimeoutSeconds: &hookTimeout,
+            },
+        },
+    },
 })
 if err != nil {
-    log.Fatal(err)
+    return err
 }
-
-pool, err := opensandbox.NewSandboxPoolBuilder().
-    PoolName("prod-pool").
-    OwnerID("worker-1").
-    MaxIdle(10).
-    StateStore(store).
-    ConnectionConfig(opensandbox.ConnectionConfig{
-        Domain: "api.opensandbox.io",
-    }).
-    CreationSpec(opensandbox.PoolCreationSpec{
-        Image: "ubuntu:24.04",
-    }).
-    PrimaryLockTTL(60 * time.Second).
-    Build()
+defer sandbox.Close()
+defer sandbox.Kill(context.Background())
+fmt.Println(sandbox.ID())
 ```
 
-::: info Pool Lifecycle Semantics
-- `Acquire()` is only allowed when pool state is `RUNNING`.
-- In `DRAINING` / `STOPPED`, `Acquire()` returns `*PoolNotRunningError`.
-- `MaxIdle` is the target/cap for ready idle sandboxes. It is not a global limit on borrowed sandboxes or sandboxes created by `DirectCreate`.
-- `OwnerID` is the lock owner identity (node/process id), not the pool identifier. If omitted, SDK auto-generates a default.
-- Use `WarmupSandboxPreparer(...)` if you need to prepare a sandbox after warmup readiness succeeds and before it is put into the idle pool.
-:::
+The Server validates `TimeoutSeconds`; `PreStart` accepts 1–10800 seconds, while `Periodic` accepts 1–300 seconds. Both default to 60 seconds when omitted. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
 
-::: tip Distributed Deployment
-- `InMemoryPoolStateStore` is for single-process development and tests.
-- For distributed deployment, all nodes in one logical pool must share the same Redis key prefix and `PoolName`.
-- All nodes sharing one pool must use the same creation and warmup definition. If that definition changes, use a new `PoolName` or key prefix and drain the old pool.
-- `Resize(ctx, maxIdle)` can be called from any node. The call returns after the target is stored in the shared state store; the current primary applies replenish or shrink work during periodic reconcile.
-- Use `Resize(ctx, 0)` and wait for `Snapshot().IdleCount == 0` to drain a distributed idle buffer. `ReleaseAllIdle()` is only a best-effort cleanup pass in distributed mode.
-- `ReleaseAllIdle(ctx)` preserves fire-and-forget kill scheduling. Call
-  `ReleaseAllIdleParallel(ctx, maxWorkers)` on `*DefaultSandboxPool` for bounded
-  parallel cleanup that waits for every drained ID to receive a kill attempt.
-  `maxWorkers` must be positive; the method is not part of the `SandboxPool` interface.
-- Configure `PrimaryLockTTL` greater than `WarmupReadyTimeout` plus expected warmup preparer time.
-:::
+### Idle policy (auto-pause and wake-on-access)
+
+`SandboxLifecycle.IdlePolicy` (OSEP-0024, fast-sandbox only) tells the control plane to auto-pause the sandbox after `IdleTimeoutSeconds` (30–86400) of continuously idle ingress-observed traffic, and to wake it on the next request. It is control-plane state: it never reaches the guest, is accepted in template mode (`SandboxFromTemplateOptions.IdlePolicy`), and is rejected by non-fast-sandbox backends. Omitting it preserves non-automated behavior exactly.
+
+```go
+idleTimeout := 300
+wakeOnAccess := true
+sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    Image: "ubuntu:24.04",
+    Lifecycle: &opensandbox.SandboxLifecycle{
+        IdlePolicy: &opensandbox.IdlePolicy{
+            IdleTimeoutSeconds: &idleTimeout,
+            OnIdle:             opensandbox.OnIdlePause,
+            WakeOnAccess:       &wakeOnAccess,
+        },
+    },
+})
+```
+
+`ActiveProbe` lets the application veto a pause while real work runs without producing ingress traffic: declare an endpoint answering `{"active": bool, "message"?: string}` and the server polls it when the sandbox is otherwise idle; a busy answer resets the idle clock. Invalid policies fail fast client-side through `IdlePolicy.Validate()`.
+
+### Renewal policy (renew-on-access)
+
+`SandboxLifecycle.RenewalPolicy.ExtendSeconds` (OSEP-0009) opts the sandbox into automatic expiration extension on observed access: each proxied or gateway-observed request moves the expiration to `max(now + ExtendSeconds, current expiresAt)`. It is control-plane state and never reaches the guest. Requires the server operator to enable `[renew_intent]` — see [Renew-on-Access](/guides/renew-on-access). The deprecated `extensions["access.renew.extend.seconds"]` key remains supported through 1.x and is removed in 2.0. Invalid policies fail fast client-side through `RenewalPolicy.Validate()`.
+
+```go
+sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    Image: "ubuntu:24.04",
+    Lifecycle: &opensandbox.SandboxLifecycle{
+        RenewalPolicy: &opensandbox.RenewalPolicy{ExtendSeconds: 3600},
+    },
+})
+```
+
+### Retry policy
+
+`ConnectionConfig.Retry` and `WithRetry` retry transient failures with exponential backoff. Idempotent methods (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`) retry `429`, `502`, `503`, and `504` by default. `POST` and `PATCH` retry only dial, proxy-connect, and TLS-handshake failures that are provably pre-send by default; status-code retries for writes are opt-in because a replay can duplicate a sandbox, session, command, or file mutation. Set `RetryableStatusCodesNonIdempotent` only when the operation is idempotent at the application layer or duplicate execution is acceptable:
+
+```go
+config.Retry = &opensandbox.RetryConfig{
+    MaxRetries:                        3,
+    InitialBackoff:                    500 * time.Millisecond,
+    RetryableStatusCodesNonIdempotent: []int{http.StatusServiceUnavailable},
+}
+```
+
+SSE bootstraps do not use the generic retry loop, even when a write status code is opted in. The OSEP-0024 wake retry below still covers the request that starts the stream.
+
+### Wake retry
+
+A request to a paused sandbox may arrive while its restore is still in progress. The gateway answers `503` with the `OpenSandbox-Wake: expired` marker; the client recognizes it and resends the original request after the `Retry-After` delay (safe for any method — the marker proves the request was never forwarded). The wake budget defaults to 5 attempts / 60 seconds across all wake cycles; when it is exhausted the client returns a `*SandboxWakeTimeoutError` (carrying `Attempts` and `Waited`) while the server-side resume continues in the background. Bare `503` responses follow the existing retry rules untouched. Wake retry is active whenever a `WithRetry` config is set (`WakeRetryEnabled` defaults to enabled even for hand-built configs; pass `WakeRetryDisabled()` to opt out). It also covers the request that starts an SSE stream, so a command or code execution against an auto-paused sandbox wakes it like any other request; once a stream is established, its events are never re-executed.
+
+## Fsb Template Management
+
+fsb (fast-sandbox microVM) golden-image templates are managed through `SandboxManager`. Template builds are asynchronous: `CreateTemplate` returns with `Status.Phase` set to `Pending`; poll `GetTemplate` until the phase reaches `Succeeded` or `Failed`. Only a `Succeeded` template can create sandboxes. Template management requires a configured Fsb provider on Kubernetes. Replace the publish URI with a location configured for your server.
+
+```go
+manager := opensandbox.NewSandboxManager(config)
+
+buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+defer cancel()
+
+// Start the async build (starts at TemplatePhasePending)
+template, err := manager.CreateTemplate(buildCtx, opensandbox.CreateTemplateRequest{
+    Image:          "alpine:3.19",
+    Publish:        "s3://bucket/publish",
+    ResourceLimits: opensandbox.ResourceLimits{"cpu": "1", "memory": "512Mi", "disk": "2Gi"},
+    Readiness:      &opensandbox.TemplateReadiness{Probe: "tcp://127.0.0.1:44772"},
+    Metadata:       map[string]string{"team": "backend"},
+})
+if err != nil {
+    return err
+}
+
+// Poll until the build finishes
+for template.Status.Phase != opensandbox.TemplatePhaseSucceeded &&
+    template.Status.Phase != opensandbox.TemplatePhaseFailed {
+    select {
+    case <-buildCtx.Done():
+        return buildCtx.Err()
+    case <-time.After(2 * time.Second):
+    }
+    template, err = manager.GetTemplate(buildCtx, template.TemplateID)
+    if err != nil {
+        return err
+    }
+}
+if template.Status.Phase == opensandbox.TemplatePhaseFailed {
+    return fmt.Errorf("template build failed: %s", template.TemplateID)
+}
+
+// List with metadata filters (1-indexed paging)
+listed, err := manager.ListTemplates(ctx, opensandbox.ListTemplatesOptions{
+    Metadata: map[string]string{"team": "backend"},
+    Page:     1,
+    PageSize: 20,
+})
+if err != nil {
+    return err
+}
+fmt.Println(listed)
+
+// When no longer needed: manager.DeleteTemplate(ctx, template.TemplateID)
+```
+
+### Creating a Sandbox from a Template
+
+Use `CreateSandboxFromTemplate` to create a sandbox from a `Succeeded` template. Template mode fixes the workload shape on the server: only `Metadata`, `NetworkPolicy` and `Extensions` may accompany the template ID, and `TimeoutSeconds` is required.
+
+```go
+sandbox, err := opensandbox.CreateSandboxFromTemplate(ctx, config, "tpl-abc",
+    opensandbox.SandboxFromTemplateOptions{
+        TimeoutSeconds: 600,
+        NetworkPolicy: &opensandbox.NetworkPolicy{
+            DefaultAction: "deny",
+            Egress: []opensandbox.NetworkRule{
+                {Action: "allow", Target: "api.example.com"},
+            },
+        },
+    })
+if err != nil {
+    return err
+}
+
+fmt.Println(sandbox.Origin()) // "template"
+```
+
+## Snapshots and metadata
+
+`Sandbox.CreateSnapshot` and `SandboxManager.CreateSnapshot` start snapshot creation. Use manager `GetSnapshot`, `ListSnapshots`, and `DeleteSnapshot` to manage snapshots, then pass `SnapshotID` to `SandboxCreateOptions` to restore. Poll snapshot status before restore. Use `Sandbox.PatchMetadata` or `SandboxManager.PatchSandboxMetadata` to add/replace keys; nil values remove keys.
+
+Snapshot support depends on the runtime and server configuration. Renew the source sandbox first if its remaining TTL may expire during snapshot creation. Wait for `Ready` before restoring. This example retains the snapshot for reuse:
+
+```go
+manager := opensandbox.NewSandboxManager(config)
+snapshot, err := sandbox.CreateSnapshot(ctx, opensandbox.CreateSnapshotRequest{Name: "demo"})
+if err != nil {
+    return err
+}
+fmt.Println("Snapshot:", snapshot.ID)
+snapshotCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+defer cancel()
+for {
+    snapshot, err = manager.GetSnapshot(snapshotCtx, snapshot.ID)
+    if err != nil {
+        return err
+    }
+    if snapshot.Status.State == opensandbox.SnapshotStateReady {
+        break
+    }
+    if snapshot.Status.State == opensandbox.SnapshotStateFailed {
+        return fmt.Errorf("snapshot failed: %s", snapshot.Status.Message)
+    }
+    select {
+    case <-snapshotCtx.Done():
+        return snapshotCtx.Err()
+    case <-time.After(2 * time.Second):
+    }
+}
+restored, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
+    SnapshotID: snapshot.ID,
+})
+if err != nil {
+    return err
+}
+defer restored.Close()
+defer restored.Kill(context.Background())
+fmt.Println(restored.ID())
+// When no longer needed: manager.DeleteSnapshot(ctx, snapshot.ID)
+```
+
+Add/replace a metadata key and remove another:
+
+```go
+project := "demo"
+if _, err := sandbox.PatchMetadata(ctx, opensandbox.MetadataPatch{
+    "project": &project, "obsolete-key": nil,
+}); err != nil {
+    return err
+}
+```
 
 ## API Reference
 
@@ -317,9 +655,16 @@ Created with `NewLifecycleClient(baseURL, apiKey string, opts ...Option)`.
 | `DeleteSandbox(ctx, id)` | Delete a sandbox |
 | `PauseSandbox(ctx, id)` | Pause a running sandbox |
 | `ResumeSandbox(ctx, id)` | Resume a paused sandbox |
-| `RenewExpiration(ctx, id, expiresAt)` | Extend sandbox expiration time |
+| `RenewExpiration(ctx, id, expiresAt)` | Set sandbox expiration to a future timestamp (may shorten or extend) |
 | `GetEndpoint(ctx, sandboxID, port, useServerProxy)` | Get public endpoint for a sandbox port |
-| `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with OSEP-0011 route token |
+| `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with a signed route token |
+| `CreateTemplate(ctx, req)` | Declare a fsb template (async golden-image build) |
+| `GetTemplate(ctx, templateID)` | Get a template with its latest build status |
+| `ListTemplates(ctx, opts)` | List templates with metadata filtering and pagination |
+| `DeleteTemplate(ctx, templateID)` | Delete a template |
+| `GetNetworkPolicy(ctx, sandboxID)` | Get a sandbox's egress policy from the control plane |
+| `PatchNetworkPolicy(ctx, sandboxID, rules)` | Merge egress rules into a sandbox's policy |
+| `DeleteNetworkPolicyRules(ctx, sandboxID, targets)` | Remove a sandbox's egress rules by target |
 
 ### ExecdClient
 
@@ -407,7 +752,7 @@ Created with `NewEgressClient(baseURL, authToken string, opts ...Option)`.
 Methods that stream output (`RunCommand`, `ExecuteCode`, `RunInSession`, `WatchMetrics`) accept an `EventHandler` callback:
 
 ```go
-type EventHandler func(event StreamEvent) error
+type EventHandler func(event opensandbox.StreamEvent) error
 ```
 
 Each `StreamEvent` contains:
@@ -419,16 +764,18 @@ Return a non-nil error from the handler to stop processing the stream early.
 
 ## Client Options
 
-All client constructors accept optional `Option` functions:
+All client constructors accept optional `Option` functions. Custom HTTP clients and health checks must honor context cancellation for timeouts to take effect:
 
 ```go
-client := opensandbox.NewLifecycleClient(url, key,
-    opensandbox.WithHTTPClient(myHTTPClient),
+// Reuse the resolved endpoint from the streaming example.
+execClient := opensandbox.NewExecdClient(
+    config.Protocol + "://" + endpoint.Endpoint, "",
+    opensandbox.WithHeaders(endpoint.Headers),
+    opensandbox.WithHTTPClient(&http.Client{Timeout: 60 * time.Second}),
 )
-
-client := opensandbox.NewExecdClient(url, token,
-    opensandbox.WithTimeout(60 * time.Second),
-)
+if err := execClient.Ping(ctx); err != nil {
+    return err
+}
 ```
 
 ::: info TLS Certificate Strength
@@ -436,17 +783,27 @@ SDK-created HTTP clients enforce NIST 2030 minimum TLS certificate strength by d
 :::
 
 ::: tip SDK Telemetry
-`CreateSandbox` reports create latency to `POST /v1/metrics/events` by default. Set `ConnectionConfig.DisableMetrics` or `OPENSANDBOX_DISABLE_METRICS=1` to opt out. See [SDK Telemetry](/guides/sdk-telemetry).
+`CreateSandbox` reports create latency to `POST /v1/metrics/events` by default. Set `ConnectionConfig.DisableMetrics` or `OPENSANDBOX_DISABLE_METRICS=1` to opt out. See [SDK Telemetry](/sdks/observability#creation-metrics).
 :::
+
+### Follow redirects
+
+The Go SDK retains Go's standard redirect behavior, including for file uploads and downloads. On redirects to a different origin (scheme, hostname, or effective port), it removes the client's default and configured authentication headers (including `X-EXECD-ACCESS-TOKEN`, `X-API-Key`, or a custom `WithAuthHeader` name), as well as all headers whose names start with `OPEN-SANDBOX-` or `OPENSANDBOX-`, case-insensitively. Each redirect destination is compared with the initial request's origin, so subsequent hops on another origin remain protected. Same-origin redirects retain these headers. Unrelated custom headers continue to follow Go's standard forwarding rules.
+
+This protection applies to lifecycle (including creation metrics), execd, egress, file transfers, and SSE requests. A custom `http.Client.CheckRedirect` supplied through `WithHTTPClient` or `ConnectionConfig.HTTPClient` still controls whether redirects are followed; the SDK removes protected headers after that callback runs, even if the callback adds them again. The SDK copies the supplied HTTP client rather than modifying it. HTTP and HTTPS default ports are treated as equivalent to explicit ports 80 and 443 respectively. Upload method conversion and body replay follow Go's existing rules; this protection does not enable replay of streaming multipart bodies.
 
 ## Error Handling
 
 Non-2xx responses are returned as `*opensandbox.APIError`:
 
 ```go
-_, err := lc.GetSandbox(ctx, "nonexistent")
-if apiErr, ok := err.(*opensandbox.APIError); ok {
-    fmt.Printf("HTTP %d: %s — %s\n", apiErr.StatusCode, apiErr.Response.Code, apiErr.Response.Message)
+_, err := sandbox.GetInfo(ctx)
+if err != nil {
+    var apiErr *opensandbox.APIError
+    if errors.As(err, &apiErr) {
+        fmt.Printf("HTTP %d: %s — %s\n", apiErr.StatusCode, apiErr.Response.Code, apiErr.Response.Message)
+    }
+    return err
 }
 ```
 

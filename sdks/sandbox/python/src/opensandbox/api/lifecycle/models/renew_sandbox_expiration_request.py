@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,8 @@ class RenewSandboxExpirationRequest:
     """
     Attributes:
         expires_at (datetime.datetime): New absolute expiration time in UTC (RFC 3339 format).
-            Must be in the future and after the current expiresAt time.
+            Must be in the future. May be earlier than, equal to, or later than the current expiresAt.
+            The creation-time limit `server.max_sandbox_timeout_seconds` does not apply.
 
             Example: "2025-11-16T14:30:45Z"
     """

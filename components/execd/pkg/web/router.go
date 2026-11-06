@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,51 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
+	"github.com/alibaba/opensandbox/execd/pkg/flag"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/execd/pkg/web/controller"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
-// NewRouter builds a Gin engine with all execd routes.
+// Paths that must be reachable before the RuntimeBinding is applied (and
+// without the API access token): liveness, readiness, and the internal
+// runtime-init call.
+//
+// /internal/init is an internal control-plane protocol: it is not part of
+// the public execd API surface and carries no external compatibility
+// guarantee.
+var preInitPaths = map[string]struct{}{
+	"/ping":          {},
+	"/ready":         {},
+	"/internal/init": {},
+}
+
 func NewRouter(accessToken string) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), accessTokenMiddleware(accessToken), ProxyMiddleware())
+	// The runtime-init gate runs before auth: pre-init business APIs answer
+	// a uniform 503 regardless of credentials, and the access-token check
+	// only sees requests that passed the gate.
+	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), runtimeInitGate(), accessTokenMiddleware(accessToken), ProxyMiddleware())
 
 	r.GET("/ping", controller.PingHandler)
+	r.POST("/internal/init", withInit(func(c *controller.InitController) { c.Init() }))
+	r.GET("/ready", withInit(func(c *controller.InitController) { c.Ready() }))
 
+	registerFilesystemRoutes(r.Group(""))
+	registerFilesystemRoutes(r.Group("/v1/filesystem/:uid/:gid", filesystemIdentityMiddleware()))
+
+	registerExecutionRoutes(r)
+	return r
+}
+
+// Both entrypoints use the same handlers. Identity-scoped requests are
+// intercepted before any filesystem access and dispatched to a child process.
+func registerFilesystemRoutes(r *gin.RouterGroup) {
 	files := r.Group("/files")
 	{
 		files.DELETE("", withFilesystem(func(c *controller.FilesystemController) { c.RemoveFiles() }))
@@ -52,6 +82,9 @@ func NewRouter(accessToken string) *gin.Engine {
 		directories.DELETE("", withFilesystem(func(c *controller.FilesystemController) { c.RemoveDirs() }))
 	}
 
+}
+
+func registerExecutionRoutes(r *gin.Engine) {
 	code := r.Group("/code")
 	{
 		code.POST("", withCode(func(c *controller.CodeInterpretingController) { c.RunCode() }))
@@ -117,7 +150,6 @@ func NewRouter(accessToken string) *gin.Engine {
 		isolated.GET("/capabilities", withIsolated(func(c *controller.IsolatedSessionController) { c.Capabilities() }))
 	}
 
-	return r
 }
 
 func withFilesystem(fn func(*controller.FilesystemController)) gin.HandlerFunc {
@@ -150,18 +182,52 @@ func withIsolated(fn func(*controller.IsolatedSessionController)) gin.HandlerFun
 	}
 }
 
-func accessTokenMiddleware(token string) gin.HandlerFunc {
+func withInit(fn func(*controller.InitController)) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		if token == "" {
+		fn(controller.NewInitController(ctx))
+	}
+}
+
+// accessTokenMiddleware guards API entrypoints. Once a RuntimeBinding with
+// a token hash is applied (/internal/init is authoritative), request tokens
+// are verified against the hash; before that, the legacy container-env
+// token applies. /internal/init, /ready, and /ping are always reachable
+// without the token.
+func accessTokenMiddleware(legacyToken string) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if _, preInit := preInitPaths[ctx.FullPath()]; preInit {
 			ctx.Next()
 			return
 		}
 
-		requestedToken := ctx.GetHeader(model.ApiAccessTokenHeader)
-		if requestedToken == "" || requestedToken != token {
-			ctx.AbortWithStatusJSON(http.StatusUnauthorized, map[string]any{
-				"error": "Unauthorized: invalid or missing header " + model.ApiAccessTokenHeader,
-			})
+		presented, valid := requestAccessToken(ctx)
+		if !valid {
+			abortUnauthorized(ctx)
+			return
+		}
+
+		if b := binding.Current(); b != nil && b.HasAccessToken {
+			if presented == "" || !b.VerifyAccessToken(presented) {
+				abortUnauthorized(ctx)
+				return
+			}
+			ctx.Next()
+			return
+		}
+
+		// TODO(runtime-init): dynamic authentication is undecided. When the
+		// binding carries no token hash (/internal/init omitted
+		// accessTokenHash), auth falls back to the legacy container-env
+		// token below. This is an internal-protocol compatibility fallback:
+		// it must not be relied on long-term, and the control plane should
+		// always deliver a token hash until a credential scheme replaces it.
+		if legacyToken == "" {
+			ctx.Next()
+			return
+		}
+
+		if presented == "" || presented != legacyToken {
+			abortUnauthorized(ctx)
 			return
 		}
 
@@ -169,9 +235,60 @@ func accessTokenMiddleware(token string) gin.HandlerFunc {
 	}
 }
 
+// requestAccessToken selects the existing API-token header or, for PTY
+// WebSocket upgrades only, a browser credential from the subprotocol list.
+func requestAccessToken(ctx *gin.Context) (string, bool) {
+	r := ctx.Request
+	token := ""
+	if r.Method == http.MethodGet && ctx.FullPath() == "/pty/:sessionId/ws" && websocket.IsWebSocketUpgrade(r) {
+		var valid bool
+		token, valid = ptyWebSocketAccessToken(r)
+		if !valid {
+			return "", false
+		}
+	}
+	// Presence, not a non-empty value, determines precedence. A bad explicit
+	// header must not be rescued by a valid subprotocol credential.
+	if _, present := r.Header[http.CanonicalHeaderKey(model.ApiAccessTokenHeader)]; present {
+		return r.Header.Get(model.ApiAccessTokenHeader), true
+	}
+	return token, true
+}
+
+func abortUnauthorized(ctx *gin.Context) {
+	ctx.AbortWithStatusJSON(http.StatusUnauthorized, map[string]any{
+		"error": "Unauthorized: invalid or missing header " + model.ApiAccessTokenHeader,
+	})
+}
+
+// runtimeInitGate serves only liveness, readiness, and /internal/init until
+// runtime init completes (runtime-init mode). The gate checks the manager's
+// ready state — not binding presence — because the binding is installed
+// atomically mid-apply: a failed apply (500) keeps the binding but must
+// stay gated since /ready reports 503 too.
+func runtimeInitGate() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if !flag.RuntimeInit {
+			ctx.Next()
+			return
+		}
+		if _, preInit := preInitPaths[ctx.FullPath()]; preInit {
+			ctx.Next()
+			return
+		}
+		if controller.GetRuntimeInitManager().Ready() {
+			ctx.Next()
+			return
+		}
+		ctx.AbortWithStatusJSON(http.StatusServiceUnavailable, map[string]any{
+			"error": "execd is not initialized yet: POST /internal/init must be called first",
+		})
+	}
+}
+
 func logMiddleware() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		log.Info("Requested: %v - %v", ctx.Request.Method, ctx.Request.URL.String())
+		log.Info("http: %s %s", ctx.Request.Method, ctx.Request.URL.String())
 		ctx.Next()
 	}
 }

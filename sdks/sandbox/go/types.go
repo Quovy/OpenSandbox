@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,10 @@ package opensandbox
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // SandboxState represents the high-level lifecycle state of a sandbox.
@@ -136,9 +139,18 @@ type NetworkPolicy struct {
 }
 
 // NetworkRule defines a single egress allow/deny rule.
+//
+// Target may be a FQDN, wildcard domain ("*.example.com"), IP, or CIDR. It
+// may be omitted when Ports is set: the rule then scopes by TCP destination
+// port alone, across all IPv4/IPv6 destinations. A domain Target combined
+// with Ports is rejected by the server/sidecar (domain rules have no port
+// dimension). Port limits enforced server-side (this SDK does not
+// pre-validate): each port 1-65535, at most 256 ports per rule, no
+// duplicates.
 type NetworkRule struct {
 	Action string `json:"action"`
-	Target string `json:"target"`
+	Target string `json:"target,omitempty"`
+	Ports  []int  `json:"ports,omitempty"`
 }
 
 // CredentialProxyConfig enables Credential Vault transparent proxy support at
@@ -147,16 +159,207 @@ type CredentialProxyConfig struct {
 	Enabled bool `json:"enabled"`
 }
 
+// LifecycleHook is a command executed before the sandbox entrypoint starts.
+type LifecycleHook struct {
+	Command        []string `json:"command"`
+	TimeoutSeconds *int     `json:"timeoutSeconds,omitempty"`
+}
+
+// PeriodicLifecycleHook is a named command scheduled while the sandbox is running.
+type PeriodicLifecycleHook struct {
+	Name           string   `json:"name"`
+	Schedule       string   `json:"schedule"`
+	Command        []string `json:"command"`
+	TimeoutSeconds *int     `json:"timeoutSeconds,omitempty"`
+}
+
+// OnIdlePause is the only idle action supported today (OSEP-0024). The value
+// exists as a named constant so future actions are additive.
+const OnIdlePause = "pause"
+
+const (
+	// IdleTimeoutMinSeconds is the smallest accepted idle threshold X.
+	IdleTimeoutMinSeconds = 30
+	// IdleTimeoutMaxSeconds is the largest accepted idle threshold X.
+	IdleTimeoutMaxSeconds = 86400
+	// ProbeTimeoutMinSeconds is the smallest accepted activity probe timeout.
+	ProbeTimeoutMinSeconds = 1
+	// ProbeTimeoutMaxSeconds is the largest accepted activity probe timeout.
+	ProbeTimeoutMaxSeconds = 10
+	// RenewExtendMinSeconds is the smallest accepted renew-on-access
+	// extension window (OSEP-0009).
+	RenewExtendMinSeconds = 300
+	// RenewExtendMaxSeconds is the largest accepted renew-on-access
+	// extension window (OSEP-0009).
+	RenewExtendMaxSeconds = 86400
+)
+
+// ActivityProbe is an application-declared activity probe (OSEP-0024).
+//
+// Endpoint inside the sandbox that answers {"active": bool, "message"?: string}
+// with 200 while work is in progress. When the sandbox is otherwise idle, the
+// server issues GET Path on Port; a busy answer counts as activity and resets
+// the idle clock, while an explicit "not active", any failure, or a timeout
+// records nothing.
+type ActivityProbe struct {
+	Port int `json:"port"`
+	// Path is the absolute HTTP path of the probe endpoint. Must start with
+	// "/" and must not contain whitespace or control characters.
+	Path string `json:"path"`
+	// TimeoutSeconds is the probe request budget in seconds (1-10). The
+	// server defaults to 2 when omitted.
+	TimeoutSeconds *int `json:"timeoutSeconds,omitempty"`
+}
+
+// IdlePolicy declares the idle behavior of a sandbox (OSEP-0024, fast-sandbox
+// only).
+//
+// With IdleTimeoutSeconds, the sandbox is auto-paused after that many seconds
+// without ingress-observed activity. Without it, the policy is wake-only: the
+// sandbox is never auto-paused, but a (manually) paused sandbox wakes on
+// access. Omitting the whole policy preserves non-automated behavior exactly.
+type IdlePolicy struct {
+	// IdleTimeoutSeconds is the idle threshold X in seconds (30-86400):
+	// the sandbox is auto-paused after X continuously idle seconds.
+	// Required together with OnIdle; absent together with it means a
+	// wake-only policy.
+	IdleTimeoutSeconds *int `json:"idleTimeoutSeconds,omitempty"`
+	// OnIdle is the action taken at the idle threshold. Only OnIdlePause
+	// exists today. Required with, and only valid with,
+	// IdleTimeoutSeconds.
+	OnIdle string `json:"onIdle,omitempty"`
+	// WakeOnAccess controls whether incoming traffic may wake the sandbox
+	// from Paused. Defaults to true when omitted.
+	WakeOnAccess *bool `json:"wakeOnAccess,omitempty"`
+	// ActiveProbe is the application-declared activity probe (relevant
+	// only with auto-pause).
+	ActiveProbe *ActivityProbe `json:"activeProbe,omitempty"`
+}
+
+// Validate checks the idle policy against the server's create-time rules so
+// invalid policies fail fast client-side.
+func (p *IdlePolicy) Validate() error {
+	if p == nil {
+		return nil
+	}
+	hasTimeout := p.IdleTimeoutSeconds != nil
+	if hasTimeout {
+		t := *p.IdleTimeoutSeconds
+		if t < IdleTimeoutMinSeconds || t > IdleTimeoutMaxSeconds {
+			return &InvalidArgumentError{
+				Field:   "IdleTimeoutSeconds",
+				Message: fmt.Sprintf("must be an integer between %d and %d, got %d", IdleTimeoutMinSeconds, IdleTimeoutMaxSeconds, t),
+			}
+		}
+	}
+	if p.OnIdle != "" {
+		if !hasTimeout {
+			return &InvalidArgumentError{
+				Field:   "OnIdle",
+				Message: "must be omitted when IdleTimeoutSeconds is omitted (a policy without a timeout is wake-only)",
+			}
+		}
+		if p.OnIdle != OnIdlePause {
+			return &InvalidArgumentError{Field: "OnIdle", Message: fmt.Sprintf("must be %q, got %q", OnIdlePause, p.OnIdle)}
+		}
+	} else if hasTimeout {
+		return &InvalidArgumentError{Field: "OnIdle", Message: "is required when IdleTimeoutSeconds is set"}
+	}
+	if p.ActiveProbe != nil {
+		if !hasTimeout {
+			return &InvalidArgumentError{
+				Field:   "ActiveProbe",
+				Message: "requires IdleTimeoutSeconds; the probe is relevant only with auto-pause",
+			}
+		}
+		if p.ActiveProbe.Port < 1 || p.ActiveProbe.Port > 65535 {
+			return &InvalidArgumentError{
+				Field:   "ActiveProbe.Port",
+				Message: fmt.Sprintf("must be an integer between 1 and 65535, got %d", p.ActiveProbe.Port),
+			}
+		}
+		path := p.ActiveProbe.Path
+		if path == "" {
+			return &InvalidArgumentError{Field: "ActiveProbe.Path", Message: "must be a non-empty absolute HTTP path"}
+		}
+		if utf8.RuneCountInString(path) > 512 {
+			return &InvalidArgumentError{Field: "ActiveProbe.Path", Message: "must not exceed 512 characters"}
+		}
+		if !strings.HasPrefix(path, "/") {
+			return &InvalidArgumentError{Field: "ActiveProbe.Path", Message: "must be an absolute HTTP path starting with '/'"}
+		}
+		if strings.IndexFunc(path, func(r rune) bool {
+			return unicode.IsSpace(r) || r < 0x20 || r == 0x7f
+		}) >= 0 {
+			return &InvalidArgumentError{Field: "ActiveProbe.Path", Message: "must not contain whitespace or control characters"}
+		}
+		if t := p.ActiveProbe.TimeoutSeconds; t != nil && (*t < ProbeTimeoutMinSeconds || *t > ProbeTimeoutMaxSeconds) {
+			return &InvalidArgumentError{
+				Field:   "ActiveProbe.TimeoutSeconds",
+				Message: fmt.Sprintf("must be an integer between %d and %d, got %d", ProbeTimeoutMinSeconds, ProbeTimeoutMaxSeconds, *t),
+			}
+		}
+	}
+	return nil
+}
+
+// RenewalPolicy declares the renew-on-access behavior of a sandbox
+// (OSEP-0009): observed access moves the expiration to
+// max(now + ExtendSeconds, current). Control-plane policy; supersedes the
+// deprecated extensions["access.renew.extend.seconds"] key.
+type RenewalPolicy struct {
+	// ExtendSeconds is the extension window X in seconds (300-86400) for
+	// each access-driven renewal.
+	ExtendSeconds int `json:"extendSeconds"`
+}
+
+// Validate checks the renewal policy against the server's create-time rules
+// so invalid policies fail fast client-side.
+func (p *RenewalPolicy) Validate() error {
+	if p == nil {
+		return nil
+	}
+	if p.ExtendSeconds < RenewExtendMinSeconds || p.ExtendSeconds > RenewExtendMaxSeconds {
+		return &InvalidArgumentError{
+			Field:   "ExtendSeconds",
+			Message: fmt.Sprintf("must be an integer between %d and %d, got %d", RenewExtendMinSeconds, RenewExtendMaxSeconds, p.ExtendSeconds),
+		}
+	}
+	return nil
+}
+
+// SandboxLifecycle contains optional lifecycle configuration applied during
+// sandbox creation.
+type SandboxLifecycle struct {
+	PreStart *LifecycleHook          `json:"preStart,omitempty"`
+	Periodic []PeriodicLifecycleHook `json:"periodic,omitempty"`
+	// IdlePolicy is the auto-pause and wake-on-access behavior (OSEP-0024).
+	// Supported only by the fast-sandbox backend; other backends reject the
+	// field. Control-plane policy: it never reaches the guest.
+	IdlePolicy *IdlePolicy `json:"idlePolicy,omitempty"`
+	// RenewalPolicy is the renew-on-access behavior (OSEP-0009).
+	// Control-plane policy; supersedes the deprecated
+	// extensions["access.renew.extend.seconds"] key.
+	RenewalPolicy *RenewalPolicy `json:"renewalPolicy,omitempty"`
+}
+
 // CreateSandboxRequest is the request body for creating a new sandbox.
 type CreateSandboxRequest struct {
-	Image            *ImageSpec             `json:"image,omitempty"`
-	SnapshotID       string                 `json:"snapshotId,omitempty"`
+	Image      *ImageSpec `json:"image,omitempty"`
+	SnapshotID string     `json:"snapshotId,omitempty"`
+	// TemplateID creates the sandbox from a Succeeded fsb template. It is
+	// mutually exclusive with Image and SnapshotID; in template mode the
+	// workload shape is fixed by the template's golden image, so only
+	// Metadata, NetworkPolicy and Extensions may accompany it, and Timeout
+	// is required.
+	TemplateID       string                 `json:"templateId,omitempty"`
 	Timeout          *int                   `json:"timeout,omitempty"`
 	ResourceLimits   ResourceLimits         `json:"resourceLimits"`
 	ResourceRequests ResourceLimits         `json:"resourceRequests,omitempty"`
 	Env              map[string]string      `json:"env,omitempty"`
 	SecureAccess     bool                   `json:"secureAccess,omitempty"`
 	Metadata         map[string]string      `json:"metadata,omitempty"`
+	Lifecycle        *SandboxLifecycle      `json:"lifecycle,omitempty"`
 	Entrypoint       []string               `json:"entrypoint,omitempty"`
 	NetworkPolicy    *NetworkPolicy         `json:"networkPolicy,omitempty"`
 	CredentialProxy  *CredentialProxyConfig `json:"credentialProxy,omitempty"`
@@ -165,19 +368,45 @@ type CreateSandboxRequest struct {
 	Platform         *PlatformSpec          `json:"platform,omitempty"`
 }
 
+// AllocationMode identifies how the runtime allocated a sandbox.
+type AllocationMode string
+
+const (
+	// AllocationModePool indicates that the sandbox was allocated from a pool.
+	AllocationModePool AllocationMode = "pool"
+)
+
+// AllocationState describes the confirmed allocation state of a sandbox.
+type AllocationState string
+
+const (
+	// AllocationStateAllocated indicates that the pool allocation is active.
+	AllocationStateAllocated AllocationState = "allocated"
+)
+
+// AllocationSummary is the public summary of a confirmed active pool
+// allocation. It is present only when the runtime confirms an active pool
+// allocation.
+type AllocationSummary struct {
+	Mode    AllocationMode  `json:"mode"`
+	PoolRef string          `json:"poolRef"`
+	State   AllocationState `json:"state"`
+}
+
 // SandboxInfo represents a runtime execution environment provisioned from a
 // container image, as returned by the lifecycle API.
 type SandboxInfo struct {
-	ID         string            `json:"id"`
-	Image      *ImageSpec        `json:"image,omitempty"`
-	SnapshotID string            `json:"snapshotId,omitempty"`
-	Status     SandboxStatus     `json:"status"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Extensions map[string]string `json:"extensions,omitempty"`
-	Entrypoint []string          `json:"entrypoint"`
-	ExpiresAt  *time.Time        `json:"expiresAt,omitempty"`
-	CreatedAt  time.Time         `json:"createdAt"`
-	Platform   *PlatformSpec     `json:"platform,omitempty"`
+	ID         string             `json:"id"`
+	Image      *ImageSpec         `json:"image,omitempty"`
+	SnapshotID string             `json:"snapshotId,omitempty"`
+	Status     SandboxStatus      `json:"status"`
+	Metadata   map[string]string  `json:"metadata,omitempty"`
+	Extensions map[string]string  `json:"extensions,omitempty"`
+	Entrypoint []string           `json:"entrypoint"`
+	ExpiresAt  *time.Time         `json:"expiresAt,omitempty"`
+	CreatedAt  time.Time          `json:"createdAt"`
+	Platform   *PlatformSpec      `json:"platform,omitempty"`
+	Allocation *AllocationSummary `json:"allocation,omitempty"`
 }
 
 type SnapshotState string
@@ -245,6 +474,158 @@ type ListSnapshotsOptions struct {
 type Endpoint struct {
 	Endpoint string            `json:"endpoint"`
 	Headers  map[string]string `json:"headers,omitempty"`
+	// Origin is the sandbox origin reported by the server's
+	// OPEN-SANDBOX-ORIGIN response header (see SandboxOrigin). Empty when
+	// the server does not send it.
+	Origin SandboxOrigin `json:"-"`
+}
+
+// SandboxOrigin describes what backs a sandbox.
+//
+// The protocol currently defines a single meaningful value:
+// SandboxOriginTemplate, reported by the server via the
+// OPEN-SANDBOX-ORIGIN response header on endpoint lookups and set locally
+// when the sandbox was explicitly created from a template. Template-backed
+// sandboxes have no sandbox-side egress sidecar: egress policy operations
+// go through the lifecycle control plane. Anything else means the sandbox
+// is not template-backed.
+//
+// The set of origin values may grow in future versions; treat a missing or
+// unknown origin as "not template-backed".
+//
+// See specs/sandbox-lifecycle.yml#/components/headers/SandboxOrigin.
+type SandboxOrigin string
+
+const (
+	// SandboxOriginTemplate indicates the sandbox runs on a fsb
+	// golden-image template.
+	SandboxOriginTemplate SandboxOrigin = "template"
+
+	// SandboxOriginUnknown indicates the origin could not be determined
+	// (created from an image or snapshot, or an older server that does not
+	// send the origin header).
+	SandboxOriginUnknown SandboxOrigin = "unknown"
+)
+
+// SandboxOriginHeader is the lifecycle response header that reports a
+// sandbox's origin on endpoint lookups.
+const SandboxOriginHeader = "Open-Sandbox-Origin"
+
+// TemplatePhase is the high-level lifecycle phase of a fsb template build.
+// The server may introduce new phases in future versions; handle unknown
+// values gracefully.
+type TemplatePhase string
+
+const (
+	// TemplatePhasePending indicates the build was accepted but not started.
+	TemplatePhasePending TemplatePhase = "Pending"
+	// TemplatePhaseBuilding indicates the golden-image build is in progress.
+	TemplatePhaseBuilding TemplatePhase = "Building"
+	// TemplatePhaseSucceeded indicates the build finished; the template can
+	// back sandbox creation.
+	TemplatePhaseSucceeded TemplatePhase = "Succeeded"
+	// TemplatePhaseFailed indicates the build failed; see
+	// TemplateStatus.Message.
+	TemplatePhaseFailed TemplatePhase = "Failed"
+)
+
+// TemplateFormat is the storage encoding of a template's produced snapshot
+// set.
+type TemplateFormat string
+
+const (
+	// TemplateFormatNative stores raw snapshots.
+	TemplateFormatNative TemplateFormat = "native"
+	// TemplateFormatOverlayBD stores overlaybd snapshots (server default).
+	TemplateFormatOverlayBD TemplateFormat = "overlaybd"
+)
+
+// TemplateReadiness is the build-side readiness gate for a fsb template.
+type TemplateReadiness struct {
+	// Probe is checked first during the golden-image build;
+	// e.g. "tcp://127.0.0.1:44772" or "cmd://<command>".
+	Probe string `json:"probe,omitempty"`
+	// WarmupSeconds is the fallback warmup window in seconds (default 60).
+	WarmupSeconds *int `json:"warmupSeconds,omitempty"`
+}
+
+// TemplateStatus is the build status of a fsb template.
+type TemplateStatus struct {
+	Phase TemplatePhase `json:"phase"`
+	// ManifestRef is the S3 manifest reference of the published artifacts;
+	// present when the phase is Succeeded.
+	ManifestRef string `json:"manifestRef,omitempty"`
+	// Message is the failure reason when the phase is Failed.
+	Message string `json:"message,omitempty"`
+}
+
+// CreateTemplateRequest is the request body for creating a fsb (fast-sandbox)
+// template: a golden-image build.
+//
+// The build runs asynchronously: the response starts at
+// TemplatePhasePending; poll GetTemplate until the phase is Succeeded (or
+// Failed). Kernel, execd and guest init are server-side build inputs, not
+// client fields.
+type CreateTemplateRequest struct {
+	// Image is the source OCI image reference the golden image is built from.
+	Image string `json:"image"`
+	// Publish is the S3-compatible publish target for the built artifacts,
+	// e.g. "s3://bucket/publish".
+	Publish string `json:"publish"`
+	// ResourceLimits is the guest machine sizing, e.g.
+	// {"cpu": "1", "memory": "512Mi", "disk": "2Gi"}. Server defaults when
+	// omitted: cpu "1", memory "512Mi", disk "2Gi".
+	ResourceLimits ResourceLimits `json:"resourceLimits,omitempty"`
+	// Entrypoint is the guest business command (argv); empty defaults to
+	// ["tail", "-f", "/dev/null"].
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	// Env is the environment variables baked into the golden image (injected
+	// as /etc/sandbox-init.env in the guest; literal values only). The source
+	// image's own OCI Config.Env is inherited; an env with the same name
+	// overrides the inherited value. Names must be valid shell variable names.
+	Env map[string]string `json:"env,omitempty"`
+	// Metadata is custom key-value metadata for management, filtering, and
+	// tagging.
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// Readiness is the build-side readiness gate.
+	Readiness *TemplateReadiness `json:"readiness,omitempty"`
+	// Format is the storage encoding of the produced snapshot set. Defaults
+	// to overlaybd.
+	Format TemplateFormat `json:"format,omitempty"`
+}
+
+// TemplateInfo is a fsb template: a golden image whose build is declared and
+// executed by fast-sandbox.
+type TemplateInfo struct {
+	TemplateID string         `json:"templateId"`
+	Image      string         `json:"image"`
+	Publish    string         `json:"publish"`
+	Format     TemplateFormat `json:"format"`
+	Status     TemplateStatus `json:"status"`
+	CreatedAt  time.Time      `json:"createdAt"`
+	UpdatedAt  time.Time      `json:"updatedAt"`
+
+	ResourceLimits ResourceLimits     `json:"resourceLimits,omitempty"`
+	Entrypoint     []string           `json:"entrypoint,omitempty"`
+	Env            map[string]string  `json:"env,omitempty"`
+	Metadata       map[string]string  `json:"metadata,omitempty"`
+	Readiness      *TemplateReadiness `json:"readiness,omitempty"`
+}
+
+// ListTemplatesOptions configures filtering and pagination for ListTemplates.
+type ListTemplatesOptions struct {
+	// Metadata filters by key-value metadata (AND logic).
+	Metadata map[string]string
+	// Page number (1-based). Defaults to 1.
+	Page int
+	// PageSize is the number of items per page (1-200). Defaults to 20.
+	PageSize int
+}
+
+// ListTemplatesResponse is the paginated response from listing templates.
+type ListTemplatesResponse struct {
+	Items      []TemplateInfo `json:"items"`
+	Pagination PaginationInfo `json:"pagination"`
 }
 
 // RenewExpirationRequest is the request body for renewing sandbox expiration.
@@ -460,6 +841,16 @@ type APIError struct {
 	// RetryAfter is the server-suggested wait duration from the Retry-After
 	// header. Zero means no suggestion was provided.
 	RetryAfter time.Duration
+
+	// WakeExpired reports whether this 503 carried the gateway-owned
+	// "OpenSandbox-Wake: expired" marker (OSEP-0024): the request was parked
+	// pre-forward and is safe to retry for any method.
+	WakeExpired bool
+
+	// RetryAfterPresent reports whether a parseable Retry-After header was
+	// on the response; when false, RetryAfter is zero and consumers apply
+	// their own default wait.
+	RetryAfterPresent bool
 }
 
 // Error implements the error interface.
@@ -501,22 +892,31 @@ type CreateSessionRequest struct {
 	Cwd string `json:"cwd,omitempty"`
 }
 
-// RunCommandRequest is the request body for executing a shell command.
+// RunCommandRequest executes exactly one of Command (shell text) or Argv (literal arguments).
 type RunCommandRequest struct {
-	Command    string            `json:"command"`
-	Cwd        string            `json:"cwd,omitempty"`
-	Background bool              `json:"background,omitempty"`
-	Timeout    int64             `json:"timeout,omitempty"`
-	UID        *int32            `json:"uid,omitempty"`
-	GID        *int32            `json:"gid,omitempty"`
-	Envs       map[string]string `json:"envs,omitempty"`
+	Command string `json:"command,omitempty"`
+	// Argv must contain a non-empty executable at index 0; no element may contain NUL.
+	// These constraints are validated by the server.
+	Argv []string `json:"argv,omitempty"`
+	Cwd  string   `json:"cwd,omitempty"`
+	// Background runs the command asynchronously when true.
+	Background bool `json:"background,omitempty"`
+	// Timeout is the maximum command duration in milliseconds. Zero omits the
+	// field and the server enforces no timeout (see execd-api.yaml). Note this
+	// differs from the second-based TimeoutSeconds fields elsewhere in the SDK.
+	Timeout int64             `json:"timeout,omitempty"`
+	UID     *int32            `json:"uid,omitempty"`
+	GID     *int32            `json:"gid,omitempty"`
+	Envs    map[string]string `json:"envs,omitempty"`
 }
 
 // RunInSessionRequest is the request body for running a command in an existing bash session.
 type RunInSessionRequest struct {
 	Command string `json:"command"`
 	Cwd     string `json:"cwd,omitempty"`
-	Timeout int64  `json:"timeout,omitempty"`
+	// Timeout is the maximum command duration in milliseconds. Zero omits the
+	// field and the server may not enforce any timeout (see execd-api.yaml).
+	Timeout int64 `json:"timeout,omitempty"`
 }
 
 // CommandStatusResponse contains the status of a command execution.

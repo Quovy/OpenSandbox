@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 Alibaba Group Holding Ltd.
+ * Copyright 2026 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -98,7 +98,7 @@ internal class IsolatedFilesystemAdapter(
     ): String {
         try {
             val request = buildDownloadRequest(path, range, offset, limit)
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw response.toSandboxApiException { statusCode, body ->
                         "Failed to read file. Status code: $statusCode, Body: $body"
@@ -121,7 +121,7 @@ internal class IsolatedFilesystemAdapter(
     ): ByteArray {
         try {
             val request = buildDownloadRequest(path, range, offset, limit)
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw response.toSandboxApiException { statusCode, body ->
                         "Failed to read file. Status code: $statusCode, Body: $body"
@@ -143,7 +143,7 @@ internal class IsolatedFilesystemAdapter(
     ): InputStream {
         try {
             val request = buildDownloadRequest(path, range, offset, limit)
-            val response = httpClientProvider.httpClient.newCall(request).execute()
+            val response = httpClientProvider.transferClient.newCall(request).execute()
             if (!response.isSuccessful) {
                 try {
                     throw response.toSandboxApiException { statusCode, body ->
@@ -215,7 +215,7 @@ internal class IsolatedFilesystemAdapter(
                     .post(builder.build())
                     .build()
 
-            httpClientProvider.httpClient.newCall(request).execute().use { response ->
+            httpClientProvider.transferClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw response.toSandboxApiException { statusCode, body ->
                         "Failed to write files. Status code: $statusCode, Body: $body"

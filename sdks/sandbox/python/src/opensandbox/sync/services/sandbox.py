@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from typing import Protocol
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
     CredentialProxyConfig,
+    IdlePolicy,
     NetworkPolicy,
     PagedSandboxInfos,
     PagedSnapshotInfos,
@@ -35,10 +36,17 @@ from opensandbox.models.sandboxes import (
     SandboxFilter,
     SandboxImageSpec,
     SandboxInfo,
+    SandboxLifecycle,
     SandboxRenewResponse,
     SnapshotFilter,
     SnapshotInfo,
     Volume,
+)
+from opensandbox.models.templates import (
+    CreateTemplateRequest,
+    PagedTemplateInfos,
+    TemplateFilter,
+    TemplateInfo,
 )
 
 
@@ -66,6 +74,7 @@ class SandboxesSync(Protocol):
         snapshot_id: str | None = None,
         credential_proxy: CredentialProxyConfig | None = None,
         resource_requests: dict[str, str] | None = None,
+        lifecycle: SandboxLifecycle | None = None,
     ) -> SandboxCreateResponse:
         """
         Create a new sandbox with the specified configuration (blocking).
@@ -83,12 +92,31 @@ class SandboxesSync(Protocol):
                 Prefer namespaced keys (e.g. ``storage.id``).
             volumes: Optional list of volumes to mount in the sandbox.
             secure_access: Whether to enable secured access for sandbox endpoints.
+            lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
             Sandbox create response.
 
         Raises:
             SandboxException: If the operation fails.
+        """
+        ...
+
+    def create_sandbox_from_template(
+        self,
+        template_id: str,
+        timeout: timedelta,
+        metadata: dict[str, str] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        extensions: dict[str, str] | None = None,
+        idle_policy: IdlePolicy | None = None,
+    ) -> SandboxCreateResponse:
+        """
+        Create a sandbox from a ``Succeeded`` fsb template (blocking).
+
+        Template mode fixes the workload shape on the server: only metadata,
+        network policy, extensions and the control-plane ``idle_policy``
+        may accompany the template id, and the timeout is required.
         """
         ...
 
@@ -224,7 +252,8 @@ class SandboxesSync(Protocol):
 
     def kill_sandbox(self, sandbox_id: str) -> None:
         """
-        Terminate a sandbox and release all associated resources.
+        Request irreversible termination of the remote sandbox. Returns when
+        deletion is accepted; runtime cleanup may continue afterward.
 
         Args:
             sandbox_id: Unique identifier of the sandbox.
@@ -250,6 +279,22 @@ class SandboxesSync(Protocol):
 
     def delete_snapshot(self, snapshot_id: str) -> None:
         """Delete a snapshot (blocking)."""
+        ...
+
+    def create_template(self, request: CreateTemplateRequest) -> TemplateInfo:
+        """Create a fsb template (golden-image build); the build is asynchronous (blocking)."""
+        ...
+
+    def get_template(self, template_id: str) -> TemplateInfo:
+        """Get one template with its latest build status (blocking)."""
+        ...
+
+    def list_templates(self, filter: TemplateFilter) -> PagedTemplateInfos:
+        """List the current tenant's templates with optional filtering (blocking)."""
+        ...
+
+    def delete_template(self, template_id: str) -> None:
+        """Delete a template (blocking)."""
         ...
 
     def invalidate_endpoint_cache(self, sandbox_id: str) -> None:

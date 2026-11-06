@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,6 +50,8 @@ dependencies {
     testImplementation("com.alibaba.opensandbox:sandbox:latest.integration")
     testImplementation("com.alibaba.opensandbox:sandbox-pool-redis:latest.integration")
     testImplementation("com.alibaba.opensandbox:code-interpreter:latest.integration")
+    testImplementation("io.opentelemetry:opentelemetry-sdk:1.51.0")
+    testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.51.0")
 
     // Test frameworks
     testImplementation("org.junit.jupiter:junit-jupiter:5.9.2")

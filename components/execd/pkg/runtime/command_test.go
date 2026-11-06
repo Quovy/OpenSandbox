@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -30,26 +29,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestReadFromPos_SplitsOnCRAndLF(t *testing.T) {
+func TestCommandOutputTail_PreservesCRAndLF(t *testing.T) {
 	tmp := t.TempDir()
 	logFile := filepath.Join(tmp, "stdout.log")
-
-	mutex := &sync.Mutex{}
 
 	initial := "line1\nprog 10%\rprog 20%\rprog 30%\nlast\n"
 	require.NoError(t, os.WriteFile(logFile, []byte(initial), 0o644))
 
 	var got []string
-	c := &Controller{}
-	nextPos := c.readFromPos(mutex, logFile, 0, func(s string) { got = append(got, s) }, false, nil)
+	var tail commandOutputTail
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
 
-	want := []string{"line1", "prog 10%", "prog 20%", "prog 30%", "last"}
+	want := []string{"line1\n", "prog 10%\r", "prog 20%\r", "prog 30%\n", "last\n"}
 	require.Len(t, got, len(want))
 	for i := range want {
 		require.Equal(t, want[i], got[i], "token[%d] mismatch", i)
 	}
+	require.Equal(t, initial, strings.Join(got, ""))
 
-	// append more content and ensure incremental read only yields the new part
 	appendPart := "tail1\r\ntail2\n"
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
@@ -58,55 +55,57 @@ func TestReadFromPos_SplitsOnCRAndLF(t *testing.T) {
 	_ = f.Close()
 
 	got = got[:0]
-	c.readFromPos(mutex, logFile, nextPos, func(s string) { got = append(got, s) }, false, nil)
-	want = []string{"tail1", "tail2"}
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	want = []string{"tail1\r", "\n", "tail2\n"}
 	require.Len(t, got, len(want))
 	for i := range want {
 		require.Equal(t, want[i], got[i], "incremental token[%d] mismatch", i)
 	}
+	require.Equal(t, appendPart, strings.Join(got, ""))
 }
 
-func TestReadFromPos_LongLine(t *testing.T) {
+func TestCommandOutputTail_LongLine(t *testing.T) {
 	tmp := t.TempDir()
 	logFile := filepath.Join(tmp, "stdout.log")
 
 	// construct a single line larger than the default 64KB, but under 5MB
-	longLine := strings.Repeat("x", 256*1024) + "\n" // 256KB
+	longLine := strings.Repeat("x", 256*1024) + "\n"
 	require.NoError(t, os.WriteFile(logFile, []byte(longLine), 0o644))
 
 	var got []string
-	c := &Controller{}
-	c.readFromPos(&sync.Mutex{}, logFile, 0, func(s string) { got = append(got, s) }, false, nil)
+	var tail commandOutputTail
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
 
 	require.Len(t, got, 1, "expected one token")
-	require.Equal(t, strings.TrimSuffix(longLine, "\n"), got[0], "long line mismatch")
+	require.Equal(t, longLine, got[0], "long line mismatch")
 }
 
-func TestReadFromPos_FlushesTrailingLine(t *testing.T) {
+func TestCommandOutputTail_FlushesTrailingLine(t *testing.T) {
 	tmpDir := t.TempDir()
 	file := filepath.Join(tmpDir, "stdout.log")
 	content := []byte("line1\nlastline-without-newline")
 	err := os.WriteFile(file, content, 0o644)
 	assert.NoError(t, err)
 
-	c := NewController("", "")
-	mutex := &sync.Mutex{}
+	var tail commandOutputTail
 	var lines []string
 	onExecute := func(text string) {
 		lines = append(lines, text)
 	}
 
-	// First read: should only get complete lines with newlines
-	pos := c.readFromPos(mutex, file, 0, onExecute, false, nil)
-	assert.GreaterOrEqual(t, pos, int64(0))
-	assert.Equal(t, []string{"line1"}, lines)
+	tail.read(file, onExecute, false)
+	assert.Equal(t, int64(len(content)), tail.offset)
+	assert.Equal(t, []string{"line1\n"}, lines)
 
-	// Flush at end: should output the last line (without newline)
-	c.readFromPos(mutex, file, pos, onExecute, true, nil)
-	assert.Equal(t, []string{"line1", "lastline-without-newline"}, lines)
+	tail.read(file, onExecute, true)
+	assert.Equal(t, []string{"line1\n", "lastline-without-newline"}, lines)
+	assert.Equal(t, string(content), strings.Join(lines, ""))
+	tail.read(file, onExecute, true)
+	assert.Len(t, lines, 2, "final flush must not duplicate output")
+	assert.Zero(t, tail.pending.Cap())
 }
 
-func TestReadFromPos_PreservesBlankLines(t *testing.T) {
+func TestCommandOutputTail_PreservesBlankLines(t *testing.T) {
 	tmp := t.TempDir()
 	logFile := filepath.Join(tmp, "stdout.log")
 
@@ -115,29 +114,28 @@ func TestReadFromPos_PreservesBlankLines(t *testing.T) {
 	require.NoError(t, os.WriteFile(logFile, []byte(initial), 0o644))
 
 	var got []string
-	c := &Controller{}
-	c.readFromPos(&sync.Mutex{}, logFile, 0, func(s string) { got = append(got, s) }, false, nil)
+	var tail commandOutputTail
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
 
-	want := []string{"a", "\n", "b", "\n", "\n", "c", "\n", "d"}
+	want := []string{"a\n", "\n", "b\n", "\n", "\n", "c\n", "\r", "\n", "d\n"}
 	require.Equal(t, want, got)
+	require.Equal(t, initial, strings.Join(got, ""))
 }
 
-// TestReadFromPos_CRLFAcrossPolls ensures a \r\n pair that arrives in two
-// successive polls does not emit a spurious blank line for the trailing \n.
-// Reproduces the regression on Windows/cmd writers that flush \r before \n.
-func TestReadFromPos_CRLFAcrossPolls(t *testing.T) {
+// TestCommandOutputTail_PreservesCRLFAcrossPolls checks that a CRLF pair
+// remains intact when its bytes arrive in successive polls.
+func TestCommandOutputTail_PreservesCRLFAcrossPolls(t *testing.T) {
 	tmp := t.TempDir()
 	logFile := filepath.Join(tmp, "stdout.log")
 
 	require.NoError(t, os.WriteFile(logFile, []byte("a\r"), 0o644))
 
 	var got []string
-	c := &Controller{}
-	mutex := &sync.Mutex{}
-	var lastWasCR bool
-	pos := c.readFromPos(mutex, logFile, 0, func(s string) { got = append(got, s) }, false, &lastWasCR)
-	require.Equal(t, []string{"a"}, got)
-	require.True(t, lastWasCR, "CR state must persist for next poll")
+	var tail commandOutputTail
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	require.Equal(t, []string{"a\r"}, got)
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	require.Equal(t, []string{"a\r"}, got)
 
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
@@ -145,26 +143,23 @@ func TestReadFromPos_CRLFAcrossPolls(t *testing.T) {
 	require.NoError(t, err)
 	_ = f.Close()
 
-	got = got[:0]
-	c.readFromPos(mutex, logFile, pos, func(s string) { got = append(got, s) }, false, &lastWasCR)
-	require.Equal(t, []string{"b"}, got, "trailing \\n of split CRLF must not emit a blank line")
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	require.Equal(t, []string{"a\r", "\n", "b\n"}, got)
+	require.Equal(t, "a\r\nb\n", strings.Join(got, ""))
 }
 
-// TestReadFromPos_BlankCRLFAcrossPolls ensures a blank \r\n line split across
-// polls is emitted as a single blank, not duplicated.
-func TestReadFromPos_BlankCRLFAcrossPolls(t *testing.T) {
+// TestCommandOutputTail_PreservesBlankCRLFAcrossPolls checks an empty CRLF line
+// split across polls retains both bytes.
+func TestCommandOutputTail_PreservesBlankCRLFAcrossPolls(t *testing.T) {
 	tmp := t.TempDir()
 	logFile := filepath.Join(tmp, "stdout.log")
 
 	require.NoError(t, os.WriteFile(logFile, []byte("\r"), 0o644))
 
 	var got []string
-	c := &Controller{}
-	mutex := &sync.Mutex{}
-	var lastWasCR bool
-	pos := c.readFromPos(mutex, logFile, 0, func(s string) { got = append(got, s) }, false, &lastWasCR)
-	require.Equal(t, []string{"\n"}, got)
-	require.True(t, lastWasCR)
+	var tail commandOutputTail
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	require.Equal(t, []string{"\r"}, got)
 
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
@@ -172,9 +167,69 @@ func TestReadFromPos_BlankCRLFAcrossPolls(t *testing.T) {
 	require.NoError(t, err)
 	_ = f.Close()
 
-	got = got[:0]
-	c.readFromPos(mutex, logFile, pos, func(s string) { got = append(got, s) }, false, &lastWasCR)
-	require.Empty(t, got, "trailing \\n of split blank CRLF must not emit a second blank")
+	tail.read(logFile, func(s string) { got = append(got, s) }, false)
+	require.Equal(t, []string{"\r", "\n"}, got)
+	require.Equal(t, "\r\n", strings.Join(got, ""))
+}
+
+func TestCommandOutputTail_RetainsGrowingLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout.log")
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	defer file.Close()
+
+	var tail commandOutputTail
+	var got []string
+	emit := func(s string) { got = append(got, s) }
+	chunk := strings.Repeat("x", 64*1024)
+	for i := 1; i <= 4; i++ {
+		_, err := file.WriteString(chunk)
+		require.NoError(t, err)
+		for poll := 0; poll < 3; poll++ {
+			tail.read(path, emit, false)
+			require.Equal(t, int64(i*len(chunk)), tail.offset)
+			require.Equal(t, strings.Repeat(chunk, i), tail.pending.String())
+			require.Empty(t, got)
+		}
+	}
+	// A failed open must leave the unfinished output intact.
+	tail.read(path+".missing", emit, false)
+	require.Equal(t, int64(4*len(chunk)), tail.offset)
+	require.Equal(t, strings.Repeat(chunk, 4), tail.pending.String())
+
+	_, err = file.WriteString("\nnext\n")
+	require.NoError(t, err)
+	tail.read(path, emit, false)
+	require.Equal(t, []string{strings.Repeat(chunk, 4) + "\n", "next\n"}, got)
+	require.Zero(t, tail.pending.Cap())
+	tail.read(path, emit, true)
+	require.Len(t, got, 2)
+}
+
+func TestCommandOutputTail_ReleasesCompletedLineCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stdout.log")
+	longLine := strings.Repeat("x", 1<<20)
+	require.NoError(t, os.WriteFile(path, []byte(longLine+"\nprompt"), 0o600))
+
+	var tail commandOutputTail
+	var got []string
+	emit := func(s string) { got = append(got, s) }
+	tail.read(path, emit, false)
+	require.Equal(t, []string{longLine + "\n"}, got)
+	require.Equal(t, "prompt", tail.pending.String())
+	require.LessOrEqual(t, tail.pending.Cap(), 4096, "a short fragment must not retain the completed line's storage")
+
+	tail.read(path, emit, false)
+	require.Len(t, got, 1)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = file.WriteString(" continued\n")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	tail.read(path, emit, true)
+	require.Equal(t, []string{longLine + "\n", "prompt continued\n"}, got)
+	require.Equal(t, int64(len(longLine+"\nprompt continued\n")), tail.offset)
+	require.Zero(t, tail.pending.Cap())
 }
 
 func TestRunCommand_Echo(t *testing.T) {
@@ -225,8 +280,8 @@ func TestRunCommand_Echo(t *testing.T) {
 	}
 
 	require.NotEmpty(t, sessionID, "expected session id to be set")
-	require.Equal(t, []string{"hello"}, stdoutLines)
-	require.Equal(t, []string{"errline"}, stderrLines)
+	require.Equal(t, []string{"hello\n"}, stdoutLines)
+	require.Equal(t, []string{"errline\n"}, stderrLines)
 }
 
 func TestRunCommand_Error(t *testing.T) {
@@ -275,11 +330,13 @@ func TestRunCommand_Error(t *testing.T) {
 	}
 
 	require.NotEmpty(t, sessionID, "expected session id to be set")
-	require.Equal(t, []string{"before"}, stdoutLines)
+	require.Equal(t, []string{"before\n"}, stdoutLines)
 	require.Empty(t, stderrLines, "expected no stderr")
 	require.NotNil(t, gotErr, "expected error hook to be called")
 	require.Equal(t, "CommandExecError", gotErr.EName)
 	require.Equal(t, "3", gotErr.EValue)
+	require.NotNil(t, gotErr.ExitCode, "expected exit_code for a command that ran")
+	require.Equal(t, 3, *gotErr.ExitCode)
 }
 
 func TestRunCommand_ExpandsHomeInCwd(t *testing.T) {
@@ -438,6 +495,7 @@ func TestRunCommand_StartErrorIncludesTraceback(t *testing.T) {
 	require.Equal(t, "CommandExecError", gotErr.EName)
 	require.NotEmpty(t, gotErr.Traceback, "expected traceback to be populated")
 	require.Equal(t, gotErr.EValue, gotErr.Traceback[0])
+	require.Nil(t, gotErr.ExitCode, "start failure must not report an exit_code")
 	require.False(t, completeCalled, "did not expect completion hook on start failure")
 }
 
@@ -459,7 +517,6 @@ func TestStdLogDescriptor_AutoCreatesTempDir(t *testing.T) {
 	stdout.Close()
 	stderr.Close()
 
-	// The directory must have been created.
 	info, err := os.Stat(missingDir)
 	require.NoError(t, err, "expected temp dir to be created, stat error")
 	require.True(t, info.IsDir(), "expected %s to be a directory", missingDir)

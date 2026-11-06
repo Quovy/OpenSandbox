@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -158,6 +158,10 @@ func (p *BatchSandboxProvider) GetEndpoint(sandboxId string) (*EndpointInfo, err
 		Endpoint:          endpoints[0],
 		SecureAccessToken: accessToken,
 	}, nil
+}
+
+func (p *BatchSandboxProvider) ResolveEndpoint(_ context.Context, target EndpointTarget) (*EndpointInfo, error) {
+	return p.GetEndpoint(target.SandboxID)
 }
 
 var _ Provider = (*BatchSandboxProvider)(nil)

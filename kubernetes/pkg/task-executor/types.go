@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,16 +43,11 @@ const (
 )
 
 type Process struct {
-	// Command command
-	Command []string `json:"command"`
-	// Arguments to the entrypoint.
-	Args []string `json:"args,omitempty"`
-	// List of environment variables to set in the process.
-	Env []corev1.EnvVar `json:"env,omitempty"`
-	// WorkingDir process working directory.
-	WorkingDir string `json:"workingDir,omitempty"`
-	// TimeoutSeconds process timeout seconds.
-	TimeoutSeconds *int64 `json:"timeoutSeconds,omitempty"`
+	Command        []string        `json:"command"`
+	Args           []string        `json:"args,omitempty"`
+	Env            []corev1.EnvVar `json:"env,omitempty"`
+	WorkingDir     string          `json:"workingDir,omitempty"`
+	TimeoutSeconds *int64          `json:"timeoutSeconds,omitempty"`
 	// ExecMode controls where the process runs. If empty, execution follows the
 	// task-executor sidecar mode configuration.
 	ExecMode ExecMode `json:"execMode,omitempty"`

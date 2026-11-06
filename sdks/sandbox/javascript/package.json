@@ -1,6 +1,6 @@
 {
   "name": "@alibaba-group/opensandbox",
-  "version": "0.1.11",
+  "version": "1.2.0",
   "description": "OpenSandbox TypeScript/JavaScript SDK (sandbox lifecycle + execd APIs)",
   "license": "Apache-2.0",
   "type": "module",
@@ -18,6 +18,12 @@
       "import": "./dist/internal.js",
       "require": "./dist/cjs/internal.cjs",
       "default": "./dist/internal.js"
+    },
+    "./pool-redis": {
+      "types": "./dist/poolRedis.d.ts",
+      "import": "./dist/poolRedis.js",
+      "require": "./dist/cjs/poolRedis.cjs",
+      "default": "./dist/poolRedis.js"
     }
   },
   "browser": "./dist/index.js",
@@ -47,8 +53,9 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
     "openapi-fetch": "^0.14.1",
-    "undici": "^7.28.0"
+    "undici": "^7.30.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",

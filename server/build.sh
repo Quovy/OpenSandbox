@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,11 +49,21 @@ if [[ -n "${SETUPTOOLS_SCM_PRETEND_VERSION:-}" ]]; then
   BUILD_ARGS+=(--build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}")
 fi
 
+PUSH=${PUSH:-true}
+if [ "$PUSH" == "true" ]; then
+  PLATFORM="linux/amd64,linux/arm64"
+  EXPORTER=(--push)
+else
+  # dry-run / local rehearsal: single-arch, load into the local docker
+  PLATFORM="linux/amd64"
+  EXPORTER=(--load)
+fi
+
 docker buildx build \
   "${IMAGE_TAGS[@]}" \
   "${LATEST_TAGS[@]}" \
   "${BUILD_ARGS[@]}" \
-  --platform linux/amd64,linux/arm64 \
+  --platform "${PLATFORM}" \
   --metadata-file "${BUILD_METADATA_FILE}" \
-  --push \
+  "${EXPORTER[@]}" \
   .

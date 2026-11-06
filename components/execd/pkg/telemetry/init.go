@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/alibaba/opensandbox/execd/pkg/binding"
 )
 
 const (
@@ -38,6 +40,7 @@ var (
 	executionDuration        metric.Float64Histogram
 	filesystemOperationDurMs metric.Float64Histogram
 	isolationRunDurationMs   metric.Float64Histogram
+	oomKills                 metric.Int64Counter
 )
 
 func Init(ctx context.Context) (shutdown func(context.Context) error, err error) {
@@ -88,7 +91,7 @@ func registerExecdMetrics() error {
 		"execd.system.process.count",
 		metric.WithDescription("Current number of processes in the system"),
 		metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
-			obs.Observe(systemProcessCount(), metric.WithAttributes(execdSharedAttrs()...))
+			obs.Observe(systemProcessCount(), metric.WithAttributes(sharedAttrs()...))
 			return nil
 		}),
 	)
@@ -98,10 +101,10 @@ func registerExecdMetrics() error {
 
 	_, err = meter.Float64ObservableGauge(
 		"execd.system.cpu.usage",
-		metric.WithDescription("System-wide CPU usage percentage"),
+		metric.WithDescription("Sandbox CPU usage percentage (sandbox cgroup when limited, host fallback)"),
 		metric.WithUnit("%"),
 		metric.WithFloat64Callback(func(ctx context.Context, obs metric.Float64Observer) error {
-			obs.Observe(systemCPUUsagePercent(), metric.WithAttributes(execdSharedAttrs()...))
+			obs.Observe(systemCPUUsagePercent(), metric.WithAttributes(sharedAttrs()...))
 			return nil
 		}),
 	)
@@ -111,10 +114,10 @@ func registerExecdMetrics() error {
 
 	_, err = meter.Int64ObservableGauge(
 		"execd.system.memory.usage_bytes",
-		metric.WithDescription("System memory used bytes"),
+		metric.WithDescription("Sandbox memory working set bytes, excluding reclaimable file cache (sandbox cgroup when limited, host fallback)"),
 		metric.WithUnit("By"),
 		metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
-			obs.Observe(systemMemoryUsageBytes(), metric.WithAttributes(execdSharedAttrs()...))
+			obs.Observe(systemMemoryUsageBytes(), metric.WithAttributes(sharedAttrs()...))
 			return nil
 		}),
 	)
@@ -128,7 +131,7 @@ func registerExecdMetrics() error {
 		metric.WithUnit("By"),
 		metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
 			inBytes, outBytes := systemNetworkIOBytes()
-			base := append([]attribute.KeyValue{}, execdSharedAttrs()...)
+			base := append([]attribute.KeyValue{}, sharedAttrs()...)
 			obs.Observe(inBytes, metric.WithAttributes(append(base, attribute.String("direction", "in"))...))
 			obs.Observe(outBytes, metric.WithAttributes(append(base, attribute.String("direction", "out"))...))
 			return nil
@@ -143,11 +146,20 @@ func registerExecdMetrics() error {
 		metric.WithDescription("Current active network connections by protocol"),
 		metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
 			tcpCount, udpCount := systemNetworkConnectionCounts()
-			base := append([]attribute.KeyValue{}, execdSharedAttrs()...)
+			base := append([]attribute.KeyValue{}, sharedAttrs()...)
 			obs.Observe(tcpCount, metric.WithAttributes(append(base, attribute.String("protocol", "tcp"))...))
 			obs.Observe(udpCount, metric.WithAttributes(append(base, attribute.String("protocol", "udp"))...))
 			return nil
 		}),
+	)
+	if err != nil {
+		return err
+	}
+
+	oomKills, err = meter.Int64Counter(
+		"execd.system.oom.kills",
+		metric.WithDescription("OOM kills observed in the sandbox cgroup"),
+		metric.WithUnit("{kill}"),
 	)
 	if err != nil {
 		return err
@@ -169,7 +181,7 @@ func registerExecdMetrics() error {
 			if isolationStatsProvider == nil {
 				return nil
 			}
-			obs.Observe(isolationStatsProvider().ActiveSessions, metric.WithAttributes(execdSharedAttrs()...))
+			obs.Observe(isolationStatsProvider().ActiveSessions, metric.WithAttributes(sharedAttrs()...))
 			return nil
 		}),
 	)
@@ -185,7 +197,11 @@ func registerExecdMetrics() error {
 			if isolationStatsProvider == nil {
 				return nil
 			}
-			obs.Observe(isolationStatsProvider().UpperUsageBytes, metric.WithAttributes(execdSharedAttrs()...))
+			stats := isolationStatsProvider()
+			if !stats.UpperUsageValid {
+				return nil // Missing data must not be reported as zero bytes.
+			}
+			obs.Observe(stats.UpperUsageBytes, metric.WithAttributes(sharedAttrs()...))
 			return nil
 		}),
 	)
@@ -199,3 +215,49 @@ var execdSharedAttrs = sync.OnceValue(func() []attribute.KeyValue {
 		SandboxAttr:   "sandbox_id",
 	})
 })
+
+// bindingDynamicAttrs renders the current RuntimeBinding as metric
+// attributes: the authoritative sandbox_id and generation, plus the extra
+// attributes delivered by POST /internal/init.
+func bindingDynamicAttrs(b *binding.RuntimeBinding) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, len(b.TelemetryAttrs)+2)
+	if b.SandboxID != "" {
+		attrs = append(attrs, attribute.String("sandbox_id", b.SandboxID))
+	}
+	attrs = append(attrs, attribute.Int64("generation", int64(b.Generation)))
+	for k, v := range b.TelemetryAttrs {
+		key := attribute.Key(k)
+		if key == "sandbox_id" || key == "generation" {
+			// Reserved: delivered structurally above.
+			continue
+		}
+		attrs = append(attrs, attribute.String(k, v))
+	}
+	return attrs
+}
+
+// execdSharedAttrs returns the attribute set stamped onto every metric:
+// static env-derived attrs plus, once a RuntimeBinding is applied, the
+// dynamic sandbox attrs captured at record time (binding wins on key
+// conflicts).
+func sharedAttrs() []attribute.KeyValue {
+	staticAttrs := execdSharedAttrs()
+	b := binding.Current()
+	if b == nil {
+		return staticAttrs
+	}
+	dynamic := bindingDynamicAttrs(b)
+	seen := make(map[attribute.Key]struct{}, len(dynamic))
+	for _, kv := range dynamic {
+		seen[kv.Key] = struct{}{}
+	}
+	attrs := make([]attribute.KeyValue, 0, len(dynamic)+len(staticAttrs))
+	attrs = append(attrs, dynamic...)
+	for _, kv := range staticAttrs {
+		if _, taken := seen[kv.Key]; taken {
+			continue
+		}
+		attrs = append(attrs, kv)
+	}
+	return attrs
+}

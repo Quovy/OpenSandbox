@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,14 +24,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-type FinalizerOpType string
+type finalizerOpType string
 
 const (
-	AddFinalizerOpType    FinalizerOpType = "Add"
-	RemoveFinalizerOpType FinalizerOpType = "Remove"
+	AddFinalizerOpType    finalizerOpType = "Add"
+	RemoveFinalizerOpType finalizerOpType = "Remove"
 )
 
-func UpdateFinalizer(c client.Client, object client.Object, op FinalizerOpType, finalizer string) error {
+func UpdateFinalizer(c client.Client, object client.Object, op finalizerOpType, finalizer string) error {
 	switch op {
 	case AddFinalizerOpType, RemoveFinalizerOpType:
 	default:

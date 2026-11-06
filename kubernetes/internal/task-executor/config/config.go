@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -80,7 +80,6 @@ func (c *Config) LoadFromFlags() {
 	flag.StringVar(&c.CRISocket, "cri-socket", c.CRISocket, "CRI socket path for container runner mode")
 	flag.BoolVar(&c.EnableSidecarMode, "enable-sidecar-mode", c.EnableSidecarMode, "enable sidecar runner mode")
 	flag.StringVar(&c.MainContainerName, "main-container-name", c.MainContainerName, "main container name")
-	// set log flags
 	flag.IntVar(&c.LogMaxSize, "log-max-size", c.LogMaxSize, "maximum log file size in MB")
 	flag.IntVar(&c.LogMaxBackups, "log-max-backups", c.LogMaxBackups, "maximum number of log backup files")
 	flag.IntVar(&c.LogMaxAge, "log-max-age", c.LogMaxAge, "maximum number of days to keep log files")

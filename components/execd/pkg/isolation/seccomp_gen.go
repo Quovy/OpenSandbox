@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -68,6 +68,12 @@ var denylistSyscalls = []string{
 	"userfaultfd",
 	"kexec_load", "kexec_file_load",
 	"acct",
+}
+
+// GenerateSeccompDenyBPF returns BPF bytecode for a default-allow,
+// deny-listed syscall filter (exported for the hardening floor launcher).
+func GenerateSeccompDenyBPF(override *SeccompOverride) ([]byte, error) {
+	return generateSeccompDenyBPF(override)
 }
 
 // generateSeccompDenyBPF returns BPF bytecode for a default-allow,

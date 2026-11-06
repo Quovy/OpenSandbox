@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,10 +69,6 @@ def _get_pool_service():
     k8s_client = K8sClient(config.kubernetes)
     return PoolService(k8s_client, namespace=config.kubernetes.namespace)
 
-
-# ============================================================================
-# Pool CRUD Endpoints
-# ============================================================================
 
 @router.post(
     "/pools",

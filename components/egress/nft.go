@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"strings"
@@ -24,20 +26,25 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/dnsproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
 )
 
 // createNftManager is non-nil only when mode includes the nft token (e.g. dns+nft).
-func createNftManager(mode string) nftApplier {
+func createNftManager(mode string, upstream *mitmproxy.UpstreamProxySpec) (nftApplier, error) {
 	if !constants.ModeUsesNft(mode) {
-		return nil
+		return nil, nil
 	}
-	return nftables.NewManagerWithOptions(parseNftOptions())
+	opts, err := parseNftOptions(upstream)
+	if err != nil {
+		return nil, err
+	}
+	return nftables.NewManagerWithOptions(opts), nil
 }
 
-// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedIPs (dynamic allow sets).
+// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedDomain (dynamic allow sets).
 // nameserverIPs and always-deny/allow follow the same merge rules as the policy API (MergeAlwaysOverlay + WithExtraAllowIPs).
 func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.NetworkPolicy, proxy *dnsproxy.Proxy, nameserverIPs []netip.Addr, alwaysDeny, alwaysAllow []policy.EgressRule) {
 	if nftMgr == nil {
@@ -63,43 +70,71 @@ func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.Netw
 	proxy.SetOnResolved(func(domain string, ips []nftables.ResolvedIP) {
 		addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := nftMgr.AddResolvedIPs(addCtx, ips); err != nil {
-			log.Warnf("[dns] add resolved IPs to nft failed for domain %q: %v", domain, err)
+		if err := nftMgr.AddResolvedDomain(addCtx, domain, ips); err != nil && !errors.Is(err, nftables.ErrQuiesced) {
+			log.Warnf("[dns] record resolved domain %q failed: %v", domain, err)
 		}
 	})
 	nftMgr.StartConnectionRefresh(ctx)
+	nftMgr.StartDomainRefresh(ctx, proxy.ResolveDomain)
 }
 
-func parseNftOptions() nftables.Options {
-	opts := nftables.Options{BlockDoT: true}
+// parseDoHBlocklist parses the comma-separated OPENSANDBOX_EGRESS_DOH_BLOCKLIST
+// value (IP or CIDR entries) into v4/v6 lists. Invalid entries are logged and
+// skipped. Shared by the sidecar and fast-sandbox profiles so both enforce the same
+// DoH-443 semantics.
+func parseDoHBlocklist(raw string) (v4, v6 []string) {
+	for _, p := range strings.Split(raw, ",") {
+		target := strings.TrimSpace(p)
+		if target == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(target); err == nil {
+			if addr.Is4() {
+				v4 = append(v4, target)
+			} else if addr.Is6() {
+				v6 = append(v6, target)
+			}
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(target); err == nil {
+			if prefix.Addr().Is4() {
+				v4 = append(v4, target)
+			} else if prefix.Addr().Is6() {
+				v6 = append(v6, target)
+			}
+			continue
+		}
+		log.Warnf("ignoring invalid DoH blocklist entry: %s", target)
+	}
+	return v4, v6
+}
+
+func parseNftOptions(upstream *mitmproxy.UpstreamProxySpec) (nftables.Options, error) {
+	opts := nftables.Options{
+		BlockDoT:              true,
+		QuiesceOnApplyFailure: constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)),
+	}
+	// Transparent MITM: exempt the REDIRECT target dport ahead of port-scoped
+	// rules (issue #2423). Same port derivation as startMitmproxyTransparentIfEnabled.
+	if constants.IsTruthy(os.Getenv(constants.EnvMitmproxyTransparent)) {
+		opts.MitmRedirectPort = constants.EnvIntOrDefault(constants.EnvMitmproxyPort, constants.DefaultMitmproxyPort)
+	}
 	if constants.IsTruthy(os.Getenv(constants.EnvBlockDoH443)) {
 		opts.BlockDoH443 = true
 	}
 	if raw := os.Getenv(constants.EnvDoHBlocklist); strings.TrimSpace(raw) != "" {
-		parts := strings.Split(raw, ",")
-		for _, p := range parts {
-			target := strings.TrimSpace(p)
-			if target == "" {
-				continue
-			}
-			if addr, err := netip.ParseAddr(target); err == nil {
-				if addr.Is4() {
-					opts.DoHBlocklistV4 = append(opts.DoHBlocklistV4, target)
-				} else if addr.Is6() {
-					opts.DoHBlocklistV6 = append(opts.DoHBlocklistV6, target)
-				}
-				continue
-			}
-			if prefix, err := netip.ParsePrefix(target); err == nil {
-				if prefix.Addr().Is4() {
-					opts.DoHBlocklistV4 = append(opts.DoHBlocklistV4, target)
-				} else if prefix.Addr().Is6() {
-					opts.DoHBlocklistV6 = append(opts.DoHBlocklistV6, target)
-				}
-				continue
-			}
-			log.Warnf("ignoring invalid DoH blocklist entry: %s", target)
-		}
+		opts.DoHBlocklistV4, opts.DoHBlocklistV6 = parseDoHBlocklist(raw)
 	}
-	return opts
+	if upstream != nil {
+		uid, _, _, err := mitmproxy.LookupUser(mitmproxy.RunAsUser)
+		if err != nil {
+			return opts, fmt.Errorf("lookup user %q for upstream proxy nft scope: %w", mitmproxy.RunAsUser, err)
+		}
+		ep := &nftables.UpstreamProxyEndpoint{Port: upstream.Port, UID: uid}
+		if ip, err := netip.ParseAddr(upstream.Host); err == nil {
+			ep.IPs = []netip.Addr{ip.Unmap()}
+		}
+		opts.UpstreamProxy = ep
+	}
+	return opts, nil
 }

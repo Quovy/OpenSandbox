@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,6 +82,9 @@ public class CreateExecdStackOptions
 /// </summary>
 public class LifecycleStack
 {
+    /// <summary>Gets optional diagnostics support for custom factories.</summary>
+    public IDiagnostics? Diagnostics { get; init; }
+
     /// <summary>
     /// Gets the sandboxes service.
     /// </summary>
@@ -137,6 +140,56 @@ public class EgressStack
 }
 
 /// <summary>
+/// Options for creating a lifecycle control-plane network policy service.
+/// </summary>
+public class CreateNetworkPolicyStackOptions
+{
+    /// <summary>
+    /// Gets or sets the connection configuration.
+    /// </summary>
+    public required ConnectionConfig ConnectionConfig { get; set; }
+
+    /// <summary>
+    /// Gets or sets the lifecycle API base URL.
+    /// </summary>
+    public required string LifecycleBaseUrl { get; set; }
+
+    /// <summary>
+    /// Gets or sets the sandbox whose policy is managed.
+    /// </summary>
+    public required string SandboxId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the HTTP client provider for this SDK instance.
+    /// </summary>
+    public required HttpClientProvider HttpClientProvider { get; set; }
+
+    /// <summary>
+    /// Gets or sets the logger factory for this SDK instance.
+    /// </summary>
+    public required ILoggerFactory LoggerFactory { get; set; }
+}
+
+/// <summary>
+/// Stack of lifecycle control-plane network policy and Credential Vault services.
+/// </summary>
+public class NetworkPolicyStack
+{
+    /// <summary>
+    /// Gets the egress policy service.
+    /// </summary>
+    public required IEgress Egress { get; init; }
+
+    /// <summary>
+    /// Gets the server-routed Credential Vault service (OSEP-0022), when the
+    /// factory provides one. Template-backed sandboxes relay vault revisions
+    /// through the lifecycle control plane instead of a sandbox-side egress
+    /// sidecar.
+    /// </summary>
+    public ICredentialVault? CredentialVault { get; init; }
+}
+
+/// <summary>
 /// Factory interface for creating service adapters.
 /// </summary>
 public interface IAdapterFactory
@@ -161,4 +214,14 @@ public interface IAdapterFactory
     /// <param name="options">The creation options.</param>
     /// <returns>The egress stack.</returns>
     EgressStack CreateEgressStack(CreateEgressStackOptions options);
+
+    /// <summary>
+    /// Creates a lifecycle control-plane network policy service stack.
+    /// Used for sandboxes created from fsb templates: policy intent is
+    /// persisted via /sandboxes/{sandboxId}/networkpolicy instead of the
+    /// sandbox-side egress sidecar.
+    /// </summary>
+    /// <param name="options">The creation options.</param>
+    /// <returns>The network policy stack.</returns>
+    NetworkPolicyStack CreateNetworkPolicyStack(CreateNetworkPolicyStackOptions options);
 }

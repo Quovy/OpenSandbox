@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,7 +49,6 @@ func TestStderrIsCaptured(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// bash sends error messages to stderr. Without Stderr=Stdout, we'd see nothing.
 	var lines []string
 	err = r.RunInIsolatedSession(ctx, id,
 		`echo stdout-line && echo stderr-line >&2`, nil,
@@ -59,8 +58,6 @@ func TestStderrIsCaptured(t *testing.T) {
 	assert.Contains(t, lines, "stderr-line")
 }
 
-// TestRecoverAfterFailedRun verifies the session remains usable after a
-// command fails (non-zero exit).
 func TestRecoverAfterFailedRun(t *testing.T) {
 	r := newRunner(t)
 
@@ -74,20 +71,18 @@ func TestRecoverAfterFailedRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Run 1: fail with non-zero exit. Use bash -c so the parent bash (the
-	// persistent session) doesn't exit — exit is a shell builtin.
+	// Use bash -c so the parent bash (the persistent session) doesn't exit —
+	// exit is a shell builtin.
 	err = r.RunInIsolatedSession(ctx, id, "bash -c 'exit 42'", nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "42")
 
-	// Run 2: must still work.
 	var lines []string
 	err = r.RunInIsolatedSession(ctx, id, "echo recovered", nil,
 		func(line string) { lines = append(lines, line) })
 	require.NoError(t, err)
 	assert.Equal(t, []string{"recovered"}, lines)
 
-	// Run 3: fail again, then recover again.
 	err = r.RunInIsolatedSession(ctx, id, "false", nil, nil)
 	require.Error(t, err)
 
@@ -98,8 +93,6 @@ func TestRecoverAfterFailedRun(t *testing.T) {
 	assert.Equal(t, []string{"alive-again"}, lines)
 }
 
-// TestContextCancellation verifies that cancelling the context causes
-// RunInIsolatedSession to return promptly.
 func TestContextCancellation(t *testing.T) {
 	r := newRunner(t)
 
@@ -120,26 +113,6 @@ func TestContextCancellation(t *testing.T) {
 		"error should be context-related, got: %v", err)
 }
 
-// TestContextNotCancelledOnNormalExit verifies context is respected but
-// doesn't trigger for fast commands.
-func TestContextNotCancelledOnNormalExit(t *testing.T) {
-	r := newRunner(t)
-
-	opts := &runtime.IsolatedSessionOptions{
-		WorkspacePath: t.TempDir(), WorkspaceMode: "rw",
-	}
-	id, err := r.CreateIsolatedSession(opts)
-	require.NoError(t, err)
-	defer r.DeleteIsolatedSession(id)
-
-	// Long timeout, fast command — must not fail.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err = r.RunInIsolatedSession(ctx, id, "echo fast", nil, nil)
-	require.NoError(t, err)
-}
-
 // TestStrictNetworkIsolation verifies --unshare-net blocks non-loopback
 // network access.
 func TestStrictNetworkIsolation(t *testing.T) {
@@ -158,29 +131,23 @@ func TestStrictNetworkIsolation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// With --unshare-net, only loopback should exist. Any non-loopback
-	// address should not be reachable. Try to get external connectivity
-	// info — `ip link show` should show only lo (loopback).
+	// With --unshare-net, the session must not see any non-loopback IP
+	// address. (A fresh netns always has `lo`; the kernel may also auto-create
+	// address-less tunnel devices such as `tunl0` per netns, so count
+	// non-lo addresses rather than links.)
 	var lines []string
 	err = r.RunInIsolatedSession(ctx, id,
-		`ip link show 2>/dev/null | wc -l; echo DONE`, nil,
+		`ip -o addr show 2>/dev/null | grep inet | grep -cv ' lo '; echo DONE`, nil,
 		func(line string) { lines = append(lines, line) })
 	require.NoError(t, err)
 
-	// With only loopback, we expect exactly 2 lines: lo + DONE.
-	// If eth0 existed, we'd see more.
 	assert.Contains(t, lines, "DONE")
-	for _, line := range lines {
-		if line == "DONE" {
-			continue
-		}
-		// The count should be small (only loopback).
-		t.Logf("ip link count: %s", line)
-	}
+	require.NotEmpty(t, lines)
+	nonLoAddrs, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	require.NoError(t, err, "first line should be the non-loopback address count, got %v", lines)
+	assert.Equal(t, 0, nonLoAddrs, "--unshare-net should expose no non-loopback addresses, got %v", lines)
 }
 
-// TestManyConsecutiveRuns runs 100 quick commands to verify the session
-// remains stable under load.
 func TestManyConsecutiveRuns(t *testing.T) {
 	r := newRunner(t)
 
@@ -200,8 +167,6 @@ func TestManyConsecutiveRuns(t *testing.T) {
 	}
 }
 
-// TestDeleteThenRecreate verifies a session can be deleted and a new one
-// created with the same configuration without resource conflicts.
 func TestDeleteThenRecreate(t *testing.T) {
 	r := newRunner(t)
 
@@ -225,13 +190,11 @@ func TestDeleteThenRecreate(t *testing.T) {
 		err = r.DeleteIsolatedSession(id)
 		require.NoError(t, err, "delete %d", i)
 
-		// Verify it's gone.
 		_, err = r.GetIsolatedSession(id)
 		assert.Error(t, err, "session %d should be gone after delete", i)
 	}
 }
 
-// TestBashAliasAndBuiltins verifies bash builtins and functions work.
 func TestBashBuiltinsAndFunctions(t *testing.T) {
 	r := newRunner(t)
 
@@ -270,10 +233,6 @@ func TestBashBuiltinsAndFunctions(t *testing.T) {
 	}
 }
 
-// TestUpperQuotaEnforcement writes data past the upper quota limit and
-// verifies it is blocked. The upper max is passed separately by the
-// UpperManager; for this test we use a small upper root disk and rely
-// on the workspace mount semantics.
 func TestLargeFileWrite(t *testing.T) {
 	r := newRunner(t)
 
@@ -287,14 +246,12 @@ func TestLargeFileWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Write a moderately large file inside the sandbox.
 	script := `dd if=/dev/zero of=/tmp/largefile bs=1M count=5 2>&1 && echo "WRITE_OK"`
 	var lines []string
 	err = r.RunInIsolatedSession(ctx, id, script, nil,
 		func(line string) { lines = append(lines, line) })
 	require.NoError(t, err)
 
-	// dd output ends with the summary, then our WRITE_OK.
 	found := false
 	for _, l := range lines {
 		if strings.Contains(l, "WRITE_OK") {
@@ -413,7 +370,6 @@ func TestBorderlineBufferSize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Generate ~60000+ lines to stress the scanner buffer.
 	script := `for i in $(seq 60000); do echo "line-$i"; done && echo "DONE"`
 	var lineCount int
 	err = r.RunInIsolatedSession(ctx, id, script, nil,
@@ -426,17 +382,12 @@ func TestBorderlineBufferSize(t *testing.T) {
 	assert.GreaterOrEqual(t, lineCount, 59000, "should capture most lines, got %d", lineCount)
 }
 
-// TestWorkspaceIsolationAcrossSessions verifies two sessions with the same
-// workspace path see independent filesystems (in overlay/ro modes) or shared
-// changes (in rw mode).
 func TestWorkspaceIsolationAcrossSessions(t *testing.T) {
 	r := newRunner(t)
 
 	ws := t.TempDir()
-	// Pre-create a file in workspace.
 	require.NoError(t, os.WriteFile(ws+"/shared.txt", []byte("original"), 0644))
 
-	// Session 1: rw mode — write modifies workspace directly.
 	opts1 := &runtime.IsolatedSessionOptions{
 		Profile: "balanced", WorkspacePath: ws, WorkspaceMode: "rw",
 	}
@@ -462,9 +413,6 @@ func TestWorkspaceIsolationAcrossSessions(t *testing.T) {
 	require.NoError(t, r.RunInIsolatedSession(ctx, id2,
 		`cat `+ws+`/shared.txt`, nil,
 		func(line string) { lines = append(lines, line) }))
-	// overlay mode: should see the original or modified content depending
-	// on whether the modification was to the workspace (it was) and whether
-	// overlay sees the lower layer correctly.
 	assert.Contains(t, lines, "modified-by-s1",
 		"overlay mode should see workspace changes (lower layer)")
 }

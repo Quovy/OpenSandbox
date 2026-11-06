@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 	"github.com/alibaba/opensandbox/egress/pkg/iptables"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
 	"github.com/alibaba/opensandbox/egress/pkg/mitmproxy"
+	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/startup"
 	"github.com/alibaba/opensandbox/egress/pkg/telemetry"
@@ -49,6 +51,47 @@ func main() {
 
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
+
+	// Validate the chained upstream proxy env before profile dispatch: a
+	// configured proxy without transparent mitmproxy (and, outside
+	// fast-sandbox, without dns+nft enforcement) fails startup instead of
+	// being silently ignored.
+	profile := strings.TrimSpace(os.Getenv(constants.EnvEgressProfile))
+	if _, present := os.LookupEnv(constants.EnvMitmproxyPassthroughHosts); present &&
+		(profile == constants.ProfileFastSandbox || !constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime))) {
+		log.Fatalf("invalid %s configuration: requires sidecar live revision runtime", constants.EnvMitmproxyPassthroughHosts)
+	}
+
+	upstreamSpec, err := upstreamProxySpecForProfile(profile)
+	if err != nil {
+		log.Fatalf("invalid upstream proxy configuration: %v", err)
+	}
+
+	// Fast Sandbox profile: multi-sandbox control plane driven by the
+	// Sandbox Actions Handler protocol. Sidecar stays the default; the two
+	// profiles are mutually exclusive deployment forms.
+	if profile == constants.ProfileFastSandbox {
+		runFastSandboxProfile(ctx, upstreamSpec)
+		return
+	}
+
+	quarantineOwner, err := newRevisionQuarantine()
+	if err != nil {
+		log.Fatalf("experimental runtime containment: %v", err)
+	}
+	if quarantineOwner != nil {
+		defer quarantineOwner.target.Close()
+	}
+
+	// Reject unsupported experimental storage before policy loading or network
+	// setup. Fast Sandbox dispatched above does not use this sidecar store.
+	if constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) {
+		if path := strings.TrimSpace(os.Getenv(constants.EnvEgressPolicyFile)); path != "" {
+			if _, err := policy.NewAtomicPolicyFile(path); err != nil {
+				log.Fatalf("invalid experimental policy storage: %v", err)
+			}
+		}
+	}
 
 	// Erase any stale mitmproxy CA left on the shared volume by a previous
 	// egress generation so the agent's bootstrap wait-loop blocks for this
@@ -78,14 +121,41 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load always allow/deny rule files: %v", err)
 	}
+	alwaysAllow = withTelemetryAllow(alwaysAllow)
 
 	allowIPs := allowIps()
 	mode := parseMode()
 	log.Infof("enforcement mode: %s", mode)
-	nftMgr := createNftManager(mode)
+
+	// upstreamSpec was already validated at startup; it scopes the infra nft
+	// exception and lets DNS exempt the proxy hostname from sandbox policy
+	// without feeding the allow sets.
+	nftMgr, err := createNftManager(mode, upstreamSpec)
+	if err != nil {
+		log.Fatalf("nftables options: %v", err)
+	}
 	proxy, err := dnsproxy.New(initialRules, "", alwaysDeny, alwaysAllow)
 	if err != nil {
 		log.Fatalf("failed to init dns proxy: %v", err)
+	}
+	if upstreamSpec != nil {
+		if _, err := netip.ParseAddr(upstreamSpec.Host); err != nil {
+			// Hostname endpoint: mitmdump resolves it through the dnsproxy, so
+			// exempt it from sandbox policy and feed answers to the uid-scoped
+			// nft set instead of the sandbox allow sets.
+			host := upstreamSpec.Host
+			proxy.SetInfraDomain(host, func(domain string, ips []nftables.ResolvedIP) {
+				if nftMgr == nil {
+					return
+				}
+				addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := nftMgr.AddUpstreamProxyIPs(addCtx, ips); err != nil && !errors.Is(err, nftables.ErrQuiesced) {
+					log.Warnf("upstream proxy: nft update for %q failed: %v", domain, err)
+				}
+			})
+			log.Infof("upstream proxy: registered infra DNS domain %q (uid-scoped nft only)", host)
+		}
 	}
 	if err := proxy.Start(ctx); err != nil {
 		log.Fatalf("failed to start dns proxy: %v", err)
@@ -101,8 +171,9 @@ func main() {
 		log.Infof("loaded %d outbound log skip pattern(s) from /var/egress/rules/log_skip.always", len(logSkipPatterns))
 	}
 
+	var blockedBroadcaster *events.Broadcaster
 	if blockWebhookURL := strings.TrimSpace(os.Getenv(constants.EnvBlockedWebhook)); blockWebhookURL != "" {
-		blockedBroadcaster := events.NewBroadcaster(ctx, events.BroadcasterConfig{QueueSize: 256})
+		blockedBroadcaster = events.NewBroadcaster(context.WithoutCancel(ctx), events.BroadcasterConfig{QueueSize: 256})
 		blockedBroadcaster.AddSubscriber(events.NewWebhookSubscriber(blockWebhookURL))
 		proxy.SetBlockedBroadcaster(blockedBroadcaster)
 		defer blockedBroadcaster.Close()
@@ -122,17 +193,24 @@ func main() {
 
 	httpAddr := envOrDefault(constants.EnvEgressHTTPAddr, constants.DefaultEgressServerAddr)
 	mitmGate := mitmproxy.NewHealthGate()
-	policySrv, err := startPolicyServer(proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile), alwaysDeny, alwaysAllow, mitmGate)
+	policySrv, policyHandler, err := startPolicyServer(proxy, nftMgr, mode, httpAddr, os.Getenv(constants.EnvEgressToken), allowIPs, os.Getenv(constants.EnvEgressPolicyFile), alwaysDeny, alwaysAllow, mitmGate, quarantineOwner)
 	if err != nil {
 		log.Fatalf("failed to start policy server: %v", err)
 	}
 	log.Infof("policy server listening on %s (POST /policy)", httpAddr)
 
-	mitm, err := startMitmproxyTransparentIfEnabled()
+	mitm, err := startMitmproxyTransparentIfEnabled(ctx, policyHandler)
 	if err != nil {
 		log.Fatalf("mitmproxy transparent: %v", err)
 	}
-	mitmGate.MarkStackReady()
+	if !constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) {
+		mitmGate.MarkStackReady()
+	}
+	if constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) && mitm != nil {
+		// Attach the live mitmdump lifecycle owner before serving revision-gated
+		// Vault writes; until then such writes fail closed with 503.
+		policyHandler.setRevisionMitm(mitm)
+	}
 	if mitm != nil {
 		mitm.watchMitmproxy(ctx, mitmGate)
 	}
@@ -141,7 +219,7 @@ func main() {
 		log.Errorf("startup hooks (post) error: %v", err)
 	}
 
-	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm)
+	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm, blockedBroadcaster, policyHandler)
 }
 
 func withLogger(ctx context.Context) context.Context {

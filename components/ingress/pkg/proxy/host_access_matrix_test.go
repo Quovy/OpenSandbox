@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,10 @@ func (p staticEndpointProvider) GetEndpoint(id string) (*sandbox.EndpointInfo, e
 		return &cp, nil
 	}
 	return &sandbox.EndpointInfo{Endpoint: "127.0.0.1"}, nil
+}
+
+func (p staticEndpointProvider) ResolveEndpoint(_ context.Context, target sandbox.EndpointTarget) (*sandbox.EndpointInfo, error) {
+	return p.GetEndpoint(target.SandboxID)
 }
 
 func (staticEndpointProvider) Start(context.Context) error { return nil }
@@ -133,7 +137,7 @@ func TestMatrix_NoAccessVerification_URI(t *testing.T) {
 		assert.Equal(t, "/v1/status", h.requestURI)
 	})
 
-	t.Run("OSEP-shaped path re-parsed with legacy (strip must not apply)", func(t *testing.T) {
+	t.Run("signed-shaped path re-parsed with legacy (strip must not apply)", func(t *testing.T) {
 		// Syntactically valid signed prefix; for unsecured sandbox full path must be legacy-interpreted.
 		path := fmt.Sprintf("/%s/3000/%s/%s/extra/segment", testIDNoAccess, exp, goodSig)
 		r := httptest.NewRequest(http.MethodGet, "http://i"+path, nil)
@@ -146,7 +150,7 @@ func TestMatrix_NoAccessVerification_URI(t *testing.T) {
 		assert.Equal(t, "/"+exp+"/"+goodSig+"/extra/segment", h.requestURI)
 	})
 
-	t.Run("OSEP shape plus OpenSandbox-Secure-Access header", func(t *testing.T) {
+	t.Run("signed shape plus OpenSandbox-Secure-Access header", func(t *testing.T) {
 		path := fmt.Sprintf("/%s/3000/%s/%s/api", testIDNoAccess, exp, goodSig)
 		r := httptest.NewRequest(http.MethodGet, "http://i"+path, nil)
 		r.Header.Set(signature.OpenSandboxSecureAccessCanonical, "noise")

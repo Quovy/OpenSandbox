@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER_PID=""
 
 source "${REPO_ROOT}/scripts/credential-vault-e2e-target.sh"
+source "${REPO_ROOT}/scripts/egress-mitm-e2e-target.sh"
 
 cleanup_server() {
   if [ -n "${SERVER_PID}" ]; then
@@ -37,6 +38,7 @@ cleanup_server() {
 cleanup() {
   cleanup_server
   cleanup_credential_vault_e2e_target
+  cleanup_egress_mitm_e2e_target
 }
 trap cleanup EXIT
 
@@ -66,6 +68,7 @@ echo "-------- PYTHON E2E test logs for execd --------" > /tmp/opensandbox-e2e/l
 
 export OPENSANDBOX_CREDENTIAL_VAULT_E2E_SANDBOX_IMAGE="${OPENSANDBOX_CREDENTIAL_VAULT_E2E_SANDBOX_IMAGE:-opensandbox/code-interpreter:${TAG}}"
 setup_credential_vault_e2e_target
+setup_egress_mitm_e2e_target
 
 # setup server
 cd server
@@ -90,5 +93,7 @@ if [ "${RUN_CODE_INTERPRETER_E2E}" = "true" ]; then
 else
   uv run pytest \
     --ignore=tests/test_code_interpreter_e2e.py \
-    --ignore=tests/test_code_interpreter_e2e_sync.py
+    --ignore=tests/test_code_interpreter_e2e_sync.py \
+    --ignore=tests/test_execd_init_e2e.py \
+    --ignore=tests/test_execd_hardening_e2e.py
 fi

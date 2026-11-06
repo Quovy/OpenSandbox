@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 import type { ConnectionConfig } from "../config/connection.js";
+import type { SandboxId } from "../models/sandboxes.js";
 import type { SandboxFiles } from "../services/filesystem.js";
 import type { CredentialVault, Egress } from "../services/egress.js";
 import type { ExecdCommands } from "../services/execdCommands.js";
@@ -20,6 +21,7 @@ import type { ExecdHealth } from "../services/execdHealth.js";
 import type { ExecdMetrics } from "../services/execdMetrics.js";
 import type { IsolationService } from "../services/isolatedSessions.js";
 import type { Sandboxes } from "../services/sandboxes.js";
+import type { Diagnostics } from "../services/diagnostics.js";
 
 export interface CreateLifecycleStackOptions {
   connectionConfig: ConnectionConfig;
@@ -28,6 +30,7 @@ export interface CreateLifecycleStackOptions {
 
 export interface LifecycleStack {
   sandboxes: Sandboxes;
+  diagnostics?: Diagnostics;
 }
 
 export interface CreateExecdStackOptions {
@@ -55,6 +58,12 @@ export interface EgressStack {
   credentialVault?: CredentialVault;
 }
 
+export interface CreateNetworkPolicyStackOptions {
+  connectionConfig: ConnectionConfig;
+  lifecycleBaseUrl: string;
+  sandboxId: SandboxId;
+}
+
 /**
  * Factory abstraction to keep `Sandbox` and `SandboxManager` decoupled from concrete adapter implementations.
  *
@@ -64,4 +73,14 @@ export interface AdapterFactory {
   createLifecycleStack(opts: CreateLifecycleStackOptions): LifecycleStack;
   createExecdStack(opts: CreateExecdStackOptions): ExecdStack;
   createEgressStack(opts: CreateEgressStackOptions): EgressStack;
+  /**
+   * Create an egress stack that routes policy operations through the lifecycle
+   * control plane (`/sandboxes/{sandboxId}/networkpolicy`) instead of the
+   * sandbox-side egress sidecar.
+   *
+   * Used for template-backed sandboxes, which have no sandbox-side sidecar.
+   * Optional: custom adapter factories may omit it, in which case template
+   * backed sandboxes fail fast when egress policy operations are attempted.
+   */
+  createNetworkPolicyStack?(opts: CreateNetworkPolicyStackOptions): EgressStack;
 }

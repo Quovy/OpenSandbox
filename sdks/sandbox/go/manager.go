@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,7 +47,8 @@ func (m *SandboxManager) PatchSandboxMetadata(ctx context.Context, sandboxID str
 	return m.lifecycle.PatchSandboxMetadata(ctx, sandboxID, patch)
 }
 
-// KillSandbox terminates a sandbox by ID.
+// KillSandbox requests irreversible termination of a sandbox by ID.
+// Returns when deletion is accepted; runtime cleanup may continue afterward.
 func (m *SandboxManager) KillSandbox(ctx context.Context, sandboxID string) error {
 	return m.lifecycle.DeleteSandbox(ctx, sandboxID)
 }
@@ -85,6 +86,29 @@ func (m *SandboxManager) ListSnapshots(ctx context.Context, filter ListSnapshots
 // DeleteSnapshot deletes a snapshot by ID.
 func (m *SandboxManager) DeleteSnapshot(ctx context.Context, snapshotID string) error {
 	return m.lifecycle.DeleteSnapshot(ctx, snapshotID)
+}
+
+// CreateTemplate declares a fsb template (golden-image build).
+// The build is asynchronous: the response starts at TemplatePhasePending;
+// poll GetTemplate until the phase reaches TemplatePhaseSucceeded.
+func (m *SandboxManager) CreateTemplate(ctx context.Context, req CreateTemplateRequest) (*TemplateInfo, error) {
+	return m.lifecycle.CreateTemplate(ctx, req)
+}
+
+// GetTemplate retrieves a template with its latest build status by ID.
+func (m *SandboxManager) GetTemplate(ctx context.Context, templateID string) (*TemplateInfo, error) {
+	return m.lifecycle.GetTemplate(ctx, templateID)
+}
+
+// ListTemplates returns a paginated list of templates with optional filtering.
+func (m *SandboxManager) ListTemplates(ctx context.Context, opts ListTemplatesOptions) (*ListTemplatesResponse, error) {
+	return m.lifecycle.ListTemplates(ctx, opts)
+}
+
+// DeleteTemplate deletes a template by ID. Sandboxes already created from the
+// template are unaffected.
+func (m *SandboxManager) DeleteTemplate(ctx context.Context, templateID string) error {
+	return m.lifecycle.DeleteTemplate(ctx, templateID)
 }
 
 // Close releases local resources. Currently a no-op placeholder.

@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,19 +42,19 @@ class Commands(Protocol):
 
     async def run(
         self,
-        command: str,
+        command: str | list[str],
         *,
         opts: RunCommandOpts | None = None,
         handlers: ExecutionHandlers | None = None,
     ) -> Execution:
         """
-        Execute a shell command in the sandbox environment.
+        Execute shell text or native executable arguments in the sandbox.
 
         The command can be executed in foreground (streaming) or background mode
         based on the request configuration.
 
         Args:
-            command: Shell command text to execute
+            command: Shell text or a native argv list
             opts: Command execution options (e.g. background, working_directory)
             handlers: Optional async handlers for streaming events (stdout/stderr/result/init/complete/error)
 
@@ -63,6 +63,29 @@ class Commands(Protocol):
 
         Raises:
             SandboxException: if the operation fails
+        """
+        ...
+
+    async def set_env(self, key: str, value: str) -> None:
+        """
+        Persist an environment variable for future commands and sessions.
+
+        Appends ``KEY=VALUE`` to the sandbox env file that the runtime loads for
+        every command and session (the file pointed to by the sandbox's
+        ``EXECD_ENVS`` variable, resolved inside the sandbox). Keys must match
+        ``[A-Za-z_][A-Za-z0-9_]*``. Values without a single quote are stored
+        verbatim; values containing a single quote use the env file's
+        double-quoted form, in which shell-style ``$NAME`` sequences may be
+        expanded when the runtime loads the file. The file is append-only: when
+        a key is written multiple times, the last entry wins.
+
+        Args:
+            key: Environment variable name
+            value: Environment variable value
+
+        Raises:
+            InvalidArgumentException: if key or value is invalid
+            SandboxException: if the sandbox fails to persist the variable
         """
         ...
 

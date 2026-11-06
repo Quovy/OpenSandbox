@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,13 +98,13 @@ else
         --platform linux/amd64 \
         $BUILD_ARG \
         "${BUILD_ARGS[@]}" \
-        -t ${IMAGE_NAME}:${TAG} \
+        -t "${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}" \
         -f "$DOCKERFILE" \
         --load \
         .
     
     echo "========================================="
     echo "Successfully built (local only):"
-    echo "  ${IMAGE_NAME}:${TAG}"
+    echo "  ${DOCKERHUB_REPO}/${IMAGE_NAME}:${TAG}"
     echo "========================================="
 fi

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ const (
 	ErrorCodeNotSupported        ErrorCode = "NOT_SUPPORTED"
 	ErrorCodeServiceUnavailable  ErrorCode = "SERVICE_UNAVAILABLE"
 	ErrorCodeSessionNotFound     ErrorCode = "SESSION_NOT_FOUND"
+	ErrorCodeAlreadyInitialized  ErrorCode = "ALREADY_INITIALIZED"
 )
 
 type ErrorResponse struct {

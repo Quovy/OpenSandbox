@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,6 +58,15 @@ public class ServerStreamEvent
     public int? ExecutionCount { get; set; }
 
     /// <summary>
+    /// Gets or sets the successful foreground command exit status (zero).
+    /// Absent for older servers, background startup, and code execution.
+    /// Non-zero command exits are reported in the error payload instead.
+    /// </summary>
+    [JsonPropertyName("exit_code")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ExitCode { get; set; }
+
+    /// <summary>
     /// Gets or sets the execution time in milliseconds.
     /// </summary>
     [JsonPropertyName("execution_time")]
@@ -114,7 +123,11 @@ public class RunCommandRequest
     /// Gets or sets the command to run.
     /// </summary>
     [JsonPropertyName("command")]
-    public required string Command { get; set; }
+    public string? Command { get; set; }
+
+    /// <summary>Native executable and literal arguments; mutually exclusive with Command.</summary>
+    [JsonPropertyName("argv")]
+    public IReadOnlyList<string>? Argv { get; set; }
 
     /// <summary>
     /// Gets or sets the working directory.

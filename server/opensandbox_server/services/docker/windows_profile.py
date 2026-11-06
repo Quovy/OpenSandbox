@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -188,7 +188,7 @@ def fetch_execd_install_bat(
                         container.remove(force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup temporary execd install.bat container: %s", cleanup_exc
+                        f"Failed to cleanup temporary execd install.bat container: {cleanup_exc}"
                     )
 
         cache["install_bat"] = data
@@ -269,7 +269,7 @@ def fetch_execd_windows_binary(
                         container.remove(force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup temporary execd windows bin container: %s", cleanup_exc
+                        f"Failed to cleanup temporary execd windows bin container: {cleanup_exc}"
                     )
 
         cache["windows_execd_bin"] = data

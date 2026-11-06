@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -173,10 +173,10 @@ wait_for_sidecar_gone() {
   done
 }
 
-docker pull ubuntu:24.04
+docker pull ubuntu:latest
 
 create_payload='{
-  "image": { "uri": "ubuntu:24.04" },
+  "image": { "uri": "ubuntu" },
   "env": { "HELLO": "WORLD" },
   "metadata": { "hello": "world" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -373,7 +373,7 @@ echo "Sandbox ${SANDBOX_ID} deleted."
 
 step "Create sandbox with networkPolicy (egress sidecar)"
 egress_payload='{
-  "image": { "uri": "ubuntu:24.04" },
+  "image": { "uri": "ubuntu" },
   "env": {},
   "metadata": { "egress": "on" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -433,7 +433,7 @@ echo "opensandbox-e2e-marker" > /tmp/opensandbox-e2e/host-volume-test/marker.txt
 chmod -R 755 /tmp/opensandbox-e2e
 
 volume_payload='{
-  "image": { "uri": "ubuntu:24.04" },
+  "image": { "uri": "ubuntu" },
   "env": {},
   "metadata": { "volume": "host-test" },
   "entrypoint": ["tail", "-f", "/dev/null"],
@@ -519,7 +519,7 @@ fi
 
 step "Create short-lived sandbox (60s TTL) for auto-expiration"
 create_payload_short='{
-  "image": { "uri": "ubuntu:24.04" },
+  "image": { "uri": "ubuntu" },
   "env": {},
   "metadata": { "lifecycle": "short" },
   "entrypoint": ["tail", "-f", "/dev/null"],

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,12 +27,18 @@ max_sandbox_timeout_seconds = 86400
 # - 交互式 TTY：按提示输入 YES
 # - 非交互环境：设置 OPENSANDBOX_INSECURE_SERVER=YES
 
+[proxy]
+# 当为 True（默认）时，服务端反向代理以沙箱的内部容器 IP（Docker bridge）为目标；
+# 设为 False 时，代理改为以服务端本地的 host-mapped 端口为目标。当服务端进程无法
+# 路由到容器 bridge IP 时（例如 macOS 上的 launchd/systemd 用户会话）应设为 False。
+resolve_internal = true
+
 [log]
 level = "INFO"
 
 [runtime]
 type = "docker"
-execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.22"
+execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0"
 
 [storage]
 allowed_host_paths = []
@@ -43,15 +49,28 @@ volume_default_size = "1Gi"
 [store]
 type = "sqlite"
 path = "~/.opensandbox/opensandbox.db"
+# 如需使用外部 PostgreSQL 存储，请设置 type = "postgresql" 并配置：
+# [store.postgresql]
+# min_pool_size = 1
+# max_pool_size = 10
+# connect_timeout_seconds = 5
+# pool_timeout_seconds = 5
+# 生产环境通过 OPENSANDBOX_STORE_POSTGRESQL_DSN 注入连接串。
+# 每个 PostgreSQL 数据库只能由一个活跃 Server 进程使用。
 
 [docker]
-# Supported values for network_mode: "host", "bridge"
+# Supported values for network_mode: "host", "bridge", "none", "pasta", "slirp4netns",
+# or a user-defined network name ("pasta"/"slirp4netns" require a runtime that supports
+# them, e.g. podman; networkPolicy/egress still requires "bridge")
 network_mode = "bridge"
 # Bridge 模式下沙箱端口映射的宿主机端口范围。
 # 每个沙箱需要 2–3 个宿主机端口（无 egress 需要 2 个，有 egress sidecar 需要 3 个）。
 # 可根据防火墙策略缩小范围 — 例如 100 个并发沙箱 ≈ 需要 300 个端口。
 port_range_min = 40000
 port_range_max = 60000
+# 沙箱端口发布到的宿主机地址（0.0.0.0 = 所有网卡）。设置为具体 IP 可让 execd 与沙箱端口不暴露在公网网卡上：
+# server 直接运行在宿主机上时用 127.0.0.1；server 运行在容器中时用 Docker 网桥网关（如 172.17.0.1）。
+# publish_host = "127.0.0.1"
 # Drop dangerous capabilities and block privilege escalation
 drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
 no_new_privileges = true
@@ -59,6 +78,11 @@ no_new_privileges = true
 apparmor_profile = ""
 # Limit process count to reduce host impact from fork bombs; set to null to disable
 pids_limit = 4096
+# 可选:注入到每个沙箱容器的环境变量(创建请求中的同名键优先)。
+# 与 sandbox_binds 搭配可让所有沙箱信任私有 CA:
+# sandbox_env = { NODE_EXTRA_CA_CERTS = "/etc/ssl/private-ca/root-ca.crt" }
+# 可选:应用到每个沙箱容器的宿主机 bind 挂载(docker -v 语法)
+# sandbox_binds = ["/opt/certs/root-ca.crt:/etc/ssl/private-ca/root-ca.crt:ro"]
 # Seccomp profile: empty string uses Docker default; set to an absolute path for a custom profile
 seccomp_profile = ""
 
@@ -66,8 +90,19 @@ seccomp_profile = ""
 mode = "direct"
 
 [egress]
-image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.6"
+image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.7"
 mode = "dns"
+readiness_timeout_seconds = 30.0
+# 可选：导出 egress sidecar 的 OpenTelemetry 指标（仅支持 OTLP/HTTP）。
+# otlp_endpoint = "http://otel-collector.observability:4318"
+# 可选：将 sidecar 出口流量经上游 HTTP(S) CONNECT 代理链式转发。要求 mode = "dns+nft"，
+# 且每个 sandbox 启用透明 MITM（credentialProxy.enabled 或 OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true）。
+# [egress.upstream_proxy]
+# url = "http://proxy.example.com:3128"
+# authorization = "Basic <base64>"
+# 可选：Docker 守护进程主机上 PEM CA bundle 的绝对路径，在系统根证书之外追加信任；
+# 仅以只读方式挂载到 egress sidecar。
+# ca_cert_path = "/etc/ssl/private-ca/upstream-proxy-ca.pem"
 
 # 按访问续期。默认关闭 — 见 server/README_zh.md。
 [renew_intent]

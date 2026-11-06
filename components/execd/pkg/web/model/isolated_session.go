@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ package model
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
 )
 
-// Workspace mode values.
 const (
 	WorkspaceModeRW      = "rw"
 	WorkspaceModeOverlay = "overlay"
@@ -31,10 +31,12 @@ const (
 
 // Create
 
-// CreateIsolatedSessionRequest is the request body for POST /v1/isolated/session.
 type CreateIsolatedSessionRequest struct {
-	Profile            string             `json:"profile"` // "strict" | "balanced"
-	Workspace          WorkspaceSpec      `json:"workspace" validate:"required"`
+	Profile string `json:"profile"` // "strict" | "balanced"
+	// Workspace is the legacy single-workspace sugar: when set it is
+	// prepended to Overlays. At least one of Workspace/Overlays is required.
+	Workspace          *WorkspaceSpec     `json:"workspace,omitempty"`
+	Overlays           []OverlaySpec      `json:"overlays,omitempty"`
 	ExtraWritable      []string           `json:"extra_writable,omitempty"`
 	Binds              []BindMount        `json:"binds,omitempty"`
 	ShareNet           *bool              `json:"share_net,omitempty"`
@@ -45,60 +47,48 @@ type CreateIsolatedSessionRequest struct {
 	IdleTimeoutSeconds int                `json:"idle_timeout_seconds,omitempty"`
 }
 
-// WorkspaceSpec describes the workspace mount.
 type WorkspaceSpec struct {
 	Path string `json:"path" validate:"required"`
 	Mode string `json:"mode,omitempty"` // "rw" | "overlay" | "ro", default per profile
 }
 
-// EnvPassthroughSpec controls environment passthrough into the namespace.
+// OverlaySpec is one overlay mount. Mode defaults to overlay; Persist
+// (overlay mode only) defaults to true; false selects the tmpfs upper.
+type OverlaySpec struct {
+	Path    string `json:"path" validate:"required"`
+	Mode    string `json:"mode,omitempty"`    // "rw" | "overlay" | "ro"
+	Persist *bool  `json:"persist,omitempty"` // overlay mode only; default true
+}
+
 type EnvPassthroughSpec struct {
 	Mode string   `json:"mode,omitempty"` // "deny" | "allow"
 	Keys []string `json:"keys,omitempty"`
 }
 
-// BindMount describes an explicit source→dest bind mount into the namespace.
 type BindMount struct {
 	Source   string `json:"source" validate:"required"`
 	Dest     string `json:"dest,omitempty"`
 	ReadOnly bool   `json:"readonly,omitempty"`
 }
 
-// IsolatedCreateSessionResponse is the response for POST /v1/isolated/session.
 type IsolatedCreateSessionResponse struct {
 	SessionID string    `json:"session_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Validate checks CreateIsolatedSessionRequest fields.
 func (r *CreateIsolatedSessionRequest) Validate() error {
 	v := validator.New()
 	if err := v.Struct(r); err != nil {
 		return err
 	}
-	if r.Workspace.Mode != "" {
-		switch r.Workspace.Mode {
-		case WorkspaceModeRW, WorkspaceModeOverlay, WorkspaceModeRO:
-		default:
-			return fmt.Errorf("invalid workspace mode %q: must be %s, %s, or %s",
-				r.Workspace.Mode, WorkspaceModeRW, WorkspaceModeOverlay, WorkspaceModeRO)
-		}
+	if err := r.validateMounts(); err != nil {
+		return err
 	}
-	if r.EnvPassthrough.Mode != "" {
-		switch r.EnvPassthrough.Mode {
-		case "deny", "allow":
-		default:
-			return fmt.Errorf("invalid env_passthrough mode %q: must be \"deny\" or \"allow\"",
-				r.EnvPassthrough.Mode)
-		}
+	if err := validateEnum("env_passthrough mode", r.EnvPassthrough.Mode, "deny", "allow"); err != nil {
+		return err
 	}
-	if r.UidMode != "" {
-		switch r.UidMode {
-		case "setpriv", "userns":
-		default:
-			return fmt.Errorf("invalid uid_mode %q: must be \"setpriv\" or \"userns\"",
-				r.UidMode)
-		}
+	if err := validateEnum("uid_mode", r.UidMode, "setpriv", "userns"); err != nil {
+		return err
 	}
 	for i, b := range r.Binds {
 		if b.Source == "" {
@@ -114,9 +104,87 @@ func (r *CreateIsolatedSessionRequest) Validate() error {
 	return nil
 }
 
+// validateEnum rejects a non-empty value outside the given set.
+func validateEnum(field, value string, allowed ...string) error {
+	if value == "" {
+		return nil
+	}
+	for _, a := range allowed {
+		if value == a {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid %s %q: must be one of %s", field, value, strings.Join(allowed, ", "))
+}
+
+// MaxIsolatedOverlays caps the per-session mount count: every entry costs
+// a host MkdirAll, an upper/work pair, and a bwrap argv segment.
+const MaxIsolatedOverlays = 16
+
+func (r *CreateIsolatedSessionRequest) validateMounts() error {
+	if r.Workspace == nil && len(r.Overlays) == 0 {
+		return fmt.Errorf("workspace or overlays is required")
+	}
+	if r.Workspace != nil {
+		if err := validateEnum("workspace mode", r.Workspace.Mode,
+			WorkspaceModeRW, WorkspaceModeOverlay, WorkspaceModeRO); err != nil {
+			return err
+		}
+	}
+	for i, ov := range r.Overlays {
+		if err := validateEnum(fmt.Sprintf("overlays[%d] mode", i), ov.Mode,
+			WorkspaceModeRW, WorkspaceModeOverlay, WorkspaceModeRO); err != nil {
+			return err
+		}
+		if ov.Persist != nil &&
+			ov.Mode != WorkspaceModeOverlay && ov.Mode != "" {
+			return fmt.Errorf("overlays[%d]: persist applies only to mode %q",
+				i, WorkspaceModeOverlay)
+		}
+	}
+	if n := len(r.EffectiveOverlays()); n > MaxIsolatedOverlays {
+		return fmt.Errorf("overlays: at most %d mounts are allowed, got %d",
+			MaxIsolatedOverlays, n)
+	}
+	return r.validateMountPaths()
+}
+
+// validateMountPaths requires absolute, unique, already-clean mount paths
+// (no trailing slash, "." or ".."): the runtime MkdirAlls each path on the
+// host verbatim, and the files API resolves mounts by their cleaned path,
+// so anything else would 400 here or 404 later.
+func (r *CreateIsolatedSessionRequest) validateMountPaths() error {
+	seenPaths := make(map[string]struct{}, len(r.Overlays)+1)
+	for _, ov := range r.EffectiveOverlays() {
+		if !strings.HasPrefix(ov.Path, "/") {
+			return fmt.Errorf("mount path %q must be an absolute path", ov.Path)
+		}
+		if filepath.Clean(ov.Path) != ov.Path {
+			return fmt.Errorf(
+				"mount path %q must be a clean path (no trailing /, . or .. segments)",
+				ov.Path)
+		}
+		if _, dup := seenPaths[ov.Path]; dup {
+			return fmt.Errorf("duplicate mount path %q", ov.Path)
+		}
+		seenPaths[ov.Path] = struct{}{}
+	}
+	return nil
+}
+
+// EffectiveOverlays returns the overlays with the legacy workspace field
+// (when present) prepended.
+func (r *CreateIsolatedSessionRequest) EffectiveOverlays() []OverlaySpec {
+	overlays := make([]OverlaySpec, 0, len(r.Overlays)+1)
+	if r.Workspace != nil {
+		overlays = append(overlays, OverlaySpec{Path: r.Workspace.Path, Mode: r.Workspace.Mode})
+	}
+	overlays = append(overlays, r.Overlays...)
+	return overlays
+}
+
 // Run
 
-// IsolatedRunRequest is the request body for POST /v1/isolated/session/<id>/run.
 type IsolatedRunRequest struct {
 	Code           string            `json:"code" validate:"required"`
 	Envs           map[string]string `json:"envs,omitempty"`
@@ -124,20 +192,17 @@ type IsolatedRunRequest struct {
 	Background     bool              `json:"background,omitempty"`
 }
 
-// Validate checks IsolatedRunRequest fields.
 func (r *IsolatedRunRequest) Validate() error {
 	v := validator.New()
 	return v.Struct(r)
 }
 
-// IsolatedBackgroundRunResponse is the handle returned for background: true runs.
 type IsolatedBackgroundRunResponse struct {
 	SessionID string    `json:"session_id"`
 	RunID     string    `json:"run_id"`
 	StartedAt time.Time `json:"started_at"`
 }
 
-// IsolatedRunStatus describes the lifecycle state of an isolated background run.
 type IsolatedRunStatus struct {
 	SessionID  string     `json:"session_id"`
 	RunID      string     `json:"run_id"`
@@ -163,10 +228,11 @@ type SessionState struct {
 	LastRunAt            time.Time `json:"last_run_at"`
 	IdleRemainingSeconds *int      `json:"idle_remaining_seconds,omitempty"`
 
-	// Creation-parameter echoes. All optional; a session_id-only client
-	// must tolerate any of these being absent.
+	// Creation-parameter echoes, all optional. Workspace is echoed only
+	// for single-overlay sessions; Overlays always carries the full list.
 	Profile            string              `json:"profile,omitempty"`
 	Workspace          *WorkspaceSpec      `json:"workspace,omitempty"`
+	Overlays           []OverlaySpec       `json:"overlays,omitempty"`
 	ExtraWritable      []string            `json:"extra_writable,omitempty"`
 	Binds              []BindMount         `json:"binds,omitempty"`
 	ShareNet           *bool               `json:"share_net,omitempty"`
@@ -177,7 +243,6 @@ type SessionState struct {
 	IdleTimeoutSeconds *int                `json:"idle_timeout_seconds,omitempty"`
 }
 
-// IsolatedSessionSummary describes a single session in a list response.
 type IsolatedSessionSummary struct {
 	SessionID            string    `json:"session_id"`
 	Status               string    `json:"status"` // "active" | "dead"
@@ -186,14 +251,12 @@ type IsolatedSessionSummary struct {
 	IdleRemainingSeconds *int      `json:"idle_remaining_seconds,omitempty"`
 }
 
-// ListIsolatedSessionsResponse is returned by GET /v1/isolated/sessions.
 type ListIsolatedSessionsResponse struct {
 	Sessions []IsolatedSessionSummary `json:"sessions"`
 }
 
 // Capabilities
 
-// CapabilitiesResponse is returned by GET /v1/isolated/capabilities.
 type CapabilitiesResponse struct {
 	Available        bool   `json:"available"`
 	Isolator         string `json:"isolator,omitempty"`
@@ -201,6 +264,13 @@ type CapabilitiesResponse struct {
 	Message          string `json:"message,omitempty"`
 	SetprivAvailable bool   `json:"setpriv_available"`
 	UsernsAvailable  bool   `json:"userns_available"`
-	CommitSupported  bool   `json:"commit_supported"`
-	DiffSupported    bool   `json:"diff_supported"`
+	// Per-mode private network namespace availability (share_net=false).
+	// execd rejects such create requests with a named error when the
+	// requested mode's flag is false.
+	SetprivNetAvailable bool               `json:"setpriv_net_available"`
+	UsernsNetAvailable  bool               `json:"userns_net_available"`
+	CommitSupported     bool               `json:"commit_supported"`
+	DiffSupported       bool               `json:"diff_supported"`
+	Hardening           *HardeningStatus   `json:"hardening,omitempty"`
+	RuntimeInit         *RuntimeInitStatus `json:"runtimeInit,omitempty"`
 }

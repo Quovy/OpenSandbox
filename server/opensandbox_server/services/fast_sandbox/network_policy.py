@@ -1,0 +1,69 @@
+# Copyright 2026 The OpenSandbox Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+"""Translate policy intent to the Fastlet Actions handler's JSON input."""
+
+from fastapi import HTTPException
+
+from opensandbox_server.api.schema import NetworkPolicy, NetworkRule
+from opensandbox_server.services.validators import normalize_network_policy_action
+
+
+def normalized_policy(policy: NetworkPolicy) -> dict:
+    default_action = normalize_network_policy_action(policy.default_action, "networkPolicy.defaultAction")
+    rules = []
+    for rule in policy.egress:
+        target = (rule.target or "").strip()
+        action = normalize_network_policy_action(rule.action, "networkPolicy rule action")
+        if rule.ports:
+            # Not enforceable by the fastlet nft path yet (#2213); accepting
+            # would silently drop deny rules.
+            raise HTTPException(400, detail="networkPolicy ports are not supported for Fast Sandbox policy yet.")
+        if not target:
+            raise HTTPException(400, detail="networkPolicy rule target cannot be empty.")
+        rules.append({"action": action, "target": target})
+    return {"defaultAction": default_action, "egress": rules}
+
+
+def policy_status(policy: dict | None) -> dict:
+    # The Actions handler resets a removed/empty binding to deny-first.
+    policy = policy or {"defaultAction": "deny", "egress": []}
+    mode = (
+        "enforcing"
+        if policy.get("egress")
+        else ("allow_all" if policy.get("defaultAction") == "allow" else "deny_all")
+    )
+    return {"status": "ok", "mode": mode, "policy": policy}
+
+
+def merge_policy_rules(policy: dict, rules: list[NetworkRule]) -> dict:
+    """Apply sidecar PATCH merge semantics to a normalized policy dict.
+
+    - Incoming rules take priority over existing rules with the same target
+      and replace them in place.
+    - Within one patch payload, the first rule for a target wins.
+    - Existing rules for other targets remain; the current defaultAction is
+      preserved.
+    """
+    incoming: dict[str, dict] = {}
+    for rule in rules:
+        if rule.ports:
+            # Mirrors normalized_policy (#2213).
+            raise HTTPException(400, detail="networkPolicy ports are not supported for Fast Sandbox policy yet.")
+        target = (rule.target or "").strip()
+        if target and target not in incoming:
+            incoming[target] = {"action": rule.action, "target": target}
+    merged: list[dict] = []
+    for rule in policy.get("egress") or []:
+        merged.append(incoming.pop(rule["target"]) if rule["target"] in incoming else rule)
+    merged.extend(incoming.values())
+    return {"defaultAction": policy.get("defaultAction") or "deny", "egress": merged}
+
+
+def delete_policy_rules(policy: dict, targets: list[str]) -> dict:
+    """Drop rules by target (idempotent), preserving the current defaultAction."""
+    removed = {t.strip() for t in targets}
+    kept = [rule for rule in policy.get("egress") or [] if rule["target"] not in removed]
+    return {"defaultAction": policy.get("defaultAction") or "deny", "egress": kept}

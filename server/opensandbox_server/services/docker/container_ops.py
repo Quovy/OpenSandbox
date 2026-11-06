@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ Mixed into DockerSandboxService.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -39,8 +40,10 @@ from opensandbox_server.api.schema import (
     PlatformSpec,
 )
 from opensandbox_server.services.constants import (
+    RESERVED_LABEL_PREFIX,
     SANDBOX_EXPIRES_AT_LABEL,
     SANDBOX_ID_LABEL,
+    SANDBOX_METADATA_KEYS_LABEL,
     SANDBOX_MANUAL_CLEANUP_LABEL,
     SANDBOX_PLATFORM_ARCH_LABEL,
     SANDBOX_PLATFORM_OS_LABEL,
@@ -113,7 +116,7 @@ class DockerContainerOpsMixin:
         try:
             info = self.docker_client.info() or {}
         except DockerException as exc:
-            logger.debug("Failed to inspect Docker daemon platform: %s", exc)
+            logger.debug(f"Failed to inspect Docker daemon platform: {exc}")
             return None
         os_value = info.get("OSType") or info.get("Os") or info.get("os")
         arch_value = info.get("Architecture") or info.get("architecture")
@@ -232,9 +235,8 @@ class DockerContainerOpsMixin:
                 image = self.docker_client.images.get(image_uri)
                 if expected_platform is None:
                     logger.debug(
-                        "Sandbox %s using cached image %s without platform check (daemon platform unavailable)",
-                        sandbox_id,
-                        image_uri,
+                        f"Sandbox {sandbox_id} using cached image {image_uri} "
+                        "without platform check (daemon platform unavailable)"
                     )
                     return
                 image_attrs = getattr(image, "attrs", {}) or {}
@@ -252,13 +254,9 @@ class DockerContainerOpsMixin:
                 )
                 if image_os != requested_os or image_arch != requested_arch:
                     logger.info(
-                        "Sandbox %s cached image %s platform mismatch (cached=%s/%s, requested=%s/%s); repulling",
-                        sandbox_id,
-                        image_uri,
-                        image_os or "unknown",
-                        image_arch or "unknown",
-                        requested_os,
-                        requested_arch,
+                        f"Sandbox {sandbox_id} cached image {image_uri} platform "
+                        f"mismatch (cached={image_os or 'unknown'}/{image_arch or 'unknown'}, "
+                        f"requested={requested_os}/{requested_arch}); repulling"
                     )
                     self._pull_image(
                         image_uri,
@@ -267,7 +265,7 @@ class DockerContainerOpsMixin:
                         expected_platform,
                     )
                     return
-                logger.debug("Sandbox %s using cached image %s", sandbox_id, image_uri)
+                logger.debug(f"Sandbox {sandbox_id} using cached image {image_uri}")
         except ImageNotFound:
             self._pull_image(
                 image_uri,
@@ -293,6 +291,7 @@ class DockerContainerOpsMixin:
     ) -> tuple[dict[str, str], list[str]]:
         metadata = request.metadata or {}
         labels = {key: str(value) for key, value in metadata.items()}
+        labels[SANDBOX_METADATA_KEYS_LABEL] = json.dumps(sorted(metadata))
         labels[SANDBOX_ID_LABEL] = sandbox_id
         if expires_at is None:
             labels[SANDBOX_MANUAL_CLEANUP_LABEL] = "true"
@@ -304,16 +303,44 @@ class DockerContainerOpsMixin:
         if request.snapshot_id:
             labels[SANDBOX_SNAPSHOT_ID_LABEL] = request.snapshot_id
 
-        apply_access_renew_extend_seconds_to_mapping(labels, request.extensions)
+        apply_access_renew_extend_seconds_to_mapping(
+            labels, request.extensions, lifecycle=request.lifecycle
+        )
         apply_extensions_to_mapping(labels, request.extensions)
 
-        env_dict = request.env or {}
+        env_dict = {**(self.app_config.docker.sandbox_env or {}), **(request.env or {})}
         environment = []
         for key, value in env_dict.items():
             if value is None:
                 continue
             environment.append(f"{key}={value}")
+        if self.app_config and self.app_config.runtime.execd_run_as_init:
+            environment.append("EXECD_INIT=1")
+        environment.append(f"OPENSANDBOX_ID={sandbox_id}")
         return labels, environment
+
+    def _mask_inherited_system_labels(
+        self,
+        image_uri: str,
+        labels: dict[str, str],
+        sandbox_id: str,
+    ) -> dict[str, str]:
+        """Blank reserved labels the image would pass on to the container.
+
+        Docker merges image labels into container labels, and a snapshot image
+        keeps every label of the sandbox it was committed from (expiration,
+        host ports, managed volumes, egress token, ...). Labels can be
+        overridden but not removed, so set the ones this sandbox does not
+        define itself to an empty value.
+        """
+        with self._docker_operation(f"inspect image {image_uri} labels", sandbox_id):
+            image = self.docker_client.images.get(image_uri)
+        image_labels = ((image.attrs or {}).get("Config") or {}).get("Labels") or {}
+        masked = dict(labels)
+        for key in image_labels:
+            if key.startswith(RESERVED_LABEL_PREFIX) and key not in masked:
+                masked[key] = ""
+        return masked
 
     def _resolve_image_auth(
         self, request: CreateSandboxRequest, sandbox_id: str
@@ -332,10 +359,49 @@ class DockerContainerOpsMixin:
         self, request: CreateSandboxRequest
     ) -> tuple[Optional[int], Optional[int], Optional[int]]:
         resource_limits = (request.resource_limits.root if request.resource_limits else None) or {}
-        mem_limit = parse_memory_limit(resource_limits.get("memory"))
-        nano_cpus = parse_nano_cpus(resource_limits.get("cpu"))
-        gpu_count = parse_gpu_request(resource_limits.get("gpu"))
-        return mem_limit, nano_cpus, gpu_count
+        resolved: dict[str, Optional[int]] = {}
+        for key, parser in (
+            ("memory", parse_memory_limit),
+            ("cpu", parse_nano_cpus),
+            ("gpu", parse_gpu_request),
+        ):
+            if key not in resource_limits:
+                resolved[key] = None
+                continue
+            value = resource_limits[key]
+            try:
+                parsed = parser(value)
+            except ValueError:
+                parsed = None
+            if parsed is None or (parsed <= 0 and not (key == "gpu" and parsed == -1)):
+                value_preview = repr(value[:80])
+                if len(value) > 80:
+                    value_preview += f"... ({len(value)} characters)"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": f"Invalid resourceLimits.{key}: {value_preview}; must resolve to a "
+                        + ("positive device count or 'all'." if key == "gpu" else "positive resource limit."),
+                    },
+                )
+            resolved[key] = parsed
+        return resolved["memory"], resolved["cpu"], resolved["gpu"]
+
+    def _profile_security_opts(self) -> list[str]:
+        """Return the ``security_opt`` entries for the configured AppArmor/seccomp profiles.
+
+        Shared by every container the server creates (sandbox containers and the execd
+        cache container) so that ``[docker] apparmor_profile`` / ``seccomp_profile`` apply
+        uniformly.
+        """
+        docker_cfg = self.app_config.docker
+        opts: list[str] = []
+        if docker_cfg.apparmor_profile:
+            opts.append(f"apparmor={docker_cfg.apparmor_profile}")
+        if docker_cfg.seccomp_profile:
+            opts.append(f"seccomp={docker_cfg.seccomp_profile}")
+        return opts
 
     def _base_host_config_kwargs(
         self,
@@ -348,33 +414,28 @@ class DockerContainerOpsMixin:
         security_opts: list[str] = []
         docker_cfg = self.app_config.docker
         if docker_cfg.no_new_privileges:
-            security_opts.append("no-new-privileges:true")
-        if docker_cfg.apparmor_profile:
-            security_opts.append(f"apparmor={docker_cfg.apparmor_profile}")
-        if docker_cfg.seccomp_profile:
-            security_opts.append(f"seccomp={docker_cfg.seccomp_profile}")
+            security_opts.append("no-new-privileges=true")
+        security_opts.extend(self._profile_security_opts())
         if security_opts:
             host_config_kwargs["security_opt"] = security_opts
         if docker_cfg.drop_capabilities:
             host_config_kwargs["cap_drop"] = docker_cfg.drop_capabilities
         if docker_cfg.pids_limit is not None:
             host_config_kwargs["pids_limit"] = docker_cfg.pids_limit
-        if mem_limit:
+        if mem_limit is not None:
             host_config_kwargs["mem_limit"] = mem_limit
-        if nano_cpus:
+        if nano_cpus is not None:
             host_config_kwargs["nano_cpus"] = nano_cpus
-        if gpu_count:
+        if gpu_count is not None:
             # Honors host toolchains such as nvidia-container-toolkit. The Docker
             # Engine returns a clear error at container create time if the host
             # cannot satisfy the request, so failure is surfaced rather than silent.
             host_config_kwargs["device_requests"] = [
                 DeviceRequest(count=gpu_count, capabilities=[["gpu"]])
             ]
-        # Inject secure runtime into host_config
         if self.docker_runtime:
             logger.info(
-                "Using Docker runtime '%s' for container creation",
-                self.docker_runtime,
+                f"Using Docker runtime '{self.docker_runtime}' for container creation"
             )
             host_config_kwargs["runtime"] = self.docker_runtime
         return host_config_kwargs
@@ -389,6 +450,7 @@ class DockerContainerOpsMixin:
         host_config_kwargs: Dict[str, Any],
         exposed_ports: Optional[list[str]],
         platform: Optional[PlatformSpec],
+        unconfine_system_paths: bool = False,
     ):
         requested_windows_platform = is_windows_platform(platform)
         bootstrap_command = normalize_bootstrap_command(
@@ -398,9 +460,13 @@ class DockerContainerOpsMixin:
         docker_platform = resolve_docker_platform(platform)
 
         host_config = self.docker_client.api.create_host_config(**host_config_kwargs)
+        if unconfine_system_paths:
+            host_config["MaskedPaths"] = []
+            host_config["ReadonlyPaths"] = []
         container = None
         container_id: Optional[str] = None
         try:
+            labels = self._mask_inherited_system_labels(image_uri, labels, sandbox_id)
             with self._docker_operation("create sandbox container", sandbox_id):
                 container_kwargs = {
                     "image": image_uri,
@@ -462,8 +528,8 @@ class DockerContainerOpsMixin:
                     docker_operation=self._docker_operation,
                 )
                 logger.info(
-                    "sandbox=%s | skip linux bootstrap/runtime injection for windows profile",
-                    sandbox_id,
+                    f"sandbox={sandbox_id} | skip linux bootstrap/runtime "
+                    "injection for windows profile"
                 )
             else:
                 self._prepare_sandbox_runtime(container, sandbox_id, runtime_platform)
@@ -477,9 +543,7 @@ class DockerContainerOpsMixin:
                         container.remove(force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup container for sandbox %s: %s",
-                        sandbox_id,
-                        cleanup_exc,
+                        f"Failed to cleanup container for sandbox {sandbox_id}: {cleanup_exc}"
                     )
             elif container_id:
                 try:
@@ -487,9 +551,7 @@ class DockerContainerOpsMixin:
                         self.docker_client.api.remove_container(container_id, force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup container for sandbox %s: %s",
-                        sandbox_id,
-                        cleanup_exc,
+                        f"Failed to cleanup container for sandbox {sandbox_id}: {cleanup_exc}"
                     )
 
             if isinstance(exc, HTTPException):

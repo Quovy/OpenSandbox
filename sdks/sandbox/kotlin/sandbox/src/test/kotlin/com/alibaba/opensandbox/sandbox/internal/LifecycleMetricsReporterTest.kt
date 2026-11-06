@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 Alibaba Group Holding Ltd.
+ * Copyright 2026 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,6 +92,29 @@ class LifecycleMetricsReporterTest {
         // Give the client a short window; MockWebServer.takeRequest returns null on timeout.
         val recorded = server.takeRequest(300, TimeUnit.MILLISECONDS)
         assertNull(recorded, "metrics must not be posted when disableMetrics=true")
+    }
+
+    @Test
+    fun `does not post sandbox create event for staged warmup`() {
+        server.enqueue(MockResponse().setResponseCode(204))
+        val config =
+            ConnectionConfig.builder()
+                .domain(server.hostName + ":" + server.port)
+                .protocol("http")
+                .build()
+                .copyForStagedWarmup()
+                .copyForSingleAttempt()
+
+        LifecycleMetricsReporter.reportSandboxCreate(
+            connectionConfig = config,
+            sandboxId = "warmup-sbx",
+            image = "python:3.12",
+            createDurationMs = 10L,
+            success = true,
+        )
+
+        val recorded = server.takeRequest(300, TimeUnit.MILLISECONDS)
+        assertNull(recorded, "staged warmup must not emit the legacy sandbox.create event")
     }
 
     @Test

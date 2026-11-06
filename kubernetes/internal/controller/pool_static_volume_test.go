@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -84,7 +84,7 @@ func TestCreatePoolPodPreservesStaticPVC(t *testing.T) {
 			},
 		},
 	}
-	defer PoolScaleExpectations.DeleteExpectations(controllerutils.GetControllerKey(pool))
+	defer poolScaleExpectations.DeleteExpectations(controllerutils.GetControllerKey(pool))
 
 	r := &PoolReconciler{
 		Client:   fakeClient,

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,7 +51,6 @@ func TestRenameFile(t *testing.T) {
 	_, err = os.Stat(src)
 	require.True(t, os.IsNotExist(err), "expected source removed, got err=%v", err)
 
-	// destination exists -> expect error
 	require.NoError(t, os.WriteFile(src, []byte("data"), 0o644))
 	require.Error(t, RenameFile(model.RenameFileItem{Src: src, Dest: dst}), "expected error when destination already exists")
 }
@@ -162,21 +161,6 @@ func TestSetFileOwnership_InvalidOwner(t *testing.T) {
 	require.Error(t, err, "invalid owner should return error")
 }
 
-func TestSearchFileMetadata(t *testing.T) {
-	metadata := map[string]model.FileMetadata{
-		"/tmp/a/notes.txt": {Path: "/tmp/a/notes.txt"},
-		"/tmp/b/readme.md": {Path: "/tmp/b/readme.md"},
-	}
-
-	path, info, ok := SearchFileMetadata(metadata, "/any/notes.txt")
-	require.True(t, ok, "expected metadata entry")
-	require.Equal(t, "/tmp/a/notes.txt", path)
-	require.Equal(t, "/tmp/a/notes.txt", info.Path)
-
-	_, _, ok = SearchFileMetadata(metadata, "/foo/unknown.txt")
-	require.False(t, ok, "expected no match")
-}
-
 func TestParseRange(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -196,6 +180,30 @@ func TestParseRange(t *testing.T) {
 			header: "bytes=-5",
 			size:   10,
 			want:   []httpRange{{start: 5, length: 5}},
+		},
+		{
+			name:   "end past size is clamped",
+			header: "bytes=5-100",
+			size:   10,
+			want:   []httpRange{{start: 5, length: 5}},
+		},
+		{
+			name:   "end at max int64",
+			header: "bytes=0-9223372036854775807",
+			size:   10,
+			want:   []httpRange{{start: 0, length: 10}},
+		},
+		{
+			name:   "start past size is skipped",
+			header: "bytes=20-30",
+			size:   10,
+			want:   []httpRange{},
+		},
+		{
+			name:   "start plus end overflows",
+			header: "bytes=1-9223372036854775807",
+			size:   10,
+			want:   []httpRange{{start: 1, length: 9}},
 		},
 		{
 			name:      "invalid",

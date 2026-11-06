@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -97,7 +97,6 @@ func TestWorkspaceOverlay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Read original + write new file in single command via overlay.
 	newFile := filepath.Join(wsDir, "upper-only.txt")
 	var lines []string
 	err = r.RunInIsolatedSession(ctx, id,

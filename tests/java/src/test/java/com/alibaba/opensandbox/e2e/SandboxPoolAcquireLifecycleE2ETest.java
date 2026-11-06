@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 Alibaba Group Holding Ltd.
+ * Copyright 2026 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -321,7 +321,6 @@ public class SandboxPoolAcquireLifecycleE2ETest extends BaseE2ETest {
                         .acquireHealthCheckPollingInterval(Duration.ofMillis(50))
                         .warmupReadyTimeout(Duration.ofMinutes(2))
                         .warmupHealthCheckPollingInterval(Duration.ofMillis(100))
-                        .reconcileInterval(Duration.ofSeconds(1))
                         .drainTimeout(Duration.ofSeconds(2));
         if (acquireHealthCheck != null) {
             builder.acquireHealthCheck(acquireHealthCheck::apply);

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -236,7 +236,7 @@ async def demo_subpath_mount(config: ConnectionConfig, image: str, host_dir: str
 async def main() -> None:
     domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
     api_key = os.getenv("SANDBOX_API_KEY")
-    image = os.getenv("SANDBOX_IMAGE", "ubuntu:24.04")
+    image = os.getenv("SANDBOX_IMAGE", "ubuntu")
     host_dir = os.getenv("HOST_VOLUME_PATH", "")
 
     # If no host path specified, create a temporary directory with sample data

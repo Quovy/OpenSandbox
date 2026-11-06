@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,13 +63,12 @@ func waitMitmCACertPath(confDirEnv, home string) (string, error) {
 }
 
 // PurgeStaleExportedCA removes any mitmproxy-ca-cert.pem left on the shared
-// volume by a previous generation of this egress container. mitmproxy's CA
-// lives in the egress container's ephemeral confdir, so an egress container
-// restart rotates the CA while the previous public cert is still on the
-// (pod-scoped) shared volume; without this purge, an agent container starting
-// alongside us would pass its bootstrap readiness check on the stale file
-// and install a CA that no longer matches what mitmproxy will sign with.
-// See upstream issue #1370. Must be called as early as possible in main().
+// volume by a previous egress generation: a restart rotates the CA in the
+// ephemeral confdir, and the stale cert would let an agent pass its bootstrap
+// readiness check and install a CA mitmproxy no longer signs with (issue #1370).
+// Sidecar-only: the fast-sandbox profile pins its CA from a seed mount
+// (cacert_seed.go) and exports nothing. Must be called as early as possible
+// in main().
 func PurgeStaleExportedCA() {
 	if !constants.IsTruthy(os.Getenv(constants.EnvMitmproxyTransparent)) {
 		return
@@ -97,14 +96,24 @@ func purgeStaleExportedCAFrom(rootDir string) {
 }
 
 func SyncRootCA(confDirEnv, home string) error {
+	return exportRootCA(confDirEnv, home, constants.OpenSandboxRootDir)
+}
+
+// exportRootCA is the sidecar-only export path (the fast-sandbox profile
+// seeds its pinned CA from a read-only mount instead — cacert_seed.go — and
+// exports nothing: the guest trusts the template-baked certificate, so there
+// is no per-sandbox CA delivery, trust seeding, or stale-export purge,
+// OSEP-0022). It also installs the CA into the egress container's own system
+// trust store: sidecar upstream validation uses it.
+func exportRootCA(confDirEnv, home, rootDir string) error {
 	src, err := waitMitmCACertPath(confDirEnv, home)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(constants.OpenSandboxRootDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", constants.OpenSandboxRootDir, err)
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", rootDir, err)
 	}
-	dst := filepath.Join(constants.OpenSandboxRootDir, mitmCACertName)
+	dst := filepath.Join(rootDir, mitmCACertName)
 	if err := copyFile(src, dst, 0o644); err != nil {
 		return fmt.Errorf("copy mitm CA to %s: %w", dst, err)
 	}

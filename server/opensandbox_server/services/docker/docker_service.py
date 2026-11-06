@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,13 +28,15 @@ import logging
 import math
 import os
 import time
+from _thread import LockType
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread, Timer
 from typing import Any, Dict, Optional
+from weakref import WeakValueDictionary
 
 import docker
-from docker.errors import DockerException, NotFound as DockerNotFound
+from docker.errors import APIError, DockerException, NotFound as DockerNotFound
 from fastapi import HTTPException, status
 
 from opensandbox_server.extensions import (
@@ -58,7 +60,10 @@ from opensandbox_server.api.schema import (
     PlatformSpec,
 )
 from opensandbox_server.config import AppConfig, get_config
-from opensandbox_server.services.docker.docker_diagnostics import DockerDiagnosticsMixin
+from opensandbox_server.services.docker.docker_diagnostics import (
+    DockerDiagnosticsMixin,
+    _container_lifecycle_state,
+)
 from opensandbox_server.services.docker.runtime import (
     DockerRuntimeMixin,
 )
@@ -71,8 +76,11 @@ from opensandbox_server.services.docker.networking import (
 from opensandbox_server.services.docker.container_ops import DockerContainerOpsMixin
 from opensandbox_server.services.docker.metadata import DockerMetadataStore
 from opensandbox_server.services.docker.port_allocator import (
+    MAX_PORT_PUBLISH_ATTEMPTS,
     allocate_port_bindings,
+    is_port_publish_error,
     normalize_port_bindings,
+    release_port_bindings,
 )
 from opensandbox_server.services.windows_common import (
     inject_windows_resource_limits_env,
@@ -89,6 +97,7 @@ from opensandbox_server.services.constants import (
     OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
+    SANDBOX_CREATED_AT_LABEL,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
     SANDBOX_EMBEDDING_PROXY_PORT_LABEL,
     SANDBOX_EXPIRES_AT_LABEL,
@@ -107,6 +116,7 @@ from opensandbox_server.services.helpers import (
     matches_filter,
     parse_timestamp,
     split_egress_env,
+    validate_upstream_proxy_request,
 )
 from opensandbox_server.services.docker.ossfs_mixin import OSSFSMixin
 from opensandbox_server.services.sandbox_service import SandboxService
@@ -123,21 +133,9 @@ from opensandbox_server.services.validators import (
 logger = logging.getLogger(__name__)
 
 class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVolumesMixin, DockerNetworkingMixin, DockerContainerOpsMixin, OSSFSMixin, SandboxService, ExtensionService):
-    """
-    Docker-based implementation of SandboxService.
-
-    This class implements sandbox lifecycle operations using Docker containers.
-    """
-
     def __init__(self, config: Optional[AppConfig] = None):
         """
-        Initialize Docker sandbox service.
-
         Initializes Docker service from environment variables.
-        The service will read configuration from:
-        - DOCKER_HOST: Docker daemon URL (e.g., 'unix://var/run/docker.sock' or 'tcp://127.0.0.1:2376')
-        - DOCKER_TLS_CERTDIR: Directory containing TLS certificates
-        - Other Docker environment variables as needed
 
         Note: Connection is not verified at initialization time.
         Connection errors will be raised when Docker operations are performed.
@@ -153,12 +151,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self._bootstrap_script_cache: Dict[str, bytes] = {}
         self._bwrap_archive_cache: Dict[str, bytes] = {}
         self._session_gate_archive_cache: Dict[str, bytes] = {}
+        self._launcher_archive_cache: Dict[str, bytes] = {}
         self._windows_profile_cache: Dict[str, bytes] = {}
         self._daemon_platform: Optional[PlatformSpec] = None
         self._metadata_store = DockerMetadataStore()
         self._api_timeout = self._resolve_api_timeout()
         try:
-            # Initialize Docker service from environment variables
             client_kwargs = {}
             try:
                 signature = inspect.signature(docker.from_env)
@@ -196,6 +194,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             )
         self._expiration_lock = Lock()
+        self._lifecycle_locks_guard = Lock()
+        self._lifecycle_locks: WeakValueDictionary[str, LockType] = WeakValueDictionary()
         self._execd_archive_lock = Lock()
         self._bootstrap_script_lock = Lock()
         self._sandbox_expirations: Dict[str, datetime] = {}
@@ -216,8 +216,27 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         return 180
 
     @contextmanager
+    def _sandbox_lifecycle_lock(self, sandbox_id: str):
+        # Order runtime mutations and transition records within this service
+        # instance only, not across service instances or processes. Keep this
+        # separate from the metadata store's non-reentrant file-write lock.
+        with self._lifecycle_locks_guard:
+            lock = self._lifecycle_locks.get(sandbox_id)
+            if lock is None:
+                lock = Lock()
+                self._lifecycle_locks[sandbox_id] = lock
+        # Active and waiting calls retain the lock; idle entries disappear.
+        with lock:
+            yield
+
+    def _persist_transition(self, sandbox_id: str, state: str) -> None:
+        try:
+            self._metadata_store.set_transition(sandbox_id, state, datetime.now(timezone.utc))
+        except OSError as exc:
+            logger.warning(f"Failed to persist {state} transition for sandbox {sandbox_id}: {exc}")
+
+    @contextmanager
     def _docker_operation(self, action: str, sandbox_id: Optional[str] = None):
-        """Context manager to log duration for Docker API calls."""
         op_id = sandbox_id or "shared"
         start = time.perf_counter()
         try:
@@ -225,24 +244,16 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.warning(
-                "sandbox=%s | action=%s | duration=%.2f | error=%s",
-                op_id,
-                action,
-                elapsed_ms,
-                exc,
+                f"sandbox={op_id} | action={action} | duration={elapsed_ms:.2f} | error={exc}"
             )
             raise
         else:
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
-                "sandbox=%s | action=%s | duration=%.2f",
-                op_id,
-                action,
-                elapsed_ms,
+                f"sandbox={op_id} | action={action} | duration={elapsed_ms:.2f}"
             )
 
     def _get_container_by_sandbox_id(self, sandbox_id: str):
-        """Helper to fetch the Docker container associated with a sandbox ID."""
         label_selector = f"{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
             try:
@@ -290,6 +301,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
         return containers[0]
 
+    def _get_egress_sidecars(self, sandbox_id: str) -> list[Any]:
+        return self.docker_client.containers.list(
+            all=True, filters={"label": f"{EGRESS_SIDECAR_LABEL}={sandbox_id}"}
+        )
+
     def _schedule_expiration(
         self,
         sandbox_id: str,
@@ -298,7 +314,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         update_expiration: bool = True,
         **expire_kwargs,
     ) -> None:
-        """Schedule automatic sandbox termination at expiration time."""
         # Delay might already be negative if the timer should fire immediately
         delay = max(0.0, (expires_at - datetime.now(timezone.utc)).total_seconds())
         timer = Timer(
@@ -319,7 +334,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         timer.start()
 
     def _remove_expiration_tracking(self, sandbox_id: str) -> None:
-        """Remove expiration tracking and cancel any pending timers."""
         with self._expiration_lock:
             timer = self._expiration_timers.pop(sandbox_id, None)
             if timer:
@@ -328,7 +342,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
     @staticmethod
     def _has_manual_cleanup(labels: Dict[str, str]) -> bool:
-        """Return True when labels indicate manual cleanup mode."""
         return labels.get(SANDBOX_MANUAL_CLEANUP_LABEL, "").lower() == "true"
 
     def _get_tracked_expiration(
@@ -336,7 +349,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         sandbox_id: str,
         labels: Dict[str, str],
     ) -> Optional[datetime]:
-        """Return the known expiration timestamp for the sandbox."""
         with self._expiration_lock:
             tracked = self._sandbox_expirations.get(sandbox_id)
         if tracked:
@@ -355,11 +367,20 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         fallback_mount_keys: Optional[list[str]] = None,
     ) -> None:
         """Timer callback to terminate expired sandboxes."""
+        with self._sandbox_lifecycle_lock(sandbox_id):
+            self._expire_sandbox_locked(sandbox_id, fallback_mount_keys)
+
+    def _expire_sandbox_locked(
+        self,
+        sandbox_id: str,
+        fallback_mount_keys: Optional[list[str]] = None,
+    ) -> None:
         mount_keys: list[str] = []
         try:
             container = self._get_container_by_sandbox_id(sandbox_id)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
+                self._cleanup_egress_sidecar(sandbox_id)
                 self._remove_expiration_tracking(sandbox_id)
                 self._cleanup_windows_oem_volume(sandbox_id, None)
                 if fallback_mount_keys:
@@ -371,15 +392,12 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 now = datetime.now(timezone.utc)
                 if current_expires and current_expires > now:
                     logger.info(
-                        "Sandbox %s expiration was renewed; skipping retry.",
-                        sandbox_id,
+                        f"Sandbox {sandbox_id} expiration was renewed; skipping retry."
                     )
                 else:
                     logger.warning(
-                        "Failed to fetch sandbox %s for expiration: %s — "
-                        "scheduling retry in 30s",
-                        sandbox_id,
-                        exc.detail,
+                        f"Failed to fetch sandbox {sandbox_id} for expiration: {exc.detail} — "
+                        "scheduling retry in 30s"
                     )
                     retry_at = now + timedelta(seconds=30)
                     self._schedule_expiration(
@@ -395,9 +413,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         if current_expires and current_expires > datetime.now(timezone.utc):
             self._schedule_expiration(sandbox_id, current_expires, update_expiration=False)
             logger.info(
-                "Sandbox %s was renewed (expires %s); aborting expiration.",
-                sandbox_id,
-                current_expires,
+                f"Sandbox {sandbox_id} was renewed "
+                f"(expires {current_expires}); aborting expiration."
             )
             return
 
@@ -414,12 +431,19 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             if state.get("Running", False):
                 container.kill()
         except DockerException as exc:
-            logger.warning("Failed to stop expired sandbox %s: %s", sandbox_id, exc)
+            logger.warning(f"Failed to stop expired sandbox {sandbox_id}: {exc}")
 
         try:
             container.remove(force=True)
         except DockerException as exc:
-            logger.warning("Failed to remove expired sandbox %s: %s", sandbox_id, exc)
+            logger.warning(f"Failed to remove expired sandbox {sandbox_id}: {exc}")
+            # Re-read ownership on retry: a concurrent DELETE may already
+            # have released the mount references captured by this callback.
+            self._schedule_expiration(
+                sandbox_id, datetime.now(timezone.utc) + timedelta(seconds=30),
+                update_expiration=False,
+            )
+            return
 
         managed_volumes_raw = labels.get(SANDBOX_MANAGED_VOLUMES_LABEL, "[]")
         try:
@@ -440,7 +464,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         try:
             containers = self.docker_client.containers.list(all=True)
         except DockerException as exc:
-            logger.warning("Failed to restore existing sandboxes: %s", exc)
+            logger.warning(f"Failed to restore existing sandboxes: {exc}")
             return
 
         restored = 0
@@ -485,13 +509,13 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     restored += 1
                     continue
                 logger.warning(
-                    "Sandbox %s missing expires-at label; skipping expiration scheduling.",
-                    sandbox_id,
+                    f"Sandbox {sandbox_id} missing expires-at label; "
+                    "skipping expiration scheduling."
                 )
                 continue
 
             if expires_at <= now:
-                logger.info("Sandbox %s already expired; terminating now.", sandbox_id)
+                logger.info(f"Sandbox {sandbox_id} already expired; terminating now.")
                 expired_entries.append((sandbox_id, mount_keys))
                 continue
 
@@ -518,11 +542,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     self._cleanup_egress_sidecar(orphan_id)
                 else:
                     logger.warning(
-                        "Failed to check sandbox %s for orphan sidecar cleanup: %s", orphan_id, exc
+                        f"Failed to check sandbox {orphan_id} for orphan sidecar cleanup: {exc}"
                     )
 
         if restored:
-            logger.info("Restored expiration timers for %d sandbox(es).", restored)
+            logger.info(f"Restored expiration timers for {restored} sandbox(es).")
 
     def _container_to_sandbox(self, container, sandbox_id: Optional[str] = None) -> Sandbox:
         labels = container.attrs.get("Config", {}).get("Labels") or {}
@@ -537,57 +561,27 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             )
 
         status_section = container.attrs.get("State", {})
-        status_value = (status_section.get("Status") or container.status or "").lower()
-        running = status_section.get("Running", False)
-        paused = status_section.get("Paused", False)
-        restarting = status_section.get("Restarting", False)
-        exit_code = status_section.get("ExitCode")
         finished_at = status_section.get("FinishedAt")
-
-        if running and not paused:
-            state = "Running"
-            reason = "CONTAINER_RUNNING"
-            message = "Sandbox container is running."
-        elif paused:
-            state = "Paused"
-            reason = "CONTAINER_PAUSED"
-            message = "Sandbox container is paused."
-        elif restarting:
-            state = "Running"
-            reason = "CONTAINER_RESTARTING"
-            message = "Sandbox container is restarting."
-        elif status_value in {"created", "starting"}:
-            state = "Pending"
-            reason = "CONTAINER_STARTING"
-            message = "Sandbox container is starting."
-        elif status_value in {"exited", "dead"}:
-            if exit_code == 0:
-                state = "Terminated"
-                reason = "CONTAINER_EXITED"
-                message = "Sandbox container exited successfully."
-            else:
-                state = "Failed"
-                reason = "CONTAINER_EXITED_ERROR"
-                message = f"Sandbox container exited with code {exit_code}."
-        else:
-            state = "Unknown"
-            reason = "CONTAINER_STATE_UNKNOWN"
-            message = f"Sandbox container is in state '{status_value or 'unknown'}'."
+        state, reason, message = _container_lifecycle_state(container)
 
         metadata = self._metadata_store.get(resolved_id, labels)
         entrypoint = container.attrs.get("Config", {}).get("Cmd") or []
         if isinstance(entrypoint, str):
             entrypoint = [entrypoint]
-        image_tags = container.image.tags
-        image_uri = image_tags[0] if image_tags else container.image.short_id
-        snapshot_id = labels.get(SANDBOX_SNAPSHOT_ID_LABEL)
+        # The image reference the container was created with. Do not look the
+        # image up via container.image: it may have been removed since.
+        image_uri = container.attrs.get("Config", {}).get("Image")
+        snapshot_id = labels.get(SANDBOX_SNAPSHOT_ID_LABEL) or None
         image_spec = None if snapshot_id else ImageSpec(uri=image_uri)
 
-        created_at = parse_timestamp(container.attrs.get("Created"))
+        created_at = parse_timestamp(
+            labels.get(SANDBOX_CREATED_AT_LABEL) or container.attrs.get("Created")
+        )
+        transitioned_at = self._metadata_store.get_transition_time(resolved_id, state)
         last_transition_at = (
             parse_timestamp(finished_at)
             if finished_at and finished_at != "0001-01-01T00:00:00Z"
-            else created_at
+            else parse_timestamp(transitioned_at) if transitioned_at else created_at
         )
         expires_at = self._get_tracked_expiration(resolved_id, labels)
 
@@ -624,18 +618,26 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         return sandbox_id, created_at, expires_at
 
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
-        """
-        Create a new sandbox from a container image using Docker.
-
-        Args:
-            request: Sandbox creation request
-
-        Returns:
-            CreateSandboxResponse: Created sandbox information
-
-        Raises:
-            HTTPException: If sandbox creation fails
-        """
+        if request.lifecycle is not None:
+            # renewalPolicy (OSEP-0009) is control-plane state, persisted as a
+            # label; hooks and idlePolicy stay unsupported on docker.
+            unsupported: list[str] = []
+            if request.lifecycle.has_hooks:
+                unsupported.append("lifecycle.preStart/periodic hooks")
+            if request.lifecycle.idle_policy is not None:
+                unsupported.append("lifecycle.idlePolicy")
+            if unsupported:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": (
+                            f"{', '.join(unsupported)} not supported by the Docker "
+                            "provider; only lifecycle.renewalPolicy (OSEP-0009) is "
+                            "accepted on the lifecycle object."
+                        ),
+                    },
+                )
         if (request.extensions or {}).get("poolRef", "").strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -644,7 +646,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     "message": "poolRef is not supported by the Docker provider. Use Kubernetes BatchSandbox provider instead.",
                 },
             )
-        request = resolve_sandbox_image_from_request(request)
+        request = await resolve_sandbox_image_from_request(request)
         ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
         ensure_platform_valid(request.platform)
@@ -654,7 +656,9 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         )
         self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
-        self._validate_network_exists()
+        resource_limits = self._prepare_resource_limits(request)
+        # Docker API calls block; keep them off the event loop.
+        await asyncio.to_thread(self._validate_network_exists)
 
         try:
             sandbox_env, egress_env = split_egress_env(request.env)
@@ -667,20 +671,36 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             ) from e
 
-        pvc_inspect_cache, auto_created_volumes = self._validate_volumes(request)
         sandbox_id, created_at, expires_at = self._prepare_creation_context(request)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CreateSandboxResponse] = loop.create_future()
 
         def _run() -> None:
+            auto_created_volumes: list[str] = []
             try:
+                # Volume validation calls the Docker API and may create
+                # volumes, so it runs here, off the event loop, where a failed
+                # create removes them below.
+                pvc_inspect_cache, auto_created_volumes = self._validate_volumes(request)
                 result = self._provision_sandbox(
-                    sandbox_id, request, created_at, expires_at,
+                    sandbox_id, request, created_at, expires_at, resource_limits,
                     pvc_inspect_cache, auto_created_volumes,
                     sandbox_env=sandbox_env, egress_env=egress_env,
                 )
                 loop.call_soon_threadsafe(future.set_result, result)
             except BaseException as exc:
+                # _provision_sandbox only removes these when it fails inside its
+                # main try block. Earlier failures (the image pull, request
+                # checks) would leak them, and delete_sandbox never runs for a
+                # sandbox that was never created. Removal is idempotent, and a
+                # cleanup error must not keep exc from reaching the caller.
+                try:
+                    self._cleanup_managed_volumes(sandbox_id, auto_created_volumes)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to clean up volumes "
+                        f"after create failure: {cleanup_exc}"
+                    )
                 try:
                     loop.call_soon_threadsafe(future.set_exception, exc)
                 except RuntimeError:
@@ -698,12 +718,24 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             ) from e
 
+    def _prepare_resource_limits(
+        self, request: CreateSandboxRequest
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        """Validate platform resource limits and return outer Docker limits."""
+        if is_windows_platform(request.platform):
+            validate_windows_resource_limits(
+                (request.resource_limits.root if request.resource_limits else None) or {}
+            )
+            return None, None, None
+        return self._resolve_resource_limits(request)
+
     def _provision_sandbox(
         self,
         sandbox_id: str,
         request: CreateSandboxRequest,
         created_at: datetime,
         expires_at: Optional[datetime],
+        resource_limits: tuple[Optional[int], Optional[int], Optional[int]],
         pvc_inspect_cache: Optional[dict[str, dict]] = None,
         auto_created_volumes: Optional[list[str]] = None,
         sandbox_env: Optional[Dict[str, Optional[str]]] = None,
@@ -713,12 +745,13 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             sandbox_env, egress_env = split_egress_env(request.env)
         patched_request = request.model_copy(update={"env": sandbox_env or None})
         labels, environment = self._build_labels_and_env(sandbox_id, patched_request, expires_at)
+        labels[SANDBOX_CREATED_AT_LABEL] = created_at.isoformat()
         if auto_created_volumes:
             labels[SANDBOX_MANAGED_VOLUMES_LABEL] = json.dumps(
                 auto_created_volumes, separators=(",", ":"),
             )
         image_uri, auth_config = self._resolve_image_auth(request, sandbox_id)
-        mem_limit, nano_cpus, gpu_count = self._resolve_resource_limits(request)
+        mem_limit, nano_cpus, gpu_count = resource_limits
         egress_token: Optional[str] = None
         requested_windows_profile = is_windows_platform(request.platform)
 
@@ -730,19 +763,23 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             raise ValueError(
                 f"'{OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE}' cannot be set when credential proxy is enabled"
             )
+        validate_upstream_proxy_request(
+            self.app_config.egress,
+            has_network_policy=bool(request.network_policy),
+            credential_proxy_enabled=credential_proxy_enabled,
+            egress_env=egress_env or {},
+        )
 
         if egress_env and not request.network_policy:
             dropped_keys = sorted(egress_env.keys())
             logger.warning(
-                "Sandbox %s has OPENSANDBOX_EGRESS_ env vars %s but no networkPolicy; "
-                "these variables will be ignored because no egress sidecar is created",
-                sandbox_id,
-                dropped_keys,
+                f"Sandbox {sandbox_id} has OPENSANDBOX_EGRESS_ env vars {dropped_keys} "
+                "but no networkPolicy; these variables will be ignored because no "
+                "egress sidecar is created"
             )
             egress_env = {}
 
         if requested_windows_profile:
-            validate_windows_resource_limits((request.resource_limits.root if request.resource_limits else None) or {})
             validate_windows_runtime_prerequisites()
 
         # Prepare OSSFS mounts first so binds can reference mounted host paths.
@@ -754,6 +791,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             )
 
         sidecar_container = None
+        reserved_port_bindings: dict[str, tuple[str, int]] = {}
         runtime_volume_name: Optional[str] = None
         try:
             # For dockur/windows profile, resourceLimits are translated to
@@ -766,7 +804,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             effective_nano_cpus = None if requested_windows_profile else nano_cpus
             effective_gpu_count = None if requested_windows_profile else gpu_count
 
-            # Build volume bind mounts from request volumes.
             # pvc_inspect_cache carries Docker volume inspect data from the
             # validation phase, avoiding a redundant API call.
             volume_binds = self._build_volume_binds(request.volumes, pvc_inspect_cache)
@@ -804,7 +841,13 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
                 egress_token = generate_egress_token()
                 labels[SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY] = egress_token
-                sidecar_port_bindings = allocate_port_bindings([*exposed_ports, "18080"], min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
+                sidecar_port_bindings = allocate_port_bindings(
+                    [*exposed_ports, "18080"],
+                    min_port=self.app_config.docker.port_range_min,
+                    max_port=self.app_config.docker.port_range_max,
+                    publish_host=self.app_config.docker.publish_host,
+                )
+                reserved_port_bindings = sidecar_port_bindings
                 host_execd_port = sidecar_port_bindings["44772"][1]
                 host_http_port = sidecar_port_bindings["8080"][1]
                 egress_api_binding = sidecar_port_bindings.get("18080")
@@ -847,7 +890,13 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     gpu_count=effective_gpu_count,
                 )
                 if self.network_mode != HOST_NETWORK_MODE:
-                    port_bindings = allocate_port_bindings(exposed_ports, min_port=self.app_config.docker.port_range_min, max_port=self.app_config.docker.port_range_max)
+                    port_bindings = allocate_port_bindings(
+                        exposed_ports,
+                        min_port=self.app_config.docker.port_range_min,
+                        max_port=self.app_config.docker.port_range_max,
+                        publish_host=self.app_config.docker.publish_host,
+                    )
+                    reserved_port_bindings = port_bindings
                     host_execd_port = port_bindings["44772"][1]
                     host_http_port = port_bindings["8080"][1]
                     host_config_kwargs["port_bindings"] = normalize_port_bindings(port_bindings)
@@ -856,7 +905,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 else:
                     exposed_ports = None
 
-            # Inject volume bind mounts into Docker host config
             if runtime_volume_name:
                 runtime_mount_suffix = f":{OPENSANDBOX_RUNTIME_MOUNT_PATH}:"
                 runtime_mount_end = f":{OPENSANDBOX_RUNTIME_MOUNT_PATH}"
@@ -868,8 +916,11 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     volume_binds.append(
                         f"{runtime_volume_name}:{OPENSANDBOX_RUNTIME_MOUNT_PATH}:rw"
                     )
-            if volume_binds:
-                host_config_kwargs["binds"] = volume_binds
+            # Config-level binds (docker.sandbox_binds) apply to every sandbox
+            # and come first.
+            all_binds = list(self.app_config.docker.sandbox_binds or []) + (volume_binds or [])
+            if all_binds:
+                host_config_kwargs["binds"] = all_binds
             if requested_windows_profile:
                 host_config_kwargs = apply_windows_runtime_host_config_defaults(
                     host_config_kwargs,
@@ -881,10 +932,14 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 )
                 environment = inject_windows_user_ports(environment, exposed_ports)
 
-            # Inject CAP_SYS_ADMIN + unconfined AppArmor when bwrap isolation is requested.
-            # bwrap needs pivot_root/mount which require CAP_SYS_ADMIN and are blocked
-            # by Docker's default AppArmor profile.
-            if (request.extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY) == "enable":
+            # Inject the container permissions required by bwrap isolation.
+            # bwrap needs pivot_root/mount, including a fresh procfs, which are blocked
+            # by Docker's default AppArmor, seccomp, and protected-system-path settings.
+            isolation_requested = (
+                (request.extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY)
+                == "enable"
+            )
+            if isolation_requested:
                 cap_add = set(host_config_kwargs.get("cap_add") or [])
                 cap_add.add("SYS_ADMIN")
                 host_config_kwargs["cap_add"] = sorted(cap_add)
@@ -897,33 +952,80 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 tmpfs[ISOLATION_UPPER_MOUNT_PATH] = ""
                 host_config_kwargs["tmpfs"] = tmpfs
                 logger.warning(
-                    "sandbox %s: granting CAP_SYS_ADMIN + apparmor/seccomp=unconfined + tmpfs for bwrap isolation (bootstrap.execd.isolation=enable)",
-                    sandbox_id,
+                    f"sandbox {sandbox_id}: granting CAP_SYS_ADMIN + "
+                    "apparmor/seccomp/system paths unconfined + tmpfs for bwrap isolation "
+                    "(bootstrap.execd.isolation=enable)"
                 )
 
-            created_container = self._create_and_start_container(
-                sandbox_id,
-                image_uri,
-                request.entrypoint,
-                labels,
-                environment,
-                host_config_kwargs,
-                container_exposed_ports,
-                request.platform,
-            )
+            if self.network_mode != HOST_NETWORK_MODE and request.network_policy is None:
+                for attempt in range(MAX_PORT_PUBLISH_ATTEMPTS):
+                    try:
+                        created_container = self._create_and_start_container(
+                            sandbox_id,
+                            image_uri,
+                            request.entrypoint,
+                            labels,
+                            environment,
+                            host_config_kwargs,
+                            container_exposed_ports,
+                            request.platform,
+                            unconfine_system_paths=isolation_requested,
+                        )
+                        break
+                    except Exception as exc:
+                        if (
+                            attempt + 1 < MAX_PORT_PUBLISH_ATTEMPTS
+                            and is_port_publish_error(exc)
+                        ):
+                            logger.warning(
+                                f"sandbox {sandbox_id}: container start failed due to "
+                                f"host port conflict: {exc}. Retrying with fresh "
+                                f"ports (attempt {attempt + 1}/{MAX_PORT_PUBLISH_ATTEMPTS})..."
+                            )
+                            if reserved_port_bindings:
+                                release_port_bindings(reserved_port_bindings)
+                                reserved_port_bindings = {}
+
+                            port_bindings = allocate_port_bindings(
+                                exposed_ports,
+                                min_port=self.app_config.docker.port_range_min,
+                                max_port=self.app_config.docker.port_range_max,
+                                publish_host=self.app_config.docker.publish_host,
+                            )
+                            reserved_port_bindings = port_bindings
+                            host_execd_port = port_bindings["44772"][1]
+                            host_http_port = port_bindings["8080"][1]
+                            host_config_kwargs["port_bindings"] = normalize_port_bindings(port_bindings)
+                            labels[SANDBOX_EMBEDDING_PROXY_PORT_LABEL] = str(host_execd_port)
+                            labels[SANDBOX_HTTP_PORT_LABEL] = str(host_http_port)
+                            continue
+                        raise
+            else:
+                created_container = self._create_and_start_container(
+                    sandbox_id,
+                    image_uri,
+                    request.entrypoint,
+                    labels,
+                    environment,
+                    host_config_kwargs,
+                    container_exposed_ports,
+                    request.platform,
+                    unconfine_system_paths=isolation_requested,
+                )
         except Exception:
             if sidecar_container is not None:
                 try:
                     sidecar_container.remove(force=True)
                 except DockerException as cleanup_exc:
                     logger.warning(
-                        "Failed to cleanup egress sidecar for sandbox %s: %s",
-                        sandbox_id,
-                        cleanup_exc,
+                        f"Failed to cleanup egress sidecar for sandbox {sandbox_id}: {cleanup_exc}"
                     )
             self._release_ossfs_mounts(ossfs_mount_keys)
             self._cleanup_managed_volumes(sandbox_id, auto_created_volumes or [])
             raise
+        finally:
+            if reserved_port_bindings:
+                release_port_bindings(reserved_port_bindings)
 
         status_info = SandboxStatus(
             state="Running",
@@ -1027,32 +1129,68 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         return ListSandboxesResponse(items=items, pagination=pagination_info)
 
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
-        """
-        Fetch a sandbox by id.
-
-        Args:
-            sandbox_id: Unique sandbox identifier
-
-        Returns:
-            Sandbox: Complete sandbox information
-
-        Raises:
-            HTTPException: If sandbox not found
-        """
         container = self._get_container_by_sandbox_id(sandbox_id)
         return self._container_to_sandbox(container, sandbox_id)
 
+    def _raise_if_lifecycle_race(
+        self, sandbox_id: str, exc: DockerException, operation: str,
+    ) -> None:
+        """Map known main-container races using the sequential error envelope."""
+        if isinstance(exc, DockerNotFound):
+            if operation == "delete":
+                self._cleanup_egress_sidecar(sandbox_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_NOT_FOUND,
+                    "message": f"Sandbox {sandbox_id} not found.",
+                },
+            ) from exc
+        if not isinstance(exc, APIError) or exc.status_code != status.HTTP_409_CONFLICT:
+            return
+
+        message = (exc.explanation or "").lower()
+        conflicts = {
+            "delete": (
+                ("removal of container " in message and "already in progress" in message)
+                or "already being removed" in message,
+                SandboxErrorCodes.SANDBOX_DELETE_FAILED,
+                "Sandbox deletion is already in progress.",
+            ),
+            "pause": (
+                "already paused" in message or "is not running" in message,
+                SandboxErrorCodes.SANDBOX_NOT_RUNNING,
+                "Sandbox is not in a running state.",
+            ),
+            "resume": (
+                "is not paused" in message or "is not running" in message,
+                SandboxErrorCodes.SANDBOX_NOT_PAUSED,
+                "Sandbox is not in a paused state.",
+            ),
+        }
+        matches, code, conflict_message = conflicts[operation]
+        if not matches:
+            return
+        if operation != "delete":
+            # The state error may have raced with removal; use the usual 404
+            # if the sandbox has disappeared since the operation failed.
+            self._get_container_by_sandbox_id(sandbox_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": code, "message": conflict_message},
+        ) from exc
+
     def delete_sandbox(self, sandbox_id: str) -> None:
-        """
-        Delete a sandbox using Docker.
+        with self._sandbox_lifecycle_lock(sandbox_id):
+            self._delete_sandbox_locked(sandbox_id)
 
-        Args:
-            sandbox_id: Unique sandbox identifier
-
-        Raises:
-            HTTPException: If sandbox not found or deletion fails
-        """
-        container = self._get_container_by_sandbox_id(sandbox_id)
+    def _delete_sandbox_locked(self, sandbox_id: str) -> None:
+        try:
+            container = self._get_container_by_sandbox_id(sandbox_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                self._cleanup_egress_sidecar(sandbox_id)
+            raise
         labels = container.attrs.get("Config", {}).get("Labels") or {}
         mount_keys_raw = labels.get(SANDBOX_OSSFS_MOUNTS_LABEL, "[]")
         try:
@@ -1075,6 +1213,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             with self._docker_operation("remove sandbox container", sandbox_id):
                 container.remove(force=True)
         except DockerException as exc:
+            self._raise_if_lifecycle_race(sandbox_id, exc, "delete")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
@@ -1082,27 +1221,21 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     "message": f"Failed to delete sandbox container: {str(exc)}",
                 },
             ) from exc
-        finally:
-            self._remove_expiration_tracking(sandbox_id)
-            self._cleanup_egress_sidecar(sandbox_id)
-            self._cleanup_windows_oem_volume(sandbox_id, labels)
-            self._release_ossfs_mounts(mount_keys)
-            self._cleanup_managed_volumes(sandbox_id, managed_volumes)
-            self._metadata_store.delete(sandbox_id)
+        self._remove_expiration_tracking(sandbox_id)
+        self._cleanup_egress_sidecar(sandbox_id)
+        self._cleanup_windows_oem_volume(sandbox_id, labels)
+        self._release_ossfs_mounts(mount_keys)
+        self._cleanup_managed_volumes(sandbox_id, managed_volumes)
+        self._metadata_store.delete(sandbox_id)
 
     def pause_sandbox(self, sandbox_id: str) -> None:
-        """
-        Pause a running sandbox using Docker.
+        with self._sandbox_lifecycle_lock(sandbox_id):
+            self._pause_sandbox_locked(sandbox_id)
 
-        Args:
-            sandbox_id: Unique sandbox identifier
-
-        Raises:
-            HTTPException: If sandbox not found or cannot be paused
-        """
+    def _pause_sandbox_locked(self, sandbox_id: str) -> None:
         container = self._get_container_by_sandbox_id(sandbox_id)
         state = container.attrs.get("State", {})
-        if not state.get("Running", False):
+        if not state.get("Running", False) or state.get("Paused", False):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
@@ -1111,10 +1244,25 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             )
 
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        egress_expected = bool(labels.get(SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY))
+        try:
+            with self._docker_operation("query egress sidecar", sandbox_id):
+                sidecars = self._get_egress_sidecars(sandbox_id)
+        except DockerException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_PAUSE_FAILED,
+                    "message": f"Failed to query egress sidecar: {str(exc)}",
+                },
+            ) from exc
+
         try:
             with self._docker_operation("pause sandbox container", sandbox_id):
                 container.pause()
         except DockerException as exc:
+            self._raise_if_lifecycle_race(sandbox_id, exc, "pause")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
@@ -1122,17 +1270,71 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     "message": f"Failed to pause sandbox container: {str(exc)}",
                 },
             ) from exc
+        self._persist_transition(sandbox_id, "Paused")
+
+        if egress_expected and not sidecars:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_PAUSE_FAILED,
+                    "message": (
+                        "Sandbox container was paused, but the expected egress sidecar was not found."
+                    ),
+                },
+            )
+
+        paused_sidecars: list[Any] = []
+        try:
+            for sidecar in sidecars:
+                sidecar_state = sidecar.attrs.get("State", {})
+                if sidecar_state.get("Paused", False):
+                    continue
+                if not sidecar_state.get("Running", False):
+                    raise DockerException(
+                        f"Egress sidecar {sidecar.id} is not in a running state."
+                    )
+                with self._docker_operation("pause egress sidecar", sandbox_id):
+                    sidecar.pause()
+                paused_sidecars.append(sidecar)
+        except DockerException as exc:
+            rollback_errors: list[str] = []
+            for paused_sidecar in reversed(paused_sidecars):
+                try:
+                    with self._docker_operation("rollback egress sidecar pause", sandbox_id):
+                        paused_sidecar.unpause()
+                except DockerException as rollback_exc:
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to rollback egress "
+                        f"sidecar pause: {rollback_exc}"
+                    )
+                    rollback_errors.append(str(rollback_exc))
+            try:
+                with self._docker_operation("rollback sandbox pause", sandbox_id):
+                    container.unpause()
+            except DockerException as rollback_exc:
+                logger.warning(
+                    f"sandbox={sandbox_id} | failed to rollback sandbox pause: {rollback_exc}"
+                )
+                rollback_errors.append(str(rollback_exc))
+            else:
+                self._persist_transition(sandbox_id, "Running")
+
+            message = f"Failed to pause egress sidecar: {str(exc)}"
+            if rollback_errors:
+                message += f"; rollback failed: {'; '.join(rollback_errors)}"
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_PAUSE_FAILED,
+                    "message": message,
+                },
+            ) from exc
 
     def resume_sandbox(self, sandbox_id: str) -> None:
-        """
-        Resume a paused sandbox using Docker.
+        with self._sandbox_lifecycle_lock(sandbox_id):
+            self._resume_sandbox_locked(sandbox_id)
 
-        Args:
-            sandbox_id: Unique sandbox identifier
-
-        Raises:
-            HTTPException: If sandbox not found or cannot be resumed
-        """
+    def _resume_sandbox_locked(self, sandbox_id: str) -> None:
         container = self._get_container_by_sandbox_id(sandbox_id)
         state = container.attrs.get("State", {})
         if not state.get("Paused", False):
@@ -1144,17 +1346,74 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             )
 
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        egress_expected = bool(labels.get(SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY))
         try:
-            with self._docker_operation("resume sandbox container", sandbox_id):
-                container.unpause()
+            with self._docker_operation("query egress sidecar", sandbox_id):
+                sidecars = self._get_egress_sidecars(sandbox_id)
         except DockerException as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
                     "code": SandboxErrorCodes.SANDBOX_RESUME_FAILED,
-                    "message": f"Failed to resume sandbox container: {str(exc)}",
+                    "message": f"Failed to query egress sidecar: {str(exc)}",
                 },
             ) from exc
+
+        if egress_expected and not sidecars:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_RESUME_FAILED,
+                    "message": "The expected egress sidecar was not found; sandbox remains paused.",
+                },
+            )
+
+        resumed_sidecars: list[Any] = []
+        resuming_main = False
+        try:
+            for sidecar in sidecars:
+                sidecar_state = sidecar.attrs.get("State", {})
+                if not sidecar_state.get("Paused", False):
+                    if sidecar_state.get("Running", False):
+                        continue
+                    raise DockerException(
+                        f"Egress sidecar {sidecar.id} is not in a paused state."
+                    )
+                with self._docker_operation("resume egress sidecar", sandbox_id):
+                    sidecar.unpause()
+                resumed_sidecars.append(sidecar)
+
+            resuming_main = True
+            with self._docker_operation("resume sandbox container", sandbox_id):
+                container.unpause()
+        except DockerException as exc:
+            rollback_errors: list[str] = []
+            for resumed_sidecar in reversed(resumed_sidecars):
+                try:
+                    with self._docker_operation("rollback egress sidecar resume", sandbox_id):
+                        resumed_sidecar.pause()
+                except DockerException as rollback_exc:
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to rollback egress "
+                        f"sidecar resume: {rollback_exc}"
+                    )
+                    rollback_errors.append(str(rollback_exc))
+
+            failed_component = "sandbox container" if resuming_main else "egress sidecar"
+            message = f"Failed to resume {failed_component}: {str(exc)}"
+            if rollback_errors:
+                message += f"; rollback failed: {'; '.join(rollback_errors)}"
+            elif resuming_main:
+                self._raise_if_lifecycle_race(sandbox_id, exc, "resume")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.SANDBOX_RESUME_FAILED,
+                    "message": message,
+                },
+            ) from exc
+        self._persist_transition(sandbox_id, "Running")
 
     def get_access_renew_extend_seconds(self, sandbox_id: str) -> Optional[int]:
         try:
@@ -1175,19 +1434,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         sandbox_id: str,
         request: RenewSandboxExpirationRequest,
     ) -> RenewSandboxExpirationResponse:
-        """
-        Renew sandbox expiration time.
-
-        Args:
-            sandbox_id: Unique sandbox identifier
-            request: Renewal request with new expiration time
-
-        Returns:
-            RenewSandboxExpirationResponse: Updated expiration time
-
-        Raises:
-            HTTPException: If sandbox not found or renewal fails
-        """
         container = self._get_container_by_sandbox_id(sandbox_id)
         new_expiration = ensure_future_expiration(request.expires_at)
 
@@ -1216,17 +1462,15 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         try:
             self._metadata_store.set_expiration(sandbox_id, new_expiration)
         except OSError as exc:
-            logger.warning("Failed to persist expiration override for sandbox %s: %s", sandbox_id, exc)
+            logger.warning(f"Failed to persist expiration override for sandbox {sandbox_id}: {exc}")
         labels[SANDBOX_EXPIRES_AT_LABEL] = new_expiration.isoformat()
         try:
             with self._docker_operation("update sandbox labels", sandbox_id):
                 self._update_container_labels(container, labels)
         except (DockerException, TypeError) as exc:
-            logger.warning("Failed to refresh labels for sandbox %s: %s", sandbox_id, exc)
+            logger.warning(f"Failed to refresh labels for sandbox {sandbox_id}: {exc}")
 
         return RenewSandboxExpirationResponse(expires_at=new_expiration)
-
-    # Patch sandbox metadata
 
     def patch_sandbox_metadata(self, sandbox_id: str, patch: PatchSandboxMetadataRequest) -> Sandbox:
         """Patch sandbox metadata via JSON Merge Patch (RFC 7396). Docker cannot update labels on running containers, so metadata is persisted to file."""
@@ -1235,7 +1479,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         container = self._get_container_by_sandbox_id(sandbox_id)
         labels = dict(container.attrs.get("Config", {}).get("Labels") or {})
 
-        # Reject reserved keys
         for key in patch:
             if SandboxService._is_system_label(key):
                 raise HTTPException(
@@ -1246,7 +1489,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     },
                 )
 
-        # Validate only incoming patch values
         patch_additions = {k: str(v) for k, v in patch.items() if v is not None}
         if patch_additions:
             ensure_metadata_labels(patch_additions)

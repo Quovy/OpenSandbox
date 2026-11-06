@@ -22,9 +22,11 @@ The `task-executor` can be started using the `cmd/task-executor/main.go` entry p
 | `--listen-addr` (LISTEN_ADDR)| Address and port for the HTTP API server.                                                                                                                                                                                                                                                                | `0.0.0.0:5758`                |
 | `--enable-sidecar-mode` (ENABLE_SIDECAR_MODE) | If `true`, enables sidecar mode execution, where tasks are run within the PID namespace of a specified main container. Requires `nsenter` and appropriate privileges.                                                                                                                                                            | `false`                       |
 | `--main-container-name` (MAIN_CONTAINER_NAME)| When `enable-sidecar-mode` is `true`, specifies the name of the main container whose PID namespace should be used.                                                                                                                                                                       | `main`                        |
-| `--enable-container-mode` (ENABLE_CONTAINER_MODE) | If `true`, enables container mode execution using the CRI runtime. (Note: Current implementation may be a placeholder).                                                                                                                                                                | `false`                       |
-| `--cri-socket` (CRI_SOCKET) | Path to the CRI socket (e.g., `containerd.sock`) when `enable-container-mode` is `true`.                                                                                                                                                                                                                | `/var/run/containerd/containerd.sock` |
-| `--reconcile-interval`      | The interval at which the internal task manager reconciles task states.                                                                                                                                                                                                                                  | `500ms`                       |
+| `--cri-socket` (CRI_SOCKET) | Path to the CRI socket for container runner mode.                                                                                                                                                                                                                                                                                      | `/var/run/containerd/containerd.sock` |
+| `--log-dir`                 | Directory for task-executor log files.                                                                                                                                                                                                                                                                                                 | `logs`                        |
+| `--log-max-size`            | Maximum log file size in MB before rotation.                                                                                                                                                                                                                                                                                           | `100`                         |
+| `--log-max-backups`         | Maximum number of rotated log backup files.                                                                                                                                                                                                                                                                                            | `10`                          |
+| `--log-max-age`             | Maximum number of days to keep rotated log files.                                                                                                                                                                                                                                                                                      | `7`                           |
 
 ## HTTP API Endpoints
 
@@ -34,9 +36,9 @@ The `task-executor` exposes a RESTful HTTP API. All API calls expect JSON reques
 
 Creates and starts a single task.
 
-*   **Method:** `POST`
-*   **Path:** `/tasks`
-*   **Request Body (application/json):** An object representing the desired task.
+* **Method:** `POST`
+* **Path:** `/tasks`
+* **Request Body (application/json):** An object representing the desired task.
 
     ```json
     {
@@ -50,7 +52,7 @@ Creates and starts a single task.
     }
     ```
 
-*   **Response Body (application/json):** The created task object with its initial status.
+* **Response Body (application/json):** The created task object with its initial status.
 
     ```json
     {
@@ -89,9 +91,9 @@ curl -X POST -H "Content-Type: application/json" -d '{
 
 Retrieves the current status of a specific task by its name.
 
-*   **Method:** `GET`
-*   **Path:** `/tasks/{taskName}`
-*   **Response Body (application/json):** The task object, including its current status.
+* **Method:** `GET`
+* **Path:** `/tasks/{taskName}`
+* **Response Body (application/json):** The task object, including its current status.
 
     ```json
     {
@@ -122,9 +124,9 @@ curl http://localhost:5758/tasks/my-first-task
 
 Marks a task for deletion. The `task-executor` will attempt to gracefully stop the task and then remove its state.
 
-*   **Method:** `DELETE`
-*   **Path:** `/tasks/{taskName}`
-*   **Response:** `204 No Content` on successful marking for deletion.
+* **Method:** `DELETE`
+* **Path:** `/tasks/{taskName}`
+* **Response:** `204 No Content` on successful marking for deletion.
 
 **Example (using `curl`):**
 
@@ -136,9 +138,9 @@ curl -X DELETE http://localhost:5758/tasks/my-first-task
 
 This endpoint is typically used by controllers to synchronize a desired set of tasks. Tasks not present in the desired list will be marked for deletion; new tasks will be created.
 
-*   **Method:** `POST`
-*   **Path:** `/setTasks`
-*   **Request Body (application/json):** An array of task objects representing the desired state.
+* **Method:** `POST`
+* **Path:** `/setTasks`
+* **Request Body (application/json):** An array of task objects representing the desired state.
 
     ```json
     [
@@ -161,7 +163,7 @@ This endpoint is typically used by controllers to synchronize a desired set of t
     ]
     ```
 
-*   **Response Body (application/json):** The current list of tasks managed by the executor after synchronization.
+* **Response Body (application/json):** The current list of tasks managed by the executor after synchronization.
 
     ```json
     [
@@ -218,9 +220,9 @@ curl -X POST -H "Content-Type: application/json" -d \
 
 Retrieves a list of all tasks currently managed by the `task-executor`.
 
-*   **Method:** `GET`
-*   **Path:** `/getTasks`
-*   **Response Body (application/json):** An array of task objects.
+* **Method:** `GET`
+* **Path:** `/getTasks`
+* **Response Body (application/json):** An array of task objects.
 
     ```json
     [
@@ -270,9 +272,9 @@ curl http://localhost:5758/getTasks
 
 Returns the health status of the `task-executor`.
 
-*   **Method:** `GET`
-*   **Path:** `/health`
-*   **Response Body (application/json):**
+* **Method:** `GET`
+* **Path:** `/health`
+* **Response Body (application/json):**
 
     ```json
     {
@@ -319,7 +321,7 @@ This mode is intended for executing tasks within containers managed by the CRI r
   "name": "my-container-task",
   "spec": {
     "container": {
-      "image": "ubuntu:24.04",
+      "image": "ubuntu:latest",
       "command": ["/bin/bash", "-c"],
       "args": ["apt update && apt install -y curl"],
       "env": [
@@ -372,9 +374,9 @@ The `status` field within a task object (`internal/task-executor/types/Status` m
 
 **State Types:**
 
-*   `waiting`: Task is pending execution.
-*   `running`: Task is currently executing.
-*   `terminated`: Task has finished (succeeded or failed).
+* `waiting`: Task is pending execution.
+* `running`: Task is currently executing.
+* `terminated`: Task has finished (succeeded or failed).
 
 ## Example Scenario: Running a Sidecar Task
 

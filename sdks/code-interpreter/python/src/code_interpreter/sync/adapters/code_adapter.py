@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,19 +27,19 @@ from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
 )
 from opensandbox.adapters.converter.response_handler import (
-    extract_request_id,
+    build_api_exception_from_httpx,
     handle_api_error,
     require_parsed,
 )
 from opensandbox.config.connection_sync import ConnectionConfigSync
-from opensandbox.exceptions import InvalidArgumentException, SandboxApiException
+from opensandbox.exceptions import InvalidArgumentException
 from opensandbox.models.execd import Execution
 from opensandbox.models.execd_sync import ExecutionHandlersSync
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.sync.adapters.converter.execution_event_dispatcher import (
     ExecutionEventDispatcherSync,
 )
-from opensandbox.transport import unwrap_retry_transport
+from opensandbox.transport import streaming_transport
 
 from code_interpreter.models.code_sync import CodeContextSync, SupportedLanguageSync
 from code_interpreter.sync.services.code import CodesSync
@@ -99,18 +99,22 @@ class CodesAdapterSync(CodesSync):
         base_url = f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}"
         timeout_seconds = self.connection_config.request_timeout.total_seconds()
         timeout = httpx.Timeout(timeout_seconds)
-        headers = {
-            "User-Agent": self.connection_config.user_agent,
-            **self.connection_config.headers,
-            **(self.execd_endpoint.headers or {}),
-        }
+        headers = self.execd_endpoint.build_request_headers(self.connection_config)
 
+        # Adapter clients must own their transports: close() closes them,
+        # and the shared/user connection_config transport must survive that.
+        self._owns_clients = self.connection_config.owns_transport
+        main_transport: httpx.BaseTransport | None
+        if self._owns_clients:
+            main_transport = self.connection_config.new_owned_transport()
+        else:
+            main_transport = self.connection_config.transport
         self._client = Client(base_url=base_url, timeout=timeout)
         self._httpx_client = httpx.Client(
             base_url=base_url,
             headers=headers,
             timeout=timeout,
-            transport=self.connection_config.transport,
+            transport=main_transport,
         )
         self._client.set_httpx_client(self._httpx_client)
 
@@ -119,15 +123,19 @@ class CodesAdapterSync(CodesSync):
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
         }
-        # SSE bootstraps bypass the retry wrapper: request bodies are
-        # not replayable and a non-idempotent status opt-in would cause
-        # duplicate execution on a resent SSE POST.
+        # SSE bootstraps keep only the wake-timeout retry: a non-idempotent
+        # status opt-in would cause duplicate execution on a resent SSE POST.
+        sse_transport = (
+            self.connection_config.new_owned_transport()
+            if self._owns_clients
+            else self.connection_config.transport
+        )
         self._sse_client = httpx.Client(
             headers=sse_headers,
             timeout=httpx.Timeout(
                 connect=timeout_seconds, read=None, write=timeout_seconds, pool=None
             ),
-            transport=unwrap_retry_transport(self.connection_config.transport),
+            transport=streaming_transport(sse_transport),
         )
 
     def _get_execd_url(self, path: str) -> str:
@@ -135,6 +143,21 @@ class CodesAdapterSync(CodesSync):
         return (
             f"{self.connection_config.protocol}://{self.execd_endpoint.endpoint}{path}"
         )
+
+    def close(self) -> None:
+        """Release the adapter-owned HTTP clients.
+
+        Never closes the shared ``connection_config.transport``; the sandbox
+        stays usable after ``close()``. Clients wrapping a user-supplied
+        transport are left open (httpx would close the caller's transport
+        with them).
+        """
+        if not self._owns_clients:
+            return
+        try:
+            self._httpx_client.close()
+        finally:
+            self._sse_client.close()
 
     def create_context(self, language: str) -> CodeContextSync:
         """
@@ -286,17 +309,13 @@ class CodesAdapterSync(CodesSync):
 
             url = self._get_execd_url(self.RUN_CODE_PATH)
             execution = Execution(id=None, execution_count=None, result=[], error=None)
+            execution._is_code_execution = True
             dispatcher = ExecutionEventDispatcherSync(execution, handlers)
 
             with self._sse_client.stream("POST", url, json=api_request) as response:
                 if response.status_code != 200:
                     response.read()
-                    error_body = response.text
-                    raise SandboxApiException(
-                        message=f"Failed to run code. Status code: {response.status_code}, Body: {error_body}",
-                        status_code=response.status_code,
-                        request_id=extract_request_id(response.headers),
-                    )
+                    raise build_api_exception_from_httpx(response, "Run code")
 
                 for line in response.iter_lines():
                     if not line or not line.strip():
@@ -337,3 +356,20 @@ class CodesAdapterSync(CodesSync):
         except Exception as e:
             logger.error("Failed to interrupt code execution", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def ping(self) -> bool:
+        """
+        Check if the execd code execution service is alive (blocking).
+
+        Uses the shared generated API client so the ping exercises the same
+        HTTP client and endpoint that serve code execution requests.
+        """
+        try:
+            from opensandbox.api.execd.api.health import ping as ping_api
+
+            response_obj = ping_api.sync_detailed(client=self._client)
+            handle_api_error(response_obj, "Ping code interpreter")
+            return True
+        except Exception as e:
+            logger.debug(f"Code interpreter ping failed: {e}")
+            return False

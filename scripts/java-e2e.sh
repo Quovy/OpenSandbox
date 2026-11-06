@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -73,6 +73,11 @@ cd ..
 
 # wait for server
 sleep 10
+
+# Wipe stale locally-published SDK artifacts from the shared runner's mavenLocal:
+# tests/java resolves 'latest.integration', and a stale higher-version jar published
+# by another job would otherwise win over the version built from this checkout.
+rm -rf "${HOME:?HOME must be set}/.m2/repository/com/alibaba/opensandbox"
 
 cd sdks/sandbox/kotlin
 ./gradlew clean publishToMavenLocal --no-build-cache

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -209,7 +209,7 @@ async def demo_subpath_mounts(config: ConnectionConfig, image: str, run_id: str)
 async def main() -> None:
     domain = os.getenv("SANDBOX_DOMAIN", "localhost:8080")
     api_key = os.getenv("SANDBOX_API_KEY")
-    image = os.getenv("SANDBOX_IMAGE", "ubuntu:24.04")
+    image = os.getenv("SANDBOX_IMAGE", "ubuntu")
     run_id = uuid4().hex[:8]
 
     config = ConnectionConfig(

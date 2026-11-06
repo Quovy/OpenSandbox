@@ -70,7 +70,7 @@ uv pip install -e sdks/sandbox/python
 ### 5. Pull the Sandbox Image
 
 ```shell
-docker pull ubuntu:24.04
+docker pull ubuntu:latest
 ```
 
 ## Run
@@ -85,7 +85,7 @@ HOST_VOLUME_PATH=/tmp/opensandbox-data uv run python examples/host-volume-mount/
 Using HOST_VOLUME_PATH: /tmp/opensandbox-data
 
 OpenSandbox server : localhost:8080
-Sandbox image      : ubuntu:24.04
+Sandbox image      : ubuntu
 Host volume path   : /tmp/opensandbox-data
 
 ============================================================
@@ -129,7 +129,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import Host, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu:24.04",
+    image="ubuntu",
     volumes=[
         Volume(
             name="my-data",
@@ -149,7 +149,7 @@ from opensandbox import SandboxSync
 from opensandbox.models.sandboxes import Host, Volume
 
 sandbox = SandboxSync.create(
-    image="ubuntu:24.04",
+    image="ubuntu",
     volumes=[
         Volume(
             name="my-data",
@@ -166,7 +166,7 @@ sandbox = SandboxSync.create(
 import { Sandbox } from "@alibaba-group/opensandbox";
 
 const sandbox = await Sandbox.create({
-  image: "ubuntu:24.04",
+  image: "ubuntu",
   volumes: [
     {
       name: "my-data",
@@ -189,14 +189,13 @@ Volume volume = Volume.builder()
     .build();
 
 Sandbox sandbox = Sandbox.builder()
-    .image("ubuntu:24.04")
+    .image("ubuntu")
     .volume(volume)
     .build();
 ```
 
 ## References
 
-- [OSEP-0003: Volume and VolumeBinding Support](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0003-volume-and-volumebinding-support.md) -- Design proposal
 - [Sandbox Lifecycle API Spec](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/sandbox-lifecycle.yml) -- OpenAPI schema for volume definitions
 - [Server Configuration](https://github.com/opensandbox-group/OpenSandbox/blob/main/server/opensandbox_server/examples/example.config.toml) -- `[storage]` section for `allowed_host_paths`
 - [Source code on GitHub](https://github.com/opensandbox-group/OpenSandbox/tree/main/examples/host-volume-mount)

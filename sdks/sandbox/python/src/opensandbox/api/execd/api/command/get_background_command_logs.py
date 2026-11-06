@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,17 +54,26 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return response_200
 
     if response.status_code == 400:
-        response_400 = ErrorResponse.from_dict(response.json())
+        try:
+            response_400 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_400
 
     if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+        try:
+            response_404 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_404
 
     if response.status_code == 500:
-        response_500 = ErrorResponse.from_dict(response.json())
+        try:
+            response_500 = ErrorResponse.from_dict(response.json())
+        except (ValueError, TypeError, KeyError):
+            return None
 
         return response_500
 
@@ -98,6 +107,8 @@ def sync_detailed(
     tail cursor for the next poll. When no starting line is provided, the full logs are returned.
     Response body is plain text so it can be rendered directly in browsers; the latest line index
     is provided via response header `EXECD-COMMANDS-TAIL-CURSOR` for subsequent incremental requests.
+    Completed background command output is retained for at least 24 hours and then
+    removed by an hourly cleanup. Running command output is never removed by retention cleanup.
 
     Args:
         id (str):
@@ -138,6 +149,8 @@ def sync(
     tail cursor for the next poll. When no starting line is provided, the full logs are returned.
     Response body is plain text so it can be rendered directly in browsers; the latest line index
     is provided via response header `EXECD-COMMANDS-TAIL-CURSOR` for subsequent incremental requests.
+    Completed background command output is retained for at least 24 hours and then
+    removed by an hourly cleanup. Running command output is never removed by retention cleanup.
 
     Args:
         id (str):
@@ -173,6 +186,8 @@ async def asyncio_detailed(
     tail cursor for the next poll. When no starting line is provided, the full logs are returned.
     Response body is plain text so it can be rendered directly in browsers; the latest line index
     is provided via response header `EXECD-COMMANDS-TAIL-CURSOR` for subsequent incremental requests.
+    Completed background command output is retained for at least 24 hours and then
+    removed by an hourly cleanup. Running command output is never removed by retention cleanup.
 
     Args:
         id (str):
@@ -211,6 +226,8 @@ async def asyncio(
     tail cursor for the next poll. When no starting line is provided, the full logs are returned.
     Response body is plain text so it can be rendered directly in browsers; the latest line index
     is provided via response header `EXECD-COMMANDS-TAIL-CURSOR` for subsequent incremental requests.
+    Completed background command output is retained for at least 24 hours and then
+    removed by an hourly cleanup. Running command output is never removed by retention cleanup.
 
     Args:
         id (str):

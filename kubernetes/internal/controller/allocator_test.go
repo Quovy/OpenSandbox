@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,9 +33,9 @@ import (
 )
 
 // newTestAllocator creates an Allocator backed by mock store and syncer.
-func newTestAllocator(ctrl *gomock.Controller) (Allocator, *MockAllocationStore, *MockAllocationSyncer) {
-	store := NewMockAllocationStore(ctrl)
-	syncer := NewMockAllocationSyncer(ctrl)
+func newTestAllocator(ctrl *gomock.Controller) (Allocator, *MockallocationStore, *MockallocationSyncer) {
+	store := NewMockallocationStore(ctrl)
+	syncer := NewMockallocationSyncer(ctrl)
 	return &defaultAllocator{store: store, syncer: syncer, algorithm: &algorithm.PackedSchedule{}}, store, syncer
 }
 
@@ -47,16 +47,16 @@ func TestSchedule(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		spec          *AllocSpec
-		poolAlloc     *PoolAllocation
-		sandboxAllocs map[string]*SandboxAllocation
-		releases      map[string]*AllocationRelease
-		released      map[string]*AllocationReleased
+		spec          *allocSpec
+		poolAlloc     *poolAllocation
+		sandboxAllocs map[string]*sandboxAllocation
+		releases      map[string]*allocationRelease
+		released      map[string]*allocationReleased
 		wantAction    *algorithm.AllocAction
 	}{
 		{
 			name: "allocate normally - 2 pods for 2 sandboxes",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
@@ -67,10 +67,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx2"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica1}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{"sbx1": {"pod1"}, "sbx2": {"pod2"}},
 				ToRelease:     map[string][]string{},
@@ -79,7 +79,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "skip non-running pods",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodPending}},
@@ -90,10 +90,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx2"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica1}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{"sbx1": {"pod1"}},
 				ToRelease:     map[string][]string{},
@@ -102,7 +102,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "partial allocated - allocate remaining",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
@@ -112,10 +112,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx1"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica2}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{"pod1"}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{"pod1"}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{"sbx1": {"pod2"}},
 				ToRelease:     map[string][]string{},
@@ -124,7 +124,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "with release - pods to release",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 				},
@@ -133,10 +133,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx1"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica1}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{"pod1"}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{"pod1"}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{"pod1"}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{"pod1"}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{},
 				ToRelease:     map[string][]string{"sbx1": {"pod1"}},
@@ -145,7 +145,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "partial release - only unreleased pods in ToRelease",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
@@ -155,10 +155,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx1"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica2}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx1", "pod2": "sbx1"}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{"pod1", "pod2"}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{"pod1", "pod2"}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{"pod1"}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx1", "pod2": "sbx1"}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{"pod1", "pod2"}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{"pod1", "pod2"}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{"pod1"}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{},
 				ToRelease:     map[string][]string{"sbx1": {"pod2"}},
@@ -167,7 +167,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "not enough pods - PodSupplement > 0",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 				},
@@ -176,10 +176,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx1"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica2}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{"sbx1": {"pod1"}},
 				ToRelease:     map[string][]string{},
@@ -188,7 +188,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "skip already allocated pod - other sandbox gets supplement",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 				},
@@ -198,10 +198,10 @@ func TestSchedule(t *testing.T) {
 					{ObjectMeta: metav1.ObjectMeta{Name: "sbx2"}, Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replica1}},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{"pod1"}}, "sbx2": {Pods: []string{}}},
-			releases:      map[string]*AllocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx1"}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{"pod1"}}, "sbx2": {Pods: []string{}}},
+			releases:      map[string]*allocationRelease{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{}}, "sbx2": {Pods: []string{}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{},
 				ToRelease:     map[string][]string{},
@@ -210,7 +210,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "terminating sandbox - queue unreleased pods for release, no supplement",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
@@ -226,10 +226,10 @@ func TestSchedule(t *testing.T) {
 					},
 				},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx1", "pod2": "sbx1"}},
-			sandboxAllocs: map[string]*SandboxAllocation{"sbx1": {Pods: []string{"pod1", "pod2"}}},
-			releases:      map[string]*AllocationRelease{},
-			released:      map[string]*AllocationReleased{"sbx1": {Pods: []string{"pod1"}}},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx1", "pod2": "sbx1"}},
+			sandboxAllocs: map[string]*sandboxAllocation{"sbx1": {Pods: []string{"pod1", "pod2"}}},
+			releases:      map[string]*allocationRelease{},
+			released:      map[string]*allocationReleased{"sbx1": {Pods: []string{"pod1"}}},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{},
 				ToRelease:     map[string][]string{"sbx1": {"pod2"}},
@@ -238,7 +238,7 @@ func TestSchedule(t *testing.T) {
 		},
 		{
 			name: "orphan sandbox - pods in store but sandbox no longer in spec",
-			spec: &AllocSpec{
+			spec: &allocSpec{
 				Pods: []*corev1.Pod{
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
 					{ObjectMeta: metav1.ObjectMeta{Name: "pod2"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}},
@@ -247,10 +247,10 @@ func TestSchedule(t *testing.T) {
 				// sbx-orphan is not in spec (e.g. force-deleted), but pod1/pod2 still in store.
 				Sandboxes: []*sandboxv1alpha1.BatchSandbox{},
 			},
-			poolAlloc:     &PoolAllocation{PodAllocation: map[string]string{"pod1": "sbx-orphan", "pod2": "sbx-orphan"}},
-			sandboxAllocs: map[string]*SandboxAllocation{},
-			releases:      map[string]*AllocationRelease{},
-			released:      map[string]*AllocationReleased{},
+			poolAlloc:     &poolAllocation{PodAllocation: map[string]string{"pod1": "sbx-orphan", "pod2": "sbx-orphan"}},
+			sandboxAllocs: map[string]*sandboxAllocation{},
+			releases:      map[string]*allocationRelease{},
+			released:      map[string]*allocationReleased{},
 			wantAction: &algorithm.AllocAction{
 				ToAllocate:    map[string][]string{},
 				ToRelease:     map[string][]string{"sbx-orphan": {"pod1", "pod2"}},
@@ -293,22 +293,6 @@ func TestSchedule(t *testing.T) {
 
 // --- GetPoolAllocation ---
 
-func TestGetPoolAllocation(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	allocator, store, _ := newTestAllocator(ctrl)
-	pool := &sandboxv1alpha1.Pool{ObjectMeta: metav1.ObjectMeta{Name: "pool1"}}
-
-	store.EXPECT().GetAllocation(gomock.Any(), pool).Return(&PoolAllocation{
-		PodAllocation: map[string]string{"pod1": "sbx1"},
-	}, nil).Times(1)
-
-	alloc, err := allocator.GetPoolAllocation(context.Background(), pool)
-	assert.NoError(t, err)
-	assert.Equal(t, map[string]string{"pod1": "sbx1"}, alloc)
-}
-
 func TestGetPoolAllocation_Empty(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -321,20 +305,6 @@ func TestGetPoolAllocation_Empty(t *testing.T) {
 	alloc, err := allocator.GetPoolAllocation(context.Background(), pool)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{}, alloc)
-}
-
-// --- ClearPoolAllocation ---
-
-func TestClearPoolAllocation(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	allocator, store, _ := newTestAllocator(ctrl)
-
-	store.EXPECT().ClearAllocation(gomock.Any(), "ns1", "pool1").Return(nil).Times(1)
-
-	err := allocator.ClearPoolAllocation(context.Background(), "ns1", "pool1")
-	assert.NoError(t, err)
 }
 
 // --- annoAllocationSyncer: finalizer behavior ---
@@ -350,14 +320,20 @@ func newTestSyncer(sandbox *sandboxv1alpha1.BatchSandbox) (*annoAllocationSyncer
 
 func TestSetAllocation_AddsFinalizer(t *testing.T) {
 	sandbox := &sandboxv1alpha1.BatchSandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: "sbx1", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sbx1", Namespace: "default", Generation: 7},
 		Spec:       sandboxv1alpha1.BatchSandboxSpec{PoolRef: "pool1"},
 	}
 	syncer, sbx := newTestSyncer(sandbox)
 
-	err := syncer.SetAllocation(context.Background(), sbx, &SandboxAllocation{Pods: []string{"pod1"}})
+	err := syncer.SetAllocation(context.Background(), sbx, &sandboxAllocation{Pods: []string{"pod1"}})
 	assert.NoError(t, err)
-	assert.Contains(t, sbx.Finalizers, FinalizerPoolAllocation)
+	assert.Contains(t, sbx.Finalizers, finalizerPoolAllocation)
+
+	allocation, err := syncer.GetAllocation(context.Background(), sbx)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"pod1"}, allocation.Pods)
+	assert.Equal(t, "pool1", allocation.PoolRef)
+	assert.Equal(t, int64(7), allocation.Generation)
 }
 
 func TestSetReleased_FinalizerBehavior(t *testing.T) {
@@ -375,7 +351,7 @@ func TestSetReleased_FinalizerBehavior(t *testing.T) {
 			name:             "not deleting - finalizer kept regardless of release coverage",
 			allocated:        []string{"pod1"},
 			released:         []string{"pod1"},
-			finalizersBefore: []string{FinalizerPoolAllocation},
+			finalizersBefore: []string{finalizerPoolAllocation},
 			wantFinalizer:    true,
 		},
 		{
@@ -383,7 +359,7 @@ func TestSetReleased_FinalizerBehavior(t *testing.T) {
 			allocated:         []string{"pod1", "pod2"},
 			released:          []string{"pod1"},
 			deletionTimestamp: &now,
-			finalizersBefore:  []string{FinalizerPoolAllocation},
+			finalizersBefore:  []string{finalizerPoolAllocation},
 			wantFinalizer:     true,
 		},
 		{
@@ -391,7 +367,7 @@ func TestSetReleased_FinalizerBehavior(t *testing.T) {
 			allocated:         []string{"pod1", "pod2"},
 			released:          []string{"pod1", "pod2"},
 			deletionTimestamp: &now,
-			finalizersBefore:  []string{FinalizerPoolAllocation},
+			finalizersBefore:  []string{finalizerPoolAllocation},
 			wantFinalizer:     false,
 		},
 		{
@@ -399,14 +375,14 @@ func TestSetReleased_FinalizerBehavior(t *testing.T) {
 			allocated:         []string{},
 			released:          []string{},
 			deletionTimestamp: &now,
-			finalizersBefore:  []string{FinalizerPoolAllocation},
+			finalizersBefore:  []string{finalizerPoolAllocation},
 			wantFinalizer:     false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allocJSON, _ := marshalJSON(&SandboxAllocation{Pods: tt.allocated})
+			allocJSON, _ := marshalJSON(&sandboxAllocation{Pods: tt.allocated})
 			sandbox := &sandboxv1alpha1.BatchSandbox{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "sbx1",
@@ -414,19 +390,19 @@ func TestSetReleased_FinalizerBehavior(t *testing.T) {
 					Finalizers:        tt.finalizersBefore,
 					DeletionTimestamp: tt.deletionTimestamp,
 					Annotations: map[string]string{
-						AnnoAllocStatusKey: allocJSON,
+						annoAllocStatusKey: allocJSON,
 					},
 				},
 			}
 			syncer, sbx := newTestSyncer(sandbox)
 
-			err := syncer.SetReleased(context.Background(), sbx, &AllocationReleased{Pods: tt.released})
+			err := syncer.SetReleased(context.Background(), sbx, &allocationReleased{Pods: tt.released})
 			assert.NoError(t, err)
 
 			if tt.wantFinalizer {
-				assert.Contains(t, sbx.Finalizers, FinalizerPoolAllocation, "finalizer should be kept")
+				assert.Contains(t, sbx.Finalizers, finalizerPoolAllocation, "finalizer should be kept")
 			} else {
-				assert.NotContains(t, sbx.Finalizers, FinalizerPoolAllocation, "finalizer should be removed")
+				assert.NotContains(t, sbx.Finalizers, finalizerPoolAllocation, "finalizer should be removed")
 			}
 		})
 	}
@@ -450,11 +426,11 @@ func TestSyncSandboxAllocation_Success(t *testing.T) {
 	newPods := []string{"pod1", "pod2"}
 
 	// Phase 1: snapshot old state, then update memory.
-	syncer.EXPECT().GetAllocation(gomock.Any(), sandbox).Return(&SandboxAllocation{Pods: []string{}}, nil).Times(1)
+	syncer.EXPECT().GetAllocation(gomock.Any(), sandbox).Return(&sandboxAllocation{Pods: []string{}}, nil).Times(1)
 	store.EXPECT().UpdateAllocation(gomock.Any(), "ns1", "pool1", "sbx1", newPods).Times(1)
 	// Phase 2: persist to annotation.
 	syncer.EXPECT().SetAllocation(gomock.Any(), sandbox, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, alloc *SandboxAllocation) error {
+		func(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, alloc *sandboxAllocation) error {
 			assert.Equal(t, newPods, alloc.Pods)
 			return nil
 		}).Times(1)
@@ -492,7 +468,7 @@ func TestSyncSandboxAllocation_SetFailed_Rollback(t *testing.T) {
 	oldPods := []string{"pod-old"}
 	newPods := []string{"pod1"}
 
-	syncer.EXPECT().GetAllocation(gomock.Any(), sandbox).Return(&SandboxAllocation{Pods: oldPods}, nil).Times(1)
+	syncer.EXPECT().GetAllocation(gomock.Any(), sandbox).Return(&sandboxAllocation{Pods: oldPods}, nil).Times(1)
 	// Phase 1: optimistic memory update.
 	store.EXPECT().UpdateAllocation(gomock.Any(), "ns1", "pool1", "sbx1", newPods).Times(1)
 	// Phase 2: annotation fails → rollback memory to old state.
@@ -518,7 +494,7 @@ func TestSyncSandboxReleased_Success(t *testing.T) {
 
 	// Phase 1: persist to annotation first to prevent premature re-allocation.
 	syncer.EXPECT().SetReleased(gomock.Any(), sandbox, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, released *AllocationReleased) error {
+		func(ctx context.Context, sbx *sandboxv1alpha1.BatchSandbox, released *allocationReleased) error {
 			assert.Equal(t, pods, released.Pods)
 			return nil
 		}).Times(1)
@@ -546,4 +522,41 @@ func TestSyncSandboxReleased_SetFailed(t *testing.T) {
 
 	err := allocator.SyncSandboxReleased(context.Background(), sandbox, pods)
 	assert.Error(t, err)
+}
+
+func TestTerminatingTaskAllocationHandoff(t *testing.T) {
+	now := metav1.Now()
+	replicas := int32(5)
+	for _, tc := range []struct {
+		name     string
+		cleaning bool
+		release  string
+		want     []string
+	}{
+		{name: "hooks pending", cleaning: true},
+		{name: "explicit completed task", cleaning: true, release: `{"pods":["done","historical"]}`, want: []string{"done"}},
+		{name: "cleanup complete", want: []string{"done", "running"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sandbox := &sandboxv1alpha1.BatchSandbox{
+				ObjectMeta: metav1.ObjectMeta{Name: "sandbox", DeletionTimestamp: &now,
+					Annotations: map[string]string{
+						annoAllocStatusKey:   `{"pods":["done","running","historical"]}`,
+						annoAllocReleasedKey: `{"pods":["historical"]}`,
+						annoAllocReleaseKey:  tc.release,
+					}},
+				Spec: sandboxv1alpha1.BatchSandboxSpec{Replicas: &replicas},
+			}
+			if tc.cleaning {
+				sandbox.Finalizers = []string{finalizerTaskCleanup}
+			}
+			allocator := NewDefaultAllocator(fake.NewClientBuilder().WithScheme(testscheme).Build()).(*defaultAllocator)
+			request, err := allocator.getSandboxRequest(context.Background(), sandbox)
+			if !assert.NoError(t, err) {
+				return
+			}
+			assert.Zero(t, request.PodSupplement)
+			assert.ElementsMatch(t, tc.want, request.ToRelease)
+		})
+	}
 }

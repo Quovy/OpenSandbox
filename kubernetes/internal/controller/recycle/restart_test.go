@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ func TestRestartRecycler(t *testing.T) {
 			name:           "HandlerFailed_NeedDelete",
 			pod:            &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1"}},
 			handlerStatus:  &restart.Status{State: restart.StateFailed},
-			wantState:      StateFailed,
+			wantState:      stateFailed,
 			wantNeedDelete: true,
 		},
 		{
@@ -82,7 +82,7 @@ func TestRestartRecycler(t *testing.T) {
 					TryRestart(gomock.Any(), pool, tt.pod, gomock.Any()).
 					Return(tt.handlerStatus, tt.handlerErr)
 			}
-			r := NewRestartRecycler(mockHandler)
+			r := newRestartRecycler(mockHandler)
 			status, err := r.TryRecycle(context.Background(), pool, tt.pod, &Spec{ID: "sbx1"})
 			if tt.wantErr {
 				assert.Error(t, err)

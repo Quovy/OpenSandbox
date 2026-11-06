@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ export default defineConfig({
     testTimeout: 15 * 60_000,
     hookTimeout: 15 * 60_000,
     // Keep ordering deterministic (mirrors ordered Python/Java E2E suites).
+    fileParallelism: false,
     sequence: {
       concurrent: false,
     },

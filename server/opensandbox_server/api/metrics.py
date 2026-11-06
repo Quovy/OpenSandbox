@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,13 +71,8 @@ def report_metrics_event(
             success=event.success,
         )
         logger.debug(
-            "Accepted sandbox.create metrics event sandbox_id=%s image=%s "
-            "duration_ms=%s sdk=%s/%s success=%s",
-            event.sandbox_id,
-            event.image,
-            event.create_duration_ms,
-            sdk_language,
-            sdk_version,
-            event.success,
+            f"Accepted sandbox.create metrics event sandbox_id={event.sandbox_id} "
+            f"image={event.image} duration_ms={event.create_duration_ms} "
+            f"sdk={sdk_language}/{sdk_version} success={event.success}"
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

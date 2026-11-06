@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,7 +47,6 @@ func TestGenerateSeccompDenyBPF_Override(t *testing.T) {
 	require.NotEmpty(t, bpf)
 	assert.Equal(t, 0, len(bpf)%8)
 
-	// Override with fewer syscalls should produce smaller BPF than default.
 	defaultBPF, err := generateSeccompDenyBPF(nil)
 	require.NoError(t, err)
 	assert.Less(t, len(bpf), len(defaultBPF), "override with 2 syscalls should produce smaller BPF than default")
@@ -58,12 +57,6 @@ func TestGenerateSeccompDenyBPF_EmptyOverride(t *testing.T) {
 	bpf, err := generateSeccompDenyBPF(override)
 	require.NoError(t, err)
 	assert.Nil(t, bpf, "empty deny list should produce nil BPF")
-}
-
-func TestGenerateSeccompDenyBPF_ArchSpecific(t *testing.T) {
-	bpf, err := generateSeccompDenyBPF(nil)
-	require.NoError(t, err)
-	t.Logf("generated %d BPF instructions (%d bytes)", len(bpf)/8, len(bpf))
 }
 
 func TestFilterKnownSyscalls(t *testing.T) {

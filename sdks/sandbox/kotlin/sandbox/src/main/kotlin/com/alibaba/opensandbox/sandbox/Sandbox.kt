@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,20 @@ import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxInternalException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
+import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContext
 import com.alibaba.opensandbox.sandbox.domain.models.execd.DEFAULT_EGRESS_PORT
 import com.alibaba.opensandbox.sandbox.domain.models.execd.DEFAULT_EXECD_PORT
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.IdlePolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxOrigin
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
@@ -41,6 +45,7 @@ import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
 import com.alibaba.opensandbox.sandbox.domain.services.Health
+import com.alibaba.opensandbox.sandbox.domain.services.IdentityFilesystem
 import com.alibaba.opensandbox.sandbox.domain.services.IsolationService
 import com.alibaba.opensandbox.sandbox.domain.services.Metrics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
@@ -79,12 +84,13 @@ import java.time.OffsetDateTime
  *     .build()
  *
  * // Use the sandbox
- * sandbox.writeFile("script.py", "print('Hello World')")
- * val result = sandbox.execute("python script.py")
- * println(result.stdout) // Output: Hello World
+ * sandbox.files().writeFile("script.py", "print('Hello World')")
+ * val result = sandbox.commands().run("python script.py")
+ * println(result.logs.stdout.firstOrNull()?.text) // Output: Hello World
  *
  * // Always clean up resources
- * sandbox.terminate()
+ * sandbox.kill()
+ * sandbox.close()
  * ```
  *
  */
@@ -101,6 +107,7 @@ class Sandbox internal constructor(
     private val customHealthCheck: ((sandbox: Sandbox) -> Boolean)? = null,
     private val httpClientProvider: HttpClientProvider,
     private val diagnosticsService: Diagnostics,
+    val origin: String = SandboxOrigin.UNKNOWN,
 ) : AutoCloseable {
     private val logger = LoggerFactory.getLogger(Sandbox::class.java)
 
@@ -112,6 +119,25 @@ class Sandbox internal constructor(
      * @return Service for filesystem manipulation
      */
     fun files() = fileSystemService
+
+    /**
+     * Returns an independent filesystem client using explicit Linux credentials.
+     * Unsupported servers fail without falling back to the default identity.
+     *
+     * @throws UnsupportedOperationException if the configured filesystem does not support identity scoping
+     * @throws IllegalArgumentException if uid or gid is outside 0..4294967294
+     */
+    fun filesWithIdentity(
+        uid: Long,
+        gid: Long,
+    ): Filesystem {
+        val adapter =
+            fileSystemService as? IdentityFilesystem
+                ?: throw UnsupportedOperationException(
+                    "The selected filesystem adapter does not support execution identity",
+                )
+        return adapter.withIdentity(uid, gid)
+    }
 
     /**
      * Provides access to command execution operations.
@@ -134,8 +160,13 @@ class Sandbox internal constructor(
     /**
      * Provides access to sandbox-scoped Credential Vault operations.
      *
-     * Credential Vault writes go directly to the sandbox egress sidecar and
+     * Direct sidecar sandboxes write straight to the sandbox egress sidecar and
      * preserve endpoint routing/auth headers resolved for this sandbox.
+     * Template-backed sandboxes route through the lifecycle control plane
+     * (OSEP-0022): the server relays vault revisions to the egress-held vault
+     * over the FastPath handler relay, so the ack is synchronous and values
+     * never appear on any read. A 412 patch failure means another writer won
+     * the revision — re-read and retry with the fresh `expectedRevision`.
      */
     fun credentialVault(): CredentialVault = credentialVaultService
 
@@ -178,6 +209,15 @@ class Sandbox internal constructor(
         fun resumer(): Resumer = Resumer()
 
         /**
+         * Creates a new [TemplateLauncher] for creating a sandbox from a fsb
+         * golden-image template.
+         *
+         * @return A new TemplateLauncher instance
+         */
+        @JvmStatic
+        fun fromTemplate(): TemplateLauncher = TemplateLauncher()
+
+        /**
          * Initialization result indicating the type of sandbox being initialized.
          */
         private sealed class InitializationResult {
@@ -193,9 +233,12 @@ class Sandbox internal constructor(
          *
          * @param operationName Operation name for logging
          * @param connectionConfig Connection configuration
+         * @param initializationConnectionConfig Optional configuration used only by [initAction]
          * @param healthCheck Custom health check function
          * @param timeout Timeout for readiness check
          * @param healthCheckPollingInterval Polling interval for health check
+         * @param origin Known sandbox origin before endpoint lookup (e.g. template-based creation);
+         * the server-reported `OPEN-SANDBOX-ORIGIN` header takes precedence when present
          * @param initAction Initialization action that returns the sandbox ID and type
          * @return Fully initialized Sandbox instance
          * @throws SandboxException if initialization fails
@@ -203,43 +246,71 @@ class Sandbox internal constructor(
         private fun initializeSandbox(
             operationName: String,
             connectionConfig: ConnectionConfig,
+            initializationConnectionConfig: ConnectionConfig? = null,
             healthCheck: ((Sandbox) -> Boolean)?,
             timeout: Duration,
             healthCheckPollingInterval: Duration,
             skipHealthCheck: Boolean,
             execdPort: Int = DEFAULT_EXECD_PORT,
+            origin: String = SandboxOrigin.UNKNOWN,
             initAction: (Sandboxes) -> InitializationResult,
         ): Sandbox {
             logger.info("Starting {} operation", operationName)
 
             val httpClientProvider = HttpClientProvider(connectionConfig)
             val factory = AdapterFactory(httpClientProvider)
+            val initializationProvider = initializationConnectionConfig?.let(::HttpClientProvider)
+            val initializationFactory = initializationProvider?.let(::AdapterFactory) ?: factory
             var initResult: InitializationResult? = null
             var sandboxService: Sandboxes? = null
+            var initializationSandboxService: Sandboxes? = null
 
             try {
-                sandboxService = factory.createSandboxes()
-                initResult = initAction(sandboxService)
+                initializationSandboxService = initializationFactory.createSandboxes()
+                initResult = initAction(initializationSandboxService)
+                sandboxService =
+                    if (initializationProvider == null) {
+                        initializationSandboxService
+                    } else {
+                        factory.createSandboxes()
+                    }
 
                 val sandboxId = initResult.id
 
-                val execdEndpoint =
-                    sandboxService.getSandboxEndpoint(
-                        sandboxId,
-                        execdPort,
-                        connectionConfig.useServerProxy,
-                    )
+                val budget =
+                    if (initResult is InitializationResult.ExistingSandbox) {
+                        ReadinessBudget(
+                            timeout,
+                            healthCheckPollingInterval,
+                        )
+                    } else {
+                        null
+                    }
+                val endpointService = sandboxService
+
+                fun resolveEndpoint(port: Int): SandboxEndpoint {
+                    val action = { endpointService.getSandboxEndpoint(sandboxId, port, connectionConfig.useServerProxy) }
+                    return budget?.endpoint(action) ?: action()
+                }
+                val execdEndpoint = resolveEndpoint(execdPort)
+                // The server-reported origin is authoritative: template-backed sandboxes
+                // (fsb golden images, including snapshot restores) have no egress sidecar,
+                // so their egress policy is routed through the lifecycle control plane.
+                val sandboxOrigin = execdEndpoint.origin ?: origin
+                val egressStack =
+                    if (sandboxOrigin == SandboxOrigin.TEMPLATE) {
+                        logger.info(
+                            "Sandbox {} is template-backed; routing egress policy through the lifecycle control plane",
+                            sandboxId,
+                        )
+                        factory.createNetworkPolicyStack(sandboxId)
+                    } else {
+                        factory.createEgressStack(resolveEndpoint(DEFAULT_EGRESS_PORT))
+                    }
                 val fileSystemService = factory.createFilesystem(execdEndpoint)
                 val commandService = factory.createCommands(execdEndpoint)
                 val metricsService = factory.createMetrics(execdEndpoint)
                 val healthService = factory.createHealth(execdEndpoint)
-                val egressEndpoint =
-                    sandboxService.getSandboxEndpoint(
-                        sandboxId,
-                        DEFAULT_EGRESS_PORT,
-                        connectionConfig.useServerProxy,
-                    )
-                val egressStack = factory.createEgressStack(egressEndpoint)
                 val diagnosticsService = factory.createDiagnostics()
                 val isolatedService = factory.createIsolatedSessions(execdEndpoint)
 
@@ -257,10 +328,11 @@ class Sandbox internal constructor(
                         customHealthCheck = healthCheck,
                         httpClientProvider = httpClientProvider,
                         diagnosticsService = diagnosticsService,
+                        origin = sandboxOrigin,
                     )
 
                 if (!skipHealthCheck) {
-                    sandbox.checkReady(timeout, healthCheckPollingInterval)
+                    sandbox.checkReady(budget ?: ReadinessBudget(timeout, healthCheckPollingInterval))
                     logger.info("{} operation completed for sandbox {}", operationName, sandboxId)
                 } else {
                     logger.info(
@@ -276,13 +348,14 @@ class Sandbox internal constructor(
                 // usable by restoring the flag only after remote/local resources are released.
                 val restoreInterrupt = Thread.interrupted() || failure.isCausedByInterruption()
                 try {
-                    if (initResult is InitializationResult.NewSandbox && sandboxService != null) {
+                    val cleanupSandboxService = sandboxService ?: initializationSandboxService
+                    if (initResult is InitializationResult.NewSandbox && cleanupSandboxService != null) {
                         try {
                             logger.warn(
                                 "Sandbox creation failed during initialization. Attempting to terminate zombie sandbox: {}",
                                 initResult.id,
                             )
-                            sandboxService.killSandbox(initResult.id)
+                            cleanupSandboxService.killSandbox(initResult.id)
                         } catch (cleanupFailure: Throwable) {
                             logger.error(
                                 "Failed to clean up sandbox {} after creation failure",
@@ -305,6 +378,7 @@ class Sandbox internal constructor(
                 }
 
                 when (failure) {
+                    is InterruptedException -> throw failure
                     is Error -> throw failure
                     is SandboxException -> throw failure
                     else -> {
@@ -314,6 +388,12 @@ class Sandbox internal constructor(
                             cause = failure,
                         )
                     }
+                }
+            } finally {
+                try {
+                    initializationProvider?.close()
+                } catch (cleanupFailure: Throwable) {
+                    logger.warn("Failed to close initialization HTTP client", cleanupFailure)
                 }
             }
         }
@@ -336,6 +416,7 @@ class Sandbox internal constructor(
          * @param healthCheckPollingInterval Polling interval for readiness/health check
          * @param extensions Optional extension parameters for server-side customized behaviors
          * @param volumes Optional list of volume mounts for persistent storage
+         * @param lifecycle Optional pre-start and periodic lifecycle hooks
          * @return Fully configured and ready Sandbox instance
          * @throws SandboxException if sandbox creation or initialization fails
          */
@@ -353,12 +434,14 @@ class Sandbox internal constructor(
             credentialProxy: CredentialProxyConfig?,
             secureAccess: Boolean,
             connectionConfig: ConnectionConfig,
+            initializationConnectionConfig: ConnectionConfig? = null,
             healthCheck: ((Sandbox) -> Boolean)? = null,
             healthCheckPollingInterval: Duration,
             extensions: Map<String, String>,
             skipHealthCheck: Boolean,
             volumes: List<Volume>?,
             resourceRequests: Map<String, String>? = null,
+            lifecycle: SandboxLifecycle? = null,
         ): Sandbox {
             val timeoutLabel = if (timeout != null) "${timeout.seconds}s" else "manual-cleanup"
             val startupSource = imageSpec?.image ?: snapshotId
@@ -369,6 +452,7 @@ class Sandbox internal constructor(
                     initializeSandbox(
                         operationName = "create sandbox with startup source $startupSource (timeout: $timeoutLabel)",
                         connectionConfig = connectionConfig,
+                        initializationConnectionConfig = initializationConnectionConfig,
                         healthCheck = healthCheck,
                         timeout = readyTimeout,
                         healthCheckPollingInterval = healthCheckPollingInterval,
@@ -390,6 +474,7 @@ class Sandbox internal constructor(
                                 secureAccess = secureAccess,
                                 snapshotId = snapshotId,
                                 resourceRequests = resourceRequests,
+                                lifecycle = lifecycle,
                             )
                         createdSandboxId = response.id
                         InitializationResult.NewSandbox(response.id)
@@ -417,6 +502,84 @@ class Sandbox internal constructor(
         private fun elapsedMillis(startNanos: Long): Long {
             val elapsed = (System.nanoTime() - startNanos) / 1_000_000L
             return if (elapsed < 0L) 0L else elapsed
+        }
+
+        /**
+         * Creates a sandbox instance from a fsb golden-image template.
+         *
+         * Template mode fixes the workload shape on the server: only metadata,
+         * network policy and extensions may accompany the template id, and the
+         * timeout is required.
+         *
+         * @param templateId Unique identifier of a `Succeeded` template owned by the requester
+         * @param timeout Sandbox lifetime. Required in template mode.
+         * @param readyTimeout Timeout for waiting for sandbox readiness
+         * @param metadata Metadata for the sandbox
+         * @param networkPolicy Optional outbound network policy (egress)
+         * @param extensions Optional extension parameters for server-side customized behaviors
+         * @param connectionConfig Connection configuration
+         * @param healthCheck Custom health check function (optional)
+         * @param healthCheckPollingInterval Polling interval for readiness/health check
+         * @param skipHealthCheck When true, do NOT wait for sandbox readiness
+         * @return Fully configured and ready Sandbox instance
+         * @throws SandboxException if sandbox creation or initialization fails
+         */
+        private fun createFromTemplate(
+            templateId: String,
+            timeout: Duration,
+            readyTimeout: Duration,
+            metadata: Map<String, String>,
+            networkPolicy: NetworkPolicy?,
+            extensions: Map<String, String>,
+            idlePolicy: IdlePolicy?,
+            connectionConfig: ConnectionConfig,
+            healthCheck: ((Sandbox) -> Boolean)?,
+            healthCheckPollingInterval: Duration,
+            skipHealthCheck: Boolean,
+        ): Sandbox {
+            val started = System.nanoTime()
+            var createdSandboxId: String? = null
+            try {
+                val sandbox =
+                    initializeSandbox(
+                        operationName = "create sandbox from template $templateId (timeout: ${timeout.seconds}s)",
+                        connectionConfig = connectionConfig,
+                        healthCheck = healthCheck,
+                        timeout = readyTimeout,
+                        healthCheckPollingInterval = healthCheckPollingInterval,
+                        skipHealthCheck = skipHealthCheck,
+                        origin = SandboxOrigin.TEMPLATE,
+                    ) { sandboxService ->
+                        val response =
+                            sandboxService.createSandboxFromTemplate(
+                                templateId = templateId,
+                                timeout = timeout,
+                                metadata = metadata,
+                                networkPolicy = networkPolicy,
+                                extensions = extensions,
+                                idlePolicy = idlePolicy,
+                            )
+                        createdSandboxId = response.id
+                        InitializationResult.NewSandbox(response.id)
+                    }
+                LifecycleMetricsReporter.reportSandboxCreate(
+                    connectionConfig = connectionConfig,
+                    sandboxId = sandbox.id,
+                    image = "template:$templateId",
+                    createDurationMs = elapsedMillis(started),
+                    success = true,
+                )
+                return sandbox
+            } catch (e: Throwable) {
+                LifecycleMetricsReporter.reportSandboxCreate(
+                    connectionConfig = connectionConfig,
+                    sandboxId = createdSandboxId,
+                    image = "template:$templateId",
+                    createDurationMs = elapsedMillis(started),
+                    success = false,
+                )
+                throw e
+            }
         }
 
         /**
@@ -465,7 +628,7 @@ class Sandbox internal constructor(
          * @param healthCheck Optional custom health check; falls back to [Sandbox.ping]
          * @param resumeTimeout Max time to wait for the sandbox to become ready after resuming
          * @param healthCheckPollingInterval Polling interval for readiness/health check
-         * @return Resumed and ready Sandbox instance
+         * @return Resumed Sandbox instance
          * @throws SandboxException if resume or readiness check fails
          */
         private fun resume(
@@ -501,10 +664,11 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Gets the current status of this sandbox.
+     * Gets the public endpoint for a sandbox service port.
      *
-     * @return Current sandbox status including state and metadata
-     * @throws SandboxException if status cannot be retrieved
+     * @param port The port number to get the endpoint for
+     * @return Endpoint address and request headers for the service
+     * @throws SandboxException if the endpoint cannot be resolved
      */
     fun getEndpoint(port: Int): SandboxEndpoint {
         return sandboxService.getSandboxEndpoint(id, port, httpClientProvider.config.useServerProxy)
@@ -525,12 +689,17 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Gets the current status of this sandbox.
+     * Gets current resource metrics (CPU/memory) for this sandbox.
      *
-     * @return Current sandbox status including state and metadata
+     * @return Latest reported metrics snapshot
      */
     fun getMetrics(): SandboxMetrics {
         return metricsService.getMetrics(id)
+    }
+
+    /** Gets the sandbox's runtime backend and diagnostic identifiers. */
+    fun getDiagnosticContext(): DiagnosticContext {
+        return diagnosticsService.getContext(id)
     }
 
     /**
@@ -556,9 +725,11 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Renew the sandbox expiration time to delay automatic termination.
+     * Set the sandbox expiration time.
      *
      * The new expiration time will be set to the current time plus the provided duration.
+     * This may shorten or extend the remaining lifetime. The creation-time
+     * server timeout limit does not apply.
      *
      * @param timeout Duration to add to the current time to set the new expiration
      * @throws SandboxException if the operation fails
@@ -629,8 +800,8 @@ class Sandbox internal constructor(
     }
 
     /**
-     * This method sends a termination signal to the remote sandbox instance, causing it to stop immediately.
-     * This is an irreversible operation.
+     * Request irreversible termination of the remote sandbox. Returns when deletion is accepted;
+     * runtime cleanup may continue afterward.
      *
      * Note: This method does NOT close the local `Sandbox` object resources (like connection pools).
      * You should call `close()` or use a try-with-resources block to clean up local resources.
@@ -662,9 +833,11 @@ class Sandbox internal constructor(
 
     /**
      * Waits for the sandbox to pass a custom health check with polling.
+     * Custom checks run on the calling thread and cannot be interrupted by this timeout.
      *
      * @param timeout Maximum time to wait for health check to pass
      * @param pollingInterval Time between health check attempts
+     * @throws InvalidArgumentException if pollingInterval is negative or zero
      * @throws SandboxReadyTimeoutException if health check doesn't pass within timeout
      * @throws SandboxException if health check fails
      */
@@ -672,58 +845,18 @@ class Sandbox internal constructor(
         timeout: Duration,
         pollingInterval: Duration,
     ) {
-        logger.info("Waiting for sandbox {} to pass health check (timeout: {}s)", id, timeout.seconds)
-
-        val deadline = System.currentTimeMillis() + timeout.toMillis()
-        var attempt = 0
-        var lastException: Throwable? = null
-
-        while (System.currentTimeMillis() < deadline) {
-            attempt++
-            logger.debug("Health check attempt #{} for sandbox {}", attempt, id)
-
-            val isHealthy =
-                try {
-                    isHealthy()
-                } catch (e: Exception) {
-                    if (Thread.currentThread().isInterrupted || e.isCausedByInterruption()) {
-                        Thread.currentThread().interrupt()
-                        throw e
-                    }
-                    lastException = e
-                    logger.debug("Health check attempt #{} failed with exception: {}", attempt, e.message)
-                    false
-                }
-
-            if (isHealthy) {
-                logger.info("Sandbox {} passed health check after {} attempts", id, attempt)
-                return
-            }
-
-            if (lastException == null) {
-                logger.debug("Health check attempt #{} returned false", attempt)
-            }
-
-            Thread.sleep(pollingInterval.toMillis())
+        if (pollingInterval.isNegative || pollingInterval.isZero) {
+            throw InvalidArgumentException(
+                message = "Ready polling interval must be positive, got: $pollingInterval",
+            )
         }
+        checkReady(ReadinessBudget(timeout, pollingInterval))
+    }
 
-        val errorDetail =
-            if (lastException != null) {
-                "Last error: ${lastException.message}"
-            } else {
-                "Check returned false continuously"
-            }
-
-        val context = "domain=${httpClientProvider.config.getDomain()}, useServerProxy=${httpClientProvider.config.useServerProxy}"
-        val finalMessage =
-            "Sandbox health check timed out after ${timeout.seconds}s ($attempt attempts). $errorDetail " +
-                "Connection context: $context."
-
-        logger.error(finalMessage, lastException)
-
-        throw SandboxReadyTimeoutException(
-            message = finalMessage,
-        )
+    private fun checkReady(budget: ReadinessBudget) {
+        budget.health("domain=${httpClientProvider.config.getDomain()}, useServerProxy=${httpClientProvider.config.useServerProxy}") {
+            isHealthy()
+        }
     }
 
     /**
@@ -744,32 +877,7 @@ class Sandbox internal constructor(
         return healthService.ping(id)
     }
 
-    /**
-     * Fluent connector for connecting to existing sandbox instances.
-     *
-     * This class provides a type-safe, fluent interface for configuring connection
-     * parameters to connect to a running sandbox instance.
-     *
-     * ## Basic Usage
-     *
-     * ```kotlin
-     * val sandbox = Sandbox.connector()
-     *     .sandboxId("existing-sandbox-id")
-     *     .build()
-     * ```
-     *
-     * ## Advanced Configuration
-     *
-     * ```kotlin
-     * val sandbox = Sandbox.connector()
-     *     .sandboxId("existing-sandbox-id")
-     *     .apiKey("your-api-key")
-     *     .domain("api.custom-domain.com/v1")
-     *     .requestTimeout(Duration.ofSeconds(60))
-     *     .healthCheck { sandbox -> sandbox.isHealthy() }
-     *     .build()
-     * ```
-     */
+    /** Connects to an existing sandbox. */
     class Connector internal constructor() {
         /**
          * Sandbox ID to connect to
@@ -813,7 +921,6 @@ class Sandbox internal constructor(
          *
          * @param sandboxId ID of the existing sandbox
          * @return This connector for method chaining
-         * @throws InvalidArgumentException if sandboxId is blank
          */
         fun sandboxId(sandboxId: String): Connector {
             this.sandboxId = sandboxId
@@ -831,7 +938,8 @@ class Sandbox internal constructor(
         }
 
         /**
-         * Sets the max time to wait for readiness after the connect operation.
+         * Total budget for endpoint publication and health checks.
+         * See [Sandbox.checkReady] for custom health-check timeout limits.
          */
         fun connectTimeout(timeout: Duration): Connector {
             this.connectTimeout = timeout
@@ -847,7 +955,7 @@ class Sandbox internal constructor(
         }
 
         /**
-         * Skip readiness/health check during [connect]. The returned sandbox may not be ready yet.
+         * Skip health checks; required endpoints are still resolved.
          */
         fun skipHealthCheck(skip: Boolean = true): Connector {
             this.skipHealthCheck = skip
@@ -867,17 +975,11 @@ class Sandbox internal constructor(
         /**
          * Connects to the existing sandbox with the configured parameters.
          *
-         * This method performs the following steps:
-         * 1. Validates all required configuration
-         * 2. Delegates to Sandbox.connect() to connect to the sandbox
-         * 3. Returns a connected Sandbox instance
-         *
          * @return Connected Sandbox instance
          * @throws InvalidArgumentException if required configuration is missing or invalid
          * @throws SandboxException if sandbox connection fails
          */
         fun connect(): Sandbox {
-            // Validate required configuration
             val id =
                 sandboxId ?: throw InvalidArgumentException(
                     message = "Sandbox ID must be specified",
@@ -992,6 +1094,9 @@ class Sandbox internal constructor(
          */
         private var platform: PlatformSpec? = null
 
+        /** Optional pre-start and periodic lifecycle hooks. */
+        private var lifecycle: SandboxLifecycle? = null
+
         /**
          * Optional list of volume mounts for persistent storage.
          */
@@ -1016,6 +1121,7 @@ class Sandbox internal constructor(
          * Connection config
          */
         private var connectionConfig: ConnectionConfig? = null
+        private var initializationConnectionConfig: ConnectionConfig? = null
 
         /**
          * Sets the sandbox image for the sandbox.
@@ -1287,6 +1393,20 @@ class Sandbox internal constructor(
             return this
         }
 
+        /** Sets lifecycle hooks applied when this sandbox starts. */
+        fun lifecycle(lifecycle: SandboxLifecycle): Builder {
+            this.lifecycle = lifecycle
+            return this
+        }
+
+        /** Configures lifecycle hooks applied when this sandbox starts. */
+        fun lifecycle(configure: SandboxLifecycle.Builder.() -> Unit): Builder {
+            val builder = SandboxLifecycle.builder()
+            builder.configure()
+            this.lifecycle = builder.build()
+            return this
+        }
+
         /**
          * Adds a single volume mount.
          *
@@ -1443,19 +1563,26 @@ class Sandbox internal constructor(
         }
 
         /**
-         * Creates and starts the sandbox with the configured parameters.
+         * Uses a separate transport only for the lifecycle create request.
          *
-         * This method performs the following steps:
-         * 1. Validates all required configuration
-         * 2. Delegates to Sandbox.create() to create the sandbox
-         * 3. Returns a fully initialized Sandbox instance
+         * The returned [Sandbox] retains [connectionConfig] configured through
+         * [connectionConfig]. This is primarily intended for pooled custom creators that use
+         * [com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreateContext.createConnectionConfig]
+         * to disable create retries without changing subsequent sandbox operations.
+         */
+        fun initializationConnectionConfig(connectionConfig: ConnectionConfig): Builder {
+            this.initializationConnectionConfig = connectionConfig
+            return this
+        }
+
+        /**
+         * Creates and starts the sandbox with the configured parameters.
          *
          * @return Fully configured and ready Sandbox instance
          * @throws InvalidArgumentException if required configuration is missing or invalid
          * @throws SandboxException if sandbox creation or initialization fails
          */
         fun build(): Sandbox {
-            // Validate required configuration
             val spec =
                 imageSpec
             if ((spec == null) == (snapshotId == null)) {
@@ -1482,11 +1609,13 @@ class Sandbox internal constructor(
                 secureAccess = secureAccess,
                 extensions = extensions,
                 connectionConfig = connectionConfig ?: ConnectionConfig.builder().build(),
+                initializationConnectionConfig = initializationConnectionConfig,
                 healthCheckPollingInterval = healthCheckPollingInterval,
                 healthCheck = healthCheck,
                 skipHealthCheck = skipHealthCheck,
                 volumes = if (volumes.isEmpty()) null else volumes.toList(),
                 resourceRequests = resourceRequests,
+                lifecycle = lifecycle,
             )
         }
     }
@@ -1580,7 +1709,8 @@ class Sandbox internal constructor(
         }
 
         /**
-         * Sets the max time to wait for readiness after the resume operation.
+         * Total budget for endpoint publication and health checks after resuming.
+         * See [Sandbox.checkReady] for custom health-check timeout limits.
          */
         fun resumeTimeout(timeout: Duration): Resumer {
             this.resumeTimeout = timeout
@@ -1596,7 +1726,7 @@ class Sandbox internal constructor(
         }
 
         /**
-         * Skip readiness/health check during [resume]. The returned sandbox may not be ready yet.
+         * Skip health checks; required endpoints are still resolved.
          */
         fun skipHealthCheck(skip: Boolean = true): Resumer {
             this.skipHealthCheck = skip
@@ -1606,10 +1736,7 @@ class Sandbox internal constructor(
         /**
          * Resumes the sandbox with the configured parameters.
          *
-         * This method validates required configuration, performs the server-side resume,
-         * rebuilds service adapters, and waits for readiness.
-         *
-         * @return Resumed and ready Sandbox instance
+         * @return Resumed Sandbox instance
          * @throws InvalidArgumentException if sandboxId is missing
          * @throws SandboxException if resume or readiness check fails
          */
@@ -1624,6 +1751,300 @@ class Sandbox internal constructor(
                 connectionConfig = connectionConfig ?: ConnectionConfig.builder().build(),
                 healthCheck = healthCheck,
                 resumeTimeout = resumeTimeout,
+                healthCheckPollingInterval = healthCheckPollingInterval,
+                skipHealthCheck = skipHealthCheck,
+            )
+        }
+    }
+
+    /**
+     * Fluent launcher for creating sandbox instances from fsb golden-image templates.
+     *
+     * Template mode fixes the workload shape on the server: only metadata,
+     * network policy and extensions may accompany the template id. Workload-shaping
+     * options (image, entrypoint, env, resources, volumes, platform, lifecycle,
+     * credential proxy) are not available, and the sandbox [timeout] is required.
+     *
+     * ## Basic Usage
+     *
+     * ```kotlin
+     * val sandbox = Sandbox.fromTemplate()
+     *     .templateId("tpl_123")
+     *     .timeout(Duration.ofMinutes(30))
+     *     .create()
+     * ```
+     */
+    class TemplateLauncher internal constructor() {
+        /**
+         * Template ID to create the sandbox from
+         */
+        private var templateId: String? = null
+
+        /**
+         * Metadata
+         */
+        private val metadata = mutableMapOf<String, String>()
+
+        /**
+         * Optional outbound network policy (egress).
+         */
+        private var networkPolicy: NetworkPolicy? = null
+        private var idlePolicy: IdlePolicy? = null
+
+        /**
+         * Optional extension parameters for server-side custom behaviors.
+         */
+        private val extensions = mutableMapOf<String, String>()
+
+        /**
+         * Sandbox timeout (automatic termination time). Required.
+         */
+        private var timeout: Duration? = null
+
+        /**
+         * Max time to wait for the sandbox to become ready after creation
+         */
+        private var readyTimeout: Duration = Duration.ofSeconds(30)
+
+        /**
+         * Polling interval for readiness/health check
+         */
+        private var healthCheckPollingInterval: Duration = Duration.ofMillis(200)
+
+        /**
+         * Health check logic
+         */
+        private var healthCheck: ((Sandbox) -> Boolean)? = null
+
+        /**
+         * When true, do NOT wait for sandbox readiness/health during [create].
+         *
+         * Default is false (wait until ready).
+         */
+        private var skipHealthCheck: Boolean = false
+
+        /**
+         * Connection config
+         */
+        private var connectionConfig: ConnectionConfig? = null
+
+        /**
+         * Sets the fsb golden-image template to create the sandbox from.
+         *
+         * @param templateId Unique identifier of a `Succeeded` template owned by the requester
+         * @return This launcher for method chaining
+         * @throws InvalidArgumentException if templateId is blank
+         */
+        fun templateId(templateId: String): TemplateLauncher {
+            if (templateId.isBlank()) {
+                throw InvalidArgumentException(
+                    message = "Template ID cannot be blank",
+                )
+            }
+            this.templateId = templateId
+            return this
+        }
+
+        /**
+         * Adds a single metadata entry.
+         *
+         * @param key Metadata key
+         * @param value Metadata value
+         * @return This launcher for method chaining
+         */
+        fun metadata(
+            key: String,
+            value: String,
+        ): TemplateLauncher {
+            if (key.isBlank()) {
+                throw InvalidArgumentException(
+                    message = "Metadata key cannot be blank",
+                )
+            }
+            metadata[key] = value
+            return this
+        }
+
+        /**
+         * Adds multiple metadata entries.
+         */
+        fun metadata(metadata: Map<String, String>): TemplateLauncher {
+            this.metadata.putAll(metadata)
+            return this
+        }
+
+        /**
+         * Configures metadata using a fluent configuration block.
+         */
+        fun metadata(configure: MutableMap<String, String>.() -> Unit): TemplateLauncher {
+            metadata.configure()
+            return this
+        }
+
+        /**
+         * Sets a sandbox outbound network policy (egress).
+         */
+        fun networkPolicy(networkPolicy: NetworkPolicy): TemplateLauncher {
+            this.networkPolicy = networkPolicy
+            return this
+        }
+
+        /**
+         * Sets the OSEP-0024 idle policy (fast-sandbox only). Control-plane
+         * state, not workload shape, so template mode accepts it.
+         */
+        fun idlePolicy(idlePolicy: IdlePolicy): TemplateLauncher {
+            this.idlePolicy = idlePolicy
+            return this
+        }
+
+        /**
+         * Configures the OSEP-0024 idle policy using a fluent configuration block.
+         */
+        fun idlePolicy(configure: IdlePolicy.Builder.() -> Unit): TemplateLauncher {
+            val builder = IdlePolicy.builder()
+            builder.configure()
+            this.idlePolicy = builder.build()
+            return this
+        }
+
+        /**
+         * Configures a sandbox outbound network policy (egress).
+         */
+        fun networkPolicy(configure: NetworkPolicy.Builder.() -> Unit): TemplateLauncher {
+            val builder = NetworkPolicy.builder()
+            builder.configure()
+            this.networkPolicy = builder.build()
+            return this
+        }
+
+        /**
+         * Adds a single extension parameter.
+         *
+         * Extensions are opaque client-side and are passed through to the server.
+         * Prefer stable, namespaced keys (e.g. `storage.id`).
+         *
+         * @throws InvalidArgumentException if [key] is blank
+         */
+        fun extension(
+            key: String,
+            value: String,
+        ): TemplateLauncher {
+            if (key.isBlank()) {
+                throw InvalidArgumentException(
+                    message = "Extension key cannot be blank",
+                )
+            }
+            extensions[key] = value
+            return this
+        }
+
+        /**
+         * Adds multiple extension parameters.
+         */
+        fun extensions(extensions: Map<String, String>): TemplateLauncher {
+            this.extensions.putAll(extensions)
+            return this
+        }
+
+        /**
+         * Configures extension parameters using a fluent configuration block.
+         */
+        fun extensions(configure: MutableMap<String, String>.() -> Unit): TemplateLauncher {
+            extensions.configure()
+            return this
+        }
+
+        /**
+         * Sets the sandbox timeout (automatic termination time). Required in
+         * template mode.
+         *
+         * @param timeout Maximum sandbox lifetime
+         * @return This launcher for method chaining
+         * @throws InvalidArgumentException if timeout is negative or zero
+         */
+        fun timeout(timeout: Duration): TemplateLauncher {
+            if (timeout.isNegative || timeout.isZero) {
+                throw InvalidArgumentException(
+                    message = "Timeout must be positive, got: $timeout",
+                )
+            }
+            this.timeout = timeout
+            return this
+        }
+
+        /**
+         * Sets the timeout for waiting for sandbox readiness.
+         */
+        fun readyTimeout(readyTimeout: Duration): TemplateLauncher {
+            if (readyTimeout.isNegative || readyTimeout.isZero) {
+                throw InvalidArgumentException(
+                    message = "Ready timeout must be positive, got: $readyTimeout",
+                )
+            }
+            this.readyTimeout = readyTimeout
+            return this
+        }
+
+        /**
+         * Sets the interval between readiness polling attempts.
+         */
+        fun healthCheckPollingInterval(pollingInterval: Duration): TemplateLauncher {
+            if (pollingInterval.isNegative || pollingInterval.isZero) {
+                throw InvalidArgumentException(
+                    message = "Ready polling interval must be positive, got: $pollingInterval",
+                )
+            }
+            this.healthCheckPollingInterval = pollingInterval
+            return this
+        }
+
+        fun healthCheck(healthCheck: (Sandbox) -> Boolean): TemplateLauncher {
+            this.healthCheck = healthCheck
+            return this
+        }
+
+        /**
+         * Skip readiness/health check during [create]. The returned sandbox may not be ready yet.
+         */
+        fun skipHealthCheck(skip: Boolean = true): TemplateLauncher {
+            this.skipHealthCheck = skip
+            return this
+        }
+
+        fun connectionConfig(connectionConfig: ConnectionConfig): TemplateLauncher {
+            this.connectionConfig = connectionConfig
+            return this
+        }
+
+        /**
+         * Creates and starts the sandbox from the configured template.
+         *
+         * @return Fully configured and ready Sandbox instance with [Sandbox.origin]
+         * set to [SandboxOrigin.TEMPLATE]
+         * @throws InvalidArgumentException if required configuration is missing or invalid
+         * @throws SandboxException if sandbox creation or initialization fails
+         */
+        fun create(): Sandbox {
+            val id =
+                templateId ?: throw InvalidArgumentException(
+                    message = "Template ID must be specified",
+                )
+            val sandboxTimeout =
+                timeout ?: throw InvalidArgumentException(
+                    message = "Timeout must be specified: template mode requires an explicit sandbox lifetime",
+                )
+
+            return createFromTemplate(
+                templateId = id,
+                timeout = sandboxTimeout,
+                readyTimeout = readyTimeout,
+                metadata = metadata,
+                networkPolicy = networkPolicy,
+                extensions = extensions,
+                idlePolicy = idlePolicy,
+                connectionConfig = connectionConfig ?: ConnectionConfig.builder().build(),
+                healthCheck = healthCheck,
                 healthCheckPollingInterval = healthCheckPollingInterval,
                 skipHealthCheck = skipHealthCheck,
             )

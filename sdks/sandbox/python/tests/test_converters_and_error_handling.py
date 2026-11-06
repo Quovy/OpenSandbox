@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,12 @@ from datetime import datetime, timedelta
 
 import pytest
 from httpx import HTTPStatusError, Request, Response
+from pydantic import ValidationError
 
+from opensandbox.adapters.converter.command_execution import (
+    build_run_in_session_request_body,
+    resolve_run_in_session_timeout,
+)
 from opensandbox.adapters.converter.exception_converter import (
     ExceptionConverter,
     parse_sandbox_error,
@@ -50,10 +55,13 @@ from opensandbox.exceptions import (
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import (
     CredentialProxyConfig,
+    LifecycleHook,
     NetworkPolicy,
     NetworkRule,
+    PeriodicLifecycleHook,
     PlatformSpec,
     SandboxImageSpec,
+    SandboxLifecycle,
 )
 
 
@@ -507,6 +515,100 @@ def test_execution_converter_to_api_run_command_request() -> None:
     assert "cwd" not in d4
 
 
+    argv = ["tool", "", "a b", "$HOME", "x'y", "中文"]
+    native = ExecutionConverter.to_api_run_command_request(
+        argv, RunCommandOpts(background=True, working_directory="$DIR", envs={"DIR": "/tmp"})
+    ).to_dict()
+    assert native == {"argv": argv, "background": True, "cwd": "$DIR", "envs": {"DIR": "/tmp"}}
+    for invalid in ([], [""], ["tool", "\0"], ["tool", None], ("tool", "arg"), None, 123):
+        with pytest.raises(InvalidArgumentException):
+            ExecutionConverter.to_api_run_command_request(invalid, RunCommandOpts())
+
+    # Shell-sensitive values (a literal "$HOME", an embedded space, a single
+    # quote, a trailing empty string) travel in `argv` untouched.
+    literal_argv = ["python3", "-c", "import sys; print(sys.argv[1:])", "a b", "$HOME", "x'y", ""]
+    literal_request = ExecutionConverter.to_api_run_command_request(
+        literal_argv, RunCommandOpts()
+    ).to_dict()
+    assert literal_request == {"argv": literal_argv}
+
+
+@pytest.mark.parametrize(
+    ("microseconds", "expected"),
+    [
+        (None, None),
+        (0, 0),
+        (1, 1),
+        (500, 1),
+        (900, 1),
+        (999, 1),
+        (1000, 1),
+        (1001, 2),
+        (1200, 2),
+        (1_001_000, 1001),
+        (2_007_000, 2007),
+        (60_000_000, 60_000),
+    ],
+)
+def test_execution_converter_rounds_timeout_up_to_milliseconds(
+    microseconds: int | None, expected: int | None
+) -> None:
+    timeout = timedelta(microseconds=microseconds) if microseconds is not None else None
+    request = ExecutionConverter.to_api_run_command_request(
+        "sleep 10", RunCommandOpts(timeout=timeout)
+    ).to_dict()
+
+    if expected is None:
+        assert "timeout" not in request
+    else:
+        assert request["timeout"] == expected
+
+
+@pytest.mark.parametrize(
+    ("microseconds", "expected"),
+    [
+        (None, None),
+        (0, 0),
+        (1, 1),
+        (500, 1),
+        (900, 1),
+        (999, 1),
+        (1000, 1),
+        (1001, 2),
+        (1200, 2),
+        (1_001_000, 1001),
+        (2_007_000, 2007),
+        (60_000_000, 60_000),
+    ],
+)
+def test_run_in_session_converter_rounds_timeout_up_to_milliseconds(
+    microseconds: int | None, expected: int | None
+) -> None:
+    timeout = timedelta(microseconds=microseconds) if microseconds is not None else None
+    timeout_ms = resolve_run_in_session_timeout(timeout)
+    assert timeout_ms == expected
+    request = build_run_in_session_request_body("sleep 10", None, timeout_ms).to_dict()
+
+    if expected is None:
+        assert "timeout" not in request
+    else:
+        assert request["timeout"] == expected
+
+
+@pytest.mark.parametrize("microseconds", [-1, -999, -1000])
+def test_execution_converter_rejects_negative_timeout(microseconds: int) -> None:
+    with pytest.raises(InvalidArgumentException, match="^timeout must be positive"):
+        ExecutionConverter.to_api_run_command_request(
+            "sleep 10", RunCommandOpts(timeout=timedelta(microseconds=microseconds))
+        )
+
+
+@pytest.mark.parametrize("microseconds", [-1, -999, -1000])
+def test_run_in_session_converter_rejects_negative_timeout(microseconds: int) -> None:
+    with pytest.raises(InvalidArgumentException, match="^timeout must not be negative"):
+        resolve_run_in_session_timeout(timedelta(microseconds=microseconds))
+
+
 def test_run_command_opts_validates_gid_requires_uid() -> None:
     with pytest.raises(ValueError, match="uid is required when gid is provided"):
         RunCommandOpts(gid=1000)
@@ -559,6 +661,19 @@ def test_sandbox_model_converter_to_api_create_request_and_renew_tz() -> None:
         extensions={},
         volumes=None,
         credential_proxy=CredentialProxyConfig(enabled=True),
+        lifecycle=SandboxLifecycle(
+            preStart=LifecycleHook(
+                command=["/opt/hooks/restore.sh"],
+                timeoutSeconds=30,
+            ),
+            periodic=[
+                PeriodicLifecycleHook(
+                    name="checkpoint",
+                    schedule="@hourly",
+                    command=["/opt/hooks/checkpoint.sh"],
+                )
+            ],
+        ),
     )
     d = req.to_dict()
     assert d["image"]["uri"] == "python:3.11"
@@ -569,9 +684,138 @@ def test_sandbox_model_converter_to_api_create_request_and_renew_tz() -> None:
     assert d["networkPolicy"]["defaultAction"] == "deny"
     assert d["networkPolicy"]["egress"] == [{"action": "allow", "target": "pypi.org"}]
     assert d["credentialProxy"] == {"enabled": True}
+    assert d["lifecycle"] == {
+        "preStart": {
+            "command": ["/opt/hooks/restore.sh"],
+            "timeoutSeconds": 30,
+        },
+        "periodic": [
+            {
+                "name": "checkpoint",
+                "schedule": "@hourly",
+                "command": ["/opt/hooks/checkpoint.sh"],
+            }
+        ],
+    }
 
     renew = SandboxModelConverter.to_api_renew_request(datetime(2025, 1, 1))
     assert renew.expires_at.tzinfo is timezone.utc
+
+
+def test_sandbox_model_converter_serializes_port_scoped_rules() -> None:
+    """A domain-only rule, an IP+ports rule, and a target-less port-only rule
+    must all round-trip to the wire shape the egress sidecar expects: the
+    port-only rule's `target` key must be entirely absent (not null), since
+    the generated client uses its own UNSET sentinel to mean "omit this key".
+    """
+    req = SandboxModelConverter.to_api_create_sandbox_request(
+        spec=SandboxImageSpec("python:3.11"),
+        entrypoint=["/bin/sh"],
+        env={},
+        metadata={},
+        timeout=None,
+        resource={},
+        platform=None,
+        network_policy=NetworkPolicy(
+            defaultAction="deny",
+            egress=[
+                NetworkRule(action="allow", target="pypi.org"),
+                NetworkRule(action="allow", target="10.0.0.5", ports=[22, 80]),
+                NetworkRule(action="deny", ports=[25]),
+            ],
+        ),
+        extensions={},
+        volumes=None,
+    )
+    d = req.to_dict()
+    assert d["networkPolicy"]["egress"] == [
+        {"action": "allow", "target": "pypi.org"},
+        {"action": "allow", "target": "10.0.0.5", "ports": [22, 80]},
+        {"action": "deny", "ports": [25]},
+    ]
+
+    # Round-trip back through the reverse converter (as done for GET /policy
+    # responses) must reconstruct the same domain rules, target=None for the
+    # port-only rule instead of the generated client's UNSET sentinel.
+    from opensandbox.api.lifecycle.models.network_policy import (
+        NetworkPolicy as ApiNetworkPolicy,
+    )
+
+    api_policy = ApiNetworkPolicy.from_dict(d["networkPolicy"])
+    roundtripped = SandboxModelConverter.to_sandbox_network_policy(api_policy)
+    assert roundtripped.egress[2].target is None
+    assert roundtripped.egress[2].ports == [25]
+
+
+def test_network_rule_requires_target_or_ports() -> None:
+    with pytest.raises(ValidationError):
+        NetworkRule(action="allow")
+
+
+def test_network_rule_read_back_tolerates_sidecar_blank_target() -> None:
+    """The sidecar marshals target without omitempty, so a port-only rule
+    reads back as {"target": "", "ports": [25]}; the domain model must parse
+    it (blank => omitted) instead of raising a blank-target error."""
+    rule = NetworkRule.model_validate({"action": "deny", "target": "", "ports": [25]})
+    assert rule.target is None
+    assert rule.ports == [25]
+
+
+def test_network_rule_rejects_more_than_256_ports() -> None:
+    with pytest.raises(ValidationError):
+        NetworkRule(action="allow", ports=list(range(1, 258)))
+
+
+def test_network_rule_rejects_invalid_ports() -> None:
+    for bad_ports in ([0], [65536], [443, 443], []):
+        with pytest.raises(ValidationError):
+            NetworkRule(action="allow", target="10.0.0.5", ports=bad_ports)
+
+
+def test_network_rule_rejects_domain_target_with_ports() -> None:
+    """The sidecar rejects domain+ports (DNS-layer rules have no port
+    dimension); surfacing that as a local ValidationError beats a 4xx after
+    the sandbox create request is already in flight."""
+    for target in ("example.com", "*.example.com", "10.0.0.0/255.0.0.0"):
+        with pytest.raises(ValidationError):
+            NetworkRule(action="allow", target=target, ports=[443])
+
+
+def test_sandbox_model_converter_omits_empty_lifecycle() -> None:
+    req = SandboxModelConverter.to_api_create_sandbox_request(
+        spec=SandboxImageSpec("python:3.11"),
+        entrypoint=["python"],
+        env={},
+        metadata={},
+        timeout=None,
+        resource={},
+        platform=None,
+        network_policy=None,
+        extensions={},
+        volumes=None,
+        lifecycle=SandboxLifecycle(),
+    )
+
+    assert "lifecycle" not in req.to_dict()
+
+    req = SandboxModelConverter.to_api_create_sandbox_request(
+        spec=SandboxImageSpec("python:3.11"),
+        entrypoint=["python"],
+        env={},
+        metadata={},
+        timeout=None,
+        resource={},
+        platform=None,
+        network_policy=None,
+        extensions={},
+        volumes=None,
+        lifecycle=SandboxLifecycle(
+            preStart=LifecycleHook(command=["true"]),
+            periodic=[],
+        ),
+    )
+
+    assert req.to_dict()["lifecycle"] == {"preStart": {"command": ["true"]}}
 
 
 def test_platform_spec_accepts_windows() -> None:
@@ -618,6 +862,66 @@ def test_sandbox_model_converter_snapshot_restore_request() -> None:
     assert "image" not in dumped
     assert "entrypoint" not in dumped
 
+def test_sandbox_model_converter_to_api_volume_skips_unset_fields() -> None:
+    from opensandbox.api.lifecycle.types import UNSET
+    from opensandbox.models.sandboxes import Volume
+
+    # Inject UNSET into backend fields (bypassing Pydantic validation) to
+    # simulate a domain Volume carrying Unset values from an API round-trip.
+    volume = Volume.model_construct(
+        name="workdir",
+        mount_path="/mnt/work",
+        read_only=False,
+        host=UNSET,
+        pvc=UNSET,
+        ossfs=UNSET,
+        sub_path=UNSET,
+    )
+
+    api_volume = SandboxModelConverter.to_api_volume(volume)
+    dumped = api_volume.to_dict()
+    assert dumped == {"name": "workdir", "mountPath": "/mnt/work", "readOnly": False}
+    assert "host" not in dumped
+    assert "pvc" not in dumped
+    assert "ossfs" not in dumped
+    assert "subPath" not in dumped
+
+def test_sandbox_model_converter_to_api_volume_maps_backends() -> None:
+    from opensandbox.models.sandboxes import OSSFS, PVC, Host, Volume
+
+    volume = Volume(
+        name="workdir",
+        host=Host(path="/data/opensandbox"),
+        mount_path="/mnt/work",
+        sub_path="sub",
+    )
+    dumped = SandboxModelConverter.to_api_volume(volume).to_dict()
+    assert dumped["host"] == {"path": "/data/opensandbox"}
+    assert dumped["subPath"] == "sub"
+    assert "pvc" not in dumped
+    assert "ossfs" not in dumped
+
+    pvc_volume = Volume(
+        name="models",
+        pvc=PVC(claim_name="shared-models-pvc"),
+        mount_path="/mnt/models",
+        read_only=True,
+    )
+    pvc_dumped = SandboxModelConverter.to_api_volume(pvc_volume).to_dict()
+    assert pvc_dumped["pvc"]["claimName"] == "shared-models-pvc"
+    assert pvc_dumped["readOnly"] is True
+
+    ossfs_volume = Volume(
+        name="oss", ossfs=OSSFS(
+            bucket="b",
+            endpoint="oss-cn-hangzhou.aliyuncs.com",
+            accessKeyId="ak",
+            accessKeySecret="sk",
+        ),
+        mount_path="/mnt/oss",
+    )
+    ossfs_dumped = SandboxModelConverter.to_api_volume(ossfs_volume).to_dict()
+    assert ossfs_dumped["ossfs"]["bucket"] == "b"
 
 def test_sandbox_model_converter_maps_platform_from_create_response() -> None:
     from opensandbox.api.lifecycle.models.create_sandbox_response import (
@@ -662,6 +966,80 @@ def test_sandbox_model_converter_preserves_missing_metadata_default() -> None:
     converted = SandboxModelConverter.to_sandbox_info(api_sandbox)
     assert converted.metadata == {}
     assert converted.extensions is None
+    assert converted.allocation is None
+
+
+def test_sandbox_model_converter_maps_allocation() -> None:
+    from opensandbox.api.lifecycle.models.allocation_summary import AllocationSummary
+    from opensandbox.api.lifecycle.models.allocation_summary_mode import (
+        AllocationSummaryMode,
+    )
+    from opensandbox.api.lifecycle.models.allocation_summary_state import (
+        AllocationSummaryState,
+    )
+    from opensandbox.api.lifecycle.models.sandbox import Sandbox
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    api_sandbox = Sandbox(
+        id="sbx-1",
+        status=SandboxStatus(state="Running"),
+        created_at=datetime(2025, 1, 1),
+        entrypoint=["/bin/sh"],
+        allocation=AllocationSummary(
+            mode=AllocationSummaryMode.POOL,
+            pool_ref="default/python",
+            state=AllocationSummaryState.ALLOCATED,
+        ),
+    )
+
+    converted = SandboxModelConverter.to_sandbox_info(api_sandbox)
+    assert converted.allocation is not None
+    assert converted.allocation.mode == "pool"
+    assert converted.allocation.pool_ref == "default/python"
+    assert converted.allocation.state == "allocated"
+
+
+def test_sandbox_model_converter_maps_allocation_for_list_results() -> None:
+    from opensandbox.api.lifecycle.models.allocation_summary import AllocationSummary
+    from opensandbox.api.lifecycle.models.allocation_summary_mode import (
+        AllocationSummaryMode,
+    )
+    from opensandbox.api.lifecycle.models.allocation_summary_state import (
+        AllocationSummaryState,
+    )
+    from opensandbox.api.lifecycle.models.list_sandboxes_response import (
+        ListSandboxesResponse,
+    )
+    from opensandbox.api.lifecycle.models.pagination_info import PaginationInfo
+    from opensandbox.api.lifecycle.models.sandbox import Sandbox
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    api_response = ListSandboxesResponse(
+        items=[
+            Sandbox(
+                id="sbx-1",
+                status=SandboxStatus(state="Running"),
+                created_at=datetime(2025, 1, 1),
+                entrypoint=["/bin/sh"],
+                allocation=AllocationSummary(
+                    mode=AllocationSummaryMode.POOL,
+                    pool_ref="default/python",
+                    state=AllocationSummaryState.ALLOCATED,
+                ),
+            )
+        ],
+        pagination=PaginationInfo(
+            page=1,
+            page_size=10,
+            total_items=1,
+            total_pages=1,
+            has_next_page=False,
+        ),
+    )
+
+    converted = SandboxModelConverter.to_paged_sandbox_infos(api_response)
+    assert converted.sandbox_infos[0].allocation is not None
+    assert converted.sandbox_infos[0].allocation.pool_ref == "default/python"
 
 
 def test_sandbox_model_converter_supports_windows_platform_request() -> None:
@@ -679,3 +1057,22 @@ def test_sandbox_model_converter_supports_windows_platform_request() -> None:
     )
     dumped = req.to_dict()
     assert dumped["platform"] == {"os": "windows", "arch": "amd64"}
+
+
+def test_network_rule_trims_target_before_classification() -> None:
+    """The sidecar trims before classifying; " 10.0.0.5" with ports must be
+    an IP locally too, not a misleading domain+ports rejection."""
+    rule = NetworkRule(action="allow", target="  10.0.0.5  ", ports=[22])
+    assert rule.target == "10.0.0.5"
+    with pytest.raises(ValidationError):
+        NetworkRule(action="allow", target="  example.com  ", ports=[443])
+
+
+def test_network_rule_scoped_ipv6_prefix_with_ports_rejected() -> None:
+    """netip.ParsePrefix rejects scoped prefixes while Python's ipaddress
+    accepts them; the SDK must mirror the sidecar or a valid-looking rule
+    dies remotely as a domain+ports 400."""
+    with pytest.raises(ValidationError):
+        NetworkRule(action="allow", target="fe80::1%eth0/64", ports=[22])
+    rule = NetworkRule(action="allow", target="fe80::1%eth0", ports=[22])
+    assert rule.target == "fe80::1%eth0"

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,6 +46,20 @@ func BuildMitmproxyPortList(raw string) (string, error) {
 		parts = append(parts, strconv.Itoa(p))
 	}
 	return strings.Join(parts, ","), nil
+}
+
+// BuildMitmproxyPorts returns the validated, de-duplicated intercept port
+// list (80, 443 plus extras) as integers — the nftables rule shape used by
+// the fast-sandbox profile. Same validation as BuildMitmproxyPortList (shared
+// parseExtraPorts), so both profiles agree on what is intercepted.
+func BuildMitmproxyPorts(raw string) ([]int, error) {
+	extras, err := parseExtraPorts(raw)
+	if err != nil {
+		return nil, err
+	}
+	ports := []int{80, 443}
+	ports = append(ports, extras...)
+	return ports, nil
 }
 
 func parseExtraPorts(raw string) ([]int, error) {

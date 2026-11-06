@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,20 +22,20 @@ import (
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 )
 
-// DeleteRecycler is a RecycleHandler that marks pods for deletion.
+// deleteRecycler is a RecycleHandler that marks pods for deletion.
 // The actual deletion is handled by the pool controller's scale logic.
-type DeleteRecycler struct{}
+type deleteRecycler struct{}
 
-// NewDeleteRecycler creates a new DeleteRecycler.
-func NewDeleteRecycler() *DeleteRecycler {
-	return &DeleteRecycler{}
+// newDeleteRecycler creates a new deleteRecycler.
+func newDeleteRecycler() *deleteRecycler {
+	return &deleteRecycler{}
 }
 
 // TryRecycle drives the delete recycle state machine.
-// When the pod still exists, it returns Recycling with NeedDelete=true so the caller deletes the pod.
-// When the pod is gone (DeletionTimestamp set), it returns Succeeded.
-func (d *DeleteRecycler) TryRecycle(ctx context.Context, pool *sandboxv1alpha1.Pool, pod *corev1.Pod, spec *Spec) (*Status, error) {
-	if pod == nil || pod.DeletionTimestamp != nil {
+// An existing pod remains Recycling; NeedDelete is false once termination starts.
+// A nil pod means the caller confirmed its absence and recycling has succeeded.
+func (d *deleteRecycler) TryRecycle(ctx context.Context, pool *sandboxv1alpha1.Pool, pod *corev1.Pod, spec *Spec) (*Status, error) {
+	if pod == nil {
 		return &Status{
 			State:   StateSucceeded,
 			Message: "delete recycler: pod is deleted",
@@ -43,7 +43,7 @@ func (d *DeleteRecycler) TryRecycle(ctx context.Context, pool *sandboxv1alpha1.P
 	}
 	return &Status{
 		State:      StateRecycling,
-		Message:    "delete recycler: pod marked for deletion",
-		NeedDelete: true,
+		Message:    "delete recycler: waiting for pod deletion",
+		NeedDelete: pod.DeletionTimestamp == nil,
 	}, nil
 }

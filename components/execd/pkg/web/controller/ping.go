@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package controller
 
 import "github.com/gin-gonic/gin"
 
-// MainController handles basic server operations.
 type MainController struct {
 	*basicController
 }
@@ -25,12 +24,10 @@ func NewMainController(ctx *gin.Context) *MainController {
 	return &MainController{basicController: newBasicController(ctx)}
 }
 
-// Ping checks if the server is alive.
 func (c *MainController) Ping() {
 	c.RespondSuccess(nil)
 }
 
-// PingHandler is the Gin adapter.
 func PingHandler(ctx *gin.Context) {
 	NewMainController(ctx).Ping()
 }

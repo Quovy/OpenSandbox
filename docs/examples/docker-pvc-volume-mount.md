@@ -8,7 +8,7 @@ description: Mount Docker named volumes into sandbox containers using the OpenSa
 This example demonstrates how to mount Docker named volumes into sandbox containers using the OpenSandbox `pvc` backend. In Docker runtime, `pvc.claimName` maps to a Docker named volume -- providing a more convenient and secure alternative to host-path bind mounts for sharing data across sandboxes.
 
 ::: info What is `pvc`?
-The `pvc` backend is a runtime-neutral abstraction. In Kubernetes it maps to a PersistentVolumeClaim; in Docker it maps to a named volume. The same API request works on both runtimes. See [OSEP-0003](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0003-volume-and-volumebinding-support.md) for the design.
+The `pvc` backend is a runtime-neutral abstraction. In Kubernetes it maps to a PersistentVolumeClaim; in Docker it maps to a named volume. The same API request works on both runtimes.
 :::
 
 ## Why Named Volumes over Host Paths?
@@ -60,7 +60,7 @@ uv pip install opensandbox
 ### 4. Pull the Sandbox Image
 
 ```shell
-docker pull ubuntu:24.04
+docker pull ubuntu:latest
 ```
 
 ## Run
@@ -72,14 +72,14 @@ uv run python examples/docker-pvc-volume-mount/main.py
 The script automatically creates the named volume and seeds it with test data. You can also specify a custom volume name or image:
 
 ```shell
-SANDBOX_IMAGE=ubuntu:24.04 SANDBOX_DOMAIN=localhost:8080 uv run python examples/docker-pvc-volume-mount/main.py
+SANDBOX_IMAGE=ubuntu SANDBOX_DOMAIN=localhost:8080 uv run python examples/docker-pvc-volume-mount/main.py
 ```
 
 ## Expected Output
 
 ```text
 OpenSandbox server : localhost:8080
-Sandbox image      : ubuntu:24.04
+Sandbox image      : ubuntu
 Docker volume      : opensandbox-pvc-demo
   Ensuring Docker named volume 'opensandbox-pvc-demo' exists...
   Created volume 'opensandbox-pvc-demo' with marker.txt
@@ -118,7 +118,7 @@ from opensandbox import Sandbox
 from opensandbox.models.sandboxes import PVC, Volume
 
 sandbox = await Sandbox.create(
-    image="ubuntu:24.04",
+    image="ubuntu",
     volumes=[
         Volume(
             name="my-data",
@@ -138,7 +138,7 @@ from opensandbox import SandboxSync
 from opensandbox.models.sandboxes import PVC, Volume
 
 sandbox = SandboxSync.create(
-    image="ubuntu:24.04",
+    image="ubuntu",
     volumes=[
         Volume(
             name="my-data",
@@ -156,7 +156,7 @@ sandbox = SandboxSync.create(
 import { Sandbox } from "@alibaba-group/opensandbox";
 
 const sandbox = await Sandbox.create({
-  image: "ubuntu:24.04",
+  image: "ubuntu",
   volumes: [
     {
       name: "my-data",
@@ -181,7 +181,7 @@ Volume volume = Volume.builder()
     .build();
 
 Sandbox sandbox = Sandbox.builder()
-    .image("ubuntu:24.04")
+    .image("ubuntu")
     .volume(volume)
     .build();
 ```
@@ -194,7 +194,6 @@ docker volume rm opensandbox-pvc-demo
 
 ## References
 
-- [OSEP-0003: Volume and VolumeBinding Support](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0003-volume-and-volumebinding-support.md) -- Design proposal
 - [Sandbox Lifecycle API Spec](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/sandbox-lifecycle.yml) -- OpenAPI schema for volume definitions
 - [Host Volume Mount Example](/examples/host-volume-mount) -- Host path bind mount example (alternative approach)
 - [Source code on GitHub](https://github.com/opensandbox-group/OpenSandbox/tree/main/examples/docker-pvc-volume-mount)

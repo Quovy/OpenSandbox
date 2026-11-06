@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -70,4 +70,20 @@ func TestInitFlagsCliOverridesEnvAccessToken(t *testing.T) {
 	InitFlags()
 
 	require.Equal(t, "cli-token", ServerAccessToken)
+}
+
+func TestInitFlagsDefaultsGracefulShutdownTimeout(t *testing.T) {
+	previousArgs := os.Args
+	previousCommandLine := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	os.Args = []string{previousArgs[0]}
+	t.Cleanup(func() {
+		os.Args = previousArgs
+		flag.CommandLine = previousCommandLine
+	})
+	t.Setenv(gracefulShutdownTimeoutEnv, "")
+
+	InitFlags()
+
+	require.Equal(t, 200*time.Millisecond, ApiGracefulShutdownTimeout)
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ func TestNoopRecycler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			n := NewNoopRecycler()
+			n := newNoopRecycler()
 			status, err := n.TryRecycle(context.Background(), &sandboxv1alpha1.Pool{}, tt.pod, &Spec{ID: "sbx1"})
 			assert.NoError(t, err)
 			assert.Equal(t, StateSucceeded, status.State)

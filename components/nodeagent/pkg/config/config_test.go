@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 )
 
 func TestLoadFileConfig(t *testing.T) {
@@ -33,6 +35,82 @@ func TestLoadFileConfig(t *testing.T) {
 	}
 	if cfg.NodeName != "node-1" || cfg.ClusterID != "prod-a" || cfg.Sink != SinkFile {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	if got, want := strings.Join(cfg.Sources, ","), "container-logs"; got != want {
+		t.Fatalf("Sources = %q, want %q", got, want)
+	}
+}
+
+func TestLoadParsesMultipleSources(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("NODEAGENT_CLUSTER_ID", "prod-a")
+	t.Setenv("NODEAGENT_SOURCES", " container-logs , syscalls ")
+	t.Setenv("NODEAGENT_LOG_ROOT", t.TempDir())
+	t.Setenv("NODEAGENT_STATE_DIR", t.TempDir())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := strings.Join(cfg.Sources, ","), "container-logs,syscalls"; got != want {
+		t.Fatalf("Sources = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsEmptyOrDuplicateSources(t *testing.T) {
+	for _, value := range []string{"container-logs,,syscalls", ",container-logs", "container-logs,container-logs"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("NODE_NAME", "node-1")
+			t.Setenv("NODEAGENT_CLUSTER_ID", "prod-a")
+			t.Setenv("NODEAGENT_SOURCES", value)
+			t.Setenv("NODEAGENT_LOG_ROOT", t.TempDir())
+			t.Setenv("NODEAGENT_STATE_DIR", t.TempDir())
+
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NODEAGENT_SOURCES") {
+				t.Fatalf("Load() error = %v, want NODEAGENT_SOURCES error", err)
+			}
+		})
+	}
+}
+
+func TestLoadDoesNotValidateDisabledContainerLogSettings(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("NODEAGENT_CLUSTER_ID", "prod-a")
+	t.Setenv("NODEAGENT_SOURCES", "custom-source")
+	t.Setenv("NODEAGENT_LOG_ROOT", "relative")
+	t.Setenv("NODEAGENT_MAX_LINE_BYTES", "invalid")
+	t.Setenv("NODEAGENT_PARTIAL_TIMEOUT", "invalid")
+	t.Setenv("NODEAGENT_ENDED_STATE_RETENTION", "invalid")
+	t.Setenv("NODEAGENT_STATE_DIR", t.TempDir())
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() validated settings for a disabled Source: %v", err)
+	}
+}
+
+func TestLoadValidatesOnlyEnabledSyscallSettings(t *testing.T) {
+	t.Setenv("NODE_NAME", "node-1")
+	t.Setenv("NODEAGENT_CLUSTER_ID", "prod-a")
+	t.Setenv("NODEAGENT_SOURCES", "custom-source")
+	t.Setenv("NODEAGENT_STATE_DIR", t.TempDir())
+	t.Setenv("NODEAGENT_SYSCALL_CGROUP_ROOT", "relative")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() validated a disabled syscalls Source: %v", err)
+	}
+
+	t.Setenv("NODEAGENT_SOURCES", api.SourceNameSyscalls)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NODEAGENT_SYSCALL_CGROUP_ROOT") {
+		t.Fatalf("Load() error = %v, want syscall cgroup root error", err)
+	}
+}
+
+func TestValidateRejectsFileSinkInsideSyscallCgroupRoot(t *testing.T) {
+	cfg := validConfig()
+	cfg.Sources = []string{api.SourceNameSyscalls}
+	cfg.SyscallCgroupRoot = "/host/sys/fs/cgroup"
+	cfg.FilePath = "/host/sys/fs/cgroup/output"
+	if err := errorsContaining(cfg.validate(), "must not overlap active state or source paths"); err == "" {
+		t.Fatal("validate() accepted a file sink inside the cgroup source root")
 	}
 }
 
@@ -120,7 +198,7 @@ func TestLoadValidatesOSSEndpoint(t *testing.T) {
 
 func TestValidateAllowsCompiledExtensionNames(t *testing.T) {
 	cfg := validConfig()
-	cfg.Source = "custom-source"
+	cfg.Sources = []string{"custom-source"}
 	cfg.Sink = "custom-sink"
 	if errs := cfg.validate(); len(errs) != 0 {
 		t.Fatalf("validate() rejected extension selectors: %v", errs)
@@ -131,7 +209,7 @@ func validConfig() Config {
 	return Config{
 		NodeName:             "node-1",
 		ClusterID:            "prod-a",
-		Source:               "container-logs",
+		Sources:              []string{"container-logs"},
 		Sink:                 SinkFile,
 		LogRoot:              "/var/log/pods",
 		StateDir:             "/var/lib/opensandbox/nodeagent",

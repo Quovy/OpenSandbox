@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,11 +32,14 @@ import (
 var (
 	meter metric.Meter
 
-	dnsQueryDur     metric.Float64Histogram
-	dnsQueryFailed  metric.Int64Counter
-	policyDenied    metric.Int64Counter
-	nftUpdates      metric.Int64Counter
-	nftUpdateFailed metric.Int64Counter
+	dnsQueryDur             metric.Float64Histogram
+	dnsQueryFailed          metric.Int64Counter
+	dnsReplyFailed          metric.Int64Counter
+	policyDenied            metric.Int64Counter
+	nftUpdates              metric.Int64Counter
+	nftUpdateFailed         metric.Int64Counter
+	tlsShadowRequests       metric.Int64Counter
+	tlsAdmissionConnections metric.Int64Counter
 
 	lastNftRuleCount atomic.Int64
 )
@@ -50,11 +53,27 @@ const (
 	DNSFailureRcode         = "rcode"
 )
 
+// Bounded stage values for RecordDNSReplyFailed, mirroring the decision point
+// in serveDNS. A closed set keeps the counter's cardinality fixed: error
+// strings and queried names must never reach an attribute.
+const (
+	DNSReplyStageMalformed     = "malformed"
+	DNSReplyStageUnknownSource = "unknown_source"
+	DNSReplyStageDeny          = "deny"
+	DNSReplyStageUpstreamError = "upstream_error"
+	DNSReplyStageAnswer        = "answer"
+)
+
 // Bounded operation values for RecordNftablesUpdateFailed.
 const (
-	NftOpStaticApply = "static_apply"
-	NftOpDynamicAdd  = "dynamic_add"
-	NftOpRemove      = "remove"
+	NftOpStaticApply       = "static_apply"
+	NftOpDynamicAdd        = "dynamic_add"
+	NftOpRemove            = "remove"
+	NftOpUpstreamProxyAdd  = "upstream_proxy_add"
+	NftOpUpstreamProxySync = "upstream_proxy_sync"
+	// Fast Sandbox-profile operations (OSEP-0022).
+	NftOpReset     = "reset"
+	NftOpDenyFirst = "deny_first"
 )
 
 var egressSharedAttrs = sync.OnceValue(func() []attribute.KeyValue {
@@ -104,20 +123,12 @@ func registerEgressMetrics() error {
 		"egress.dns.query.duration",
 		metric.WithDescription("DNS forward latency"),
 		metric.WithUnit("s"),
-		// Explicit boundaries: this instrument records seconds, but the SDK default
-		// boundaries are the spec's millisecond ladder (0, 5, 10, ... 10000), so every
-		// realistic DNS latency lands in the same bucket and the quantiles are noise.
-		//
-		// The head spans a cache hit (sub-ms) to one upstream timeout
-		// (DefaultDNSUpstreamTimeoutSec = 5s). The coarse tail covers the retry chain:
-		// forward() walks the resolvers serially, each with the full timeout, and the
-		// recorded duration is the whole chain — so a query can legitimately take
-		// timeout x len(upstreams), and a late *success* lands there too, not just an
-		// exhausted failure. 15s is three resolvers at the default; 600s covers the 120s
-		// per-exchange cap across a handful of them. The chain has no finite worst case
-		// (OPENSANDBOX_EGRESS_DNS_UPSTREAM takes an unbounded resolver list), so past the
-		// last boundary quantile resolution is lost by construction and _count is what
-		// remains — a configuration that gets there has bigger problems than a percentile.
+		// Explicit boundaries: the instrument records seconds, but the SDK default
+		// boundaries are the spec's millisecond ladder, which would collapse every
+		// realistic latency into one bucket. The head covers a cache hit up to one
+		// upstream timeout (5s); the tail must reach past a serial retry chain of
+		// timeout x len(upstreams) — including late successes — hence 600s. See
+		// docs/opentelemetry.md for the full rationale.
 		metric.WithExplicitBucketBoundaries(
 			0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 			15, 30, 60, 120, 300, 600,
@@ -130,6 +141,28 @@ func registerEgressMetrics() error {
 		"egress.dns.query.failed_total",
 		metric.WithDescription("DNS queries the proxy could not resolve, by reason. "+
 			"Distinct from egress.policy.denied_total, which counts deliberate policy denials."),
+	)
+	if err != nil {
+		return err
+	}
+	dnsReplyFailed, err = meter.Int64Counter(
+		"egress.dns.reply.failed_total",
+		metric.WithDescription("DNS reply writes that failed after a decision, by stage. "+
+			"A nonzero count means a query was handled but its answer never reached the client."),
+	)
+	if err != nil {
+		return err
+	}
+	tlsShadowRequests, err = meter.Int64Counter(
+		"egress.mitm.shadow.requests_total",
+		metric.WithDescription("Request-weighted TLS host-scope projections after the existing vault lookup; not connection counts or enforcement decisions."),
+	)
+	if err != nil {
+		return err
+	}
+	tlsAdmissionConnections, err = meter.Int64Counter(
+		"egress.mitm.tls.connections_total",
+		metric.WithDescription("Live TLS admission decisions, not successful handshakes, HTTP requests or unique transport lifetimes; best-effort collection."),
 	)
 	if err != nil {
 		return err
@@ -192,7 +225,57 @@ func registerEgressMetrics() error {
 			return nil
 		}),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	return registerProcessMetrics()
+}
+
+// registerProcessMetrics adds the sidecar's own resource usage, read from its cgroup.
+//
+// The egress.system.* gauges above come from gopsutil, i.e. /proc/meminfo and /proc/stat,
+// which inside a container describe the node. Since this sidecar runs per sandbox, every
+// sandbox on a node publishes the same node figure under its own sandbox_id — series that
+// look per-sandbox but are not. The metrics here are the per-sandbox ones.
+//
+// Registration is conditional: if the cgroup files cannot be read the instruments are not
+// created at all, so a missing source shows up as an absent series rather than a flat zero
+// that reads like real data.
+func registerProcessMetrics() error {
+	if _, ok := processMemoryUsageBytes(); ok {
+		if _, err := meter.Int64ObservableGauge(
+			"egress.process.memory.usage_bytes",
+			metric.WithDescription("Memory currently charged to the egress sidecar's own cgroup."),
+			metric.WithUnit("By"),
+			metric.WithInt64Callback(func(ctx context.Context, obs metric.Int64Observer) error {
+				if value, ok := processMemoryUsageBytes(); ok {
+					obs.Observe(value, egressMetricOpt())
+				}
+				return nil
+			}),
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, ok := processCPUTimeSeconds(); ok {
+		if _, err := meter.Float64ObservableCounter(
+			"egress.process.cpu.time",
+			metric.WithDescription("CPU seconds consumed by the egress sidecar's own cgroup."),
+			metric.WithUnit("s"),
+			metric.WithFloat64Callback(func(ctx context.Context, obs metric.Float64Observer) error {
+				if seconds, ok := processCPUTimeSeconds(); ok {
+					obs.Observe(seconds, egressMetricOpt())
+				}
+				return nil
+			}),
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // ForceFlush exports pending metrics immediately. Callers that are about to terminate the
@@ -225,6 +308,18 @@ func RecordDNSQueryFailed(reason string) {
 		return
 	}
 	dnsQueryFailed.Add(context.Background(), 1, egressMetricOptWith(attribute.String("reason", reason)))
+}
+
+// RecordDNSReplyFailed counts a reply write that failed after the proxy had
+// already decided the answer. stage must be one of the DNSReplyStage*
+// constants. Together with the per-query reply-write log line this turns
+// "queries handled but answers never reaching the client" — previously a
+// silent window — into an observable condition.
+func RecordDNSReplyFailed(stage string) {
+	if dnsReplyFailed == nil {
+		return
+	}
+	dnsReplyFailed.Add(context.Background(), 1, egressMetricOptWith(attribute.String("stage", stage)))
 }
 
 func RecordDNSDenied() {

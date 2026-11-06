@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -21,23 +35,25 @@ function createAdapter(responseBody, opts = {}) {
   );
 }
 
-test("CommandsAdapter.run populates complete and exitCode for successful foreground commands", async () => {
-  const adapter = createAdapter(
-    [
-      'data: {"type":"init","text":"cmd-1","timestamp":1}',
-      'data: {"type":"stdout","text":"hi","timestamp":2}',
-      'data: {"type":"execution_complete","timestamp":3,"execution_time":4}',
-      "",
-    ].join("\n"),
-  );
+for (const explicitExitCode of [false, true]) {
+  test(`CommandsAdapter.run populates complete and exitCode for successful foreground commands (explicit exit code: ${explicitExitCode})`, async () => {
+    const adapter = createAdapter(
+      [
+        'data: {"type":"init","text":"cmd-1","timestamp":1}',
+        'data: {"type":"stdout","text":"hi","timestamp":2}',
+        `data: ${JSON.stringify({ type: "execution_complete", timestamp: 3, execution_time: 4, ...(explicitExitCode ? { exit_code: 0 } : {}) })}`,
+        "",
+      ].join("\n"),
+    );
 
-  const execution = await adapter.run("echo hi");
+    const execution = await adapter.run("echo hi");
 
-  assert.equal(execution.id, "cmd-1");
-  assert.equal(execution.logs.stdout[0].text, "hi");
-  assert.equal(execution.complete?.executionTimeMs, 4);
-  assert.equal(execution.exitCode, 0);
-});
+    assert.equal(execution.id, "cmd-1");
+    assert.equal(execution.logs.stdout[0].text, "hi");
+    assert.equal(execution.complete?.executionTimeMs, 4);
+    assert.equal(execution.exitCode, 0);
+  });
+}
 
 test("CommandsAdapter.run infers non-zero exitCode from final error state", async () => {
   const adapter = createAdapter(
@@ -72,6 +88,106 @@ test("CommandsAdapter.run keeps exitCode null when error value is empty", async 
   assert.equal(execution.error?.value, "");
   assert.equal(execution.complete?.executionTimeMs, 4);
   assert.equal(execution.exitCode, null);
+});
+
+function createEarlyCloseStream() {
+  // Delivers the two SSE chunks one read() at a time, then errors on the
+  // next pull — simulating a peer that closes the connection right after
+  // execution_complete, before the chunked terminator arrives (#1528).
+  const encoder = new TextEncoder();
+  const chunks = [
+    'data: {"type":"init","text":"cmd-bg","timestamp":1}\n\n',
+    'data: {"type":"execution_complete","timestamp":2,"execution_time":3}\n\n',
+  ].map((chunk) => encoder.encode(chunk));
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index]);
+        index += 1;
+        return;
+      }
+      controller.error(new Error("peer closed connection early"));
+    },
+  });
+}
+
+test("CommandsAdapter.run breaks on execution_complete for background commands", async () => {
+  const fetchImpl = async () =>
+    new Response(createEarlyCloseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  const execution = await adapter.run("sleep 1", { background: true });
+
+  assert.equal(execution.id, "cmd-bg");
+  assert.equal(execution.complete?.executionTimeMs, 3);
+  assert.equal(execution.exitCode, undefined);
+});
+
+test("CommandsAdapter.run still surfaces stream errors for foreground commands", async () => {
+  const fetchImpl = async () =>
+    new Response(createEarlyCloseStream(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  await assert.rejects(() => adapter.run("sleep 1"));
+});
+
+test("CommandsAdapter.run cancels the reader when a background command breaks early", async () => {
+  // The stream never signals `done` or errors on its own past
+  // execution_complete -- it simply stops delivering data, the way a
+  // peer that never sends the chunked terminator would behave. If the
+  // completion break left the reader un-cancelled, the stream's `cancel`
+  // hook would never fire and the body would stay locked indefinitely.
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const chunks = [
+    'data: {"type":"init","text":"cmd-cancel","timestamp":1}\n\n',
+    'data: {"type":"execution_complete","timestamp":2,"execution_time":3}\n\n',
+  ].map((chunk) => encoder.encode(chunk));
+  let index = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index]);
+        index += 1;
+      }
+      // Beyond the known chunks: no-op. The underlying source never
+      // closes or errors the stream by itself.
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  const fetchImpl = async () =>
+    new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  const adapter = new CommandsAdapter(
+    {},
+    { baseUrl: "http://127.0.0.1:8080", fetch: fetchImpl },
+  );
+
+  const execution = await adapter.run("sleep 1", { background: true });
+
+  assert.equal(execution.id, "cmd-cancel");
+  assert.equal(cancelled, true);
 });
 
 test("CommandsAdapter.runInSession sends command and timeout fields", async () => {
@@ -131,6 +247,98 @@ test("CommandsAdapter.runInSession infers non-zero exitCode from final error sta
   assert.equal(execution.exitCode, 7);
 });
 
+test("CommandsAdapter.run propagates error.exit_code and prefers it over evalue", async () => {
+  // evalue and exit_code deliberately disagree so the evalue fallback cannot satisfy the test.
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"cmd-exit","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"9","traceback":["exit status 3"],"exit_code":3},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.run("exit 3");
+
+  assert.equal(execution.error?.exitCode, 3);
+  assert.equal(execution.exitCode, 3);
+});
+
+test("CommandsAdapter.run reports a signal kill (exit_code -1) as a failure", async () => {
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"cmd-sig","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"signal: terminated","traceback":["signal: terminated"],"exit_code":-1},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.run("kill -TERM $$");
+
+  assert.equal(execution.error?.exitCode, -1);
+  assert.equal(execution.exitCode, -1);
+  assert.equal(execution.complete, undefined);
+});
+
+test("CommandsAdapter.run leaves exitCode null for start failures without exit_code", async () => {
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"cmd-start","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"fork/exec /bin/sh: argument list too long","traceback":["fork/exec /bin/sh: argument list too long"]},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.run("huge");
+
+  assert.equal(execution.error?.exitCode, undefined);
+  assert.equal(execution.exitCode, null);
+});
+
+test("CommandsAdapter.runInSession propagates error.exit_code", async () => {
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"sess-exit","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"signal: killed","traceback":["signal: killed"],"exit_code":-1},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.runInSession("sess-3", "kill -KILL $$");
+
+  assert.equal(execution.error?.exitCode, -1);
+  assert.equal(execution.exitCode, -1);
+});
+
+test("CommandsAdapter.run ignores a non-integer exit_code and falls back to evalue", async () => {
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"cmd-frac","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"7","traceback":["exit status 7"],"exit_code":3.5},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.run("exit 7");
+
+  assert.equal(execution.error?.exitCode, undefined);
+  assert.equal(execution.exitCode, 7);
+});
+
+test("CommandsAdapter.run ignores a string exit_code and leaves exitCode null without a numeric evalue", async () => {
+  const adapter = createAdapter(
+    [
+      'data: {"type":"init","text":"cmd-str","timestamp":1}',
+      'data: {"type":"error","error":{"ename":"CommandExecError","evalue":"signal: killed","traceback":["signal: killed"],"exit_code":"3"},"timestamp":2}',
+      "",
+    ].join("\n"),
+  );
+
+  const execution = await adapter.run("kill -KILL $$");
+
+  assert.equal(execution.error?.exitCode, undefined);
+  assert.equal(execution.exitCode, null);
+});
+
 test("execd client error message carries unstructured JSON error body", async () => {
   const adapter = new CommandsAdapter(
     createExecdClient({
@@ -153,3 +361,67 @@ test("execd client error message carries unstructured JSON error body", async ()
     },
   );
 });
+
+test("native argv preserves literals and execution options", async () => {
+  const argv = ["tool", "", "a b", "$HOME", "x'y", "中文"];
+  for (const background of [false, true]) {
+    let body;
+    const adapter = new CommandsAdapter({}, {
+      baseUrl: "http://localhost",
+      fetch: async (_url, init) => {
+        body = JSON.parse(init.body);
+        return new Response('data: {"type":"execution_complete"}\n\n', {headers: {"content-type": "text/event-stream"}});
+      },
+    });
+    await adapter.run(argv, {background, workingDirectory: "$DIR", envs: {DIR: "/tmp"}, timeoutSeconds: 2});
+    assert.deepEqual(body, {argv, background, cwd: "$DIR", envs: {DIR: "/tmp"}, timeout: 2000});
+    await assert.rejects(adapter.run([]), /argv/);
+    await assert.rejects(adapter.run(["tool", "\0"]), /argv/);
+  }
+});
+
+test("native argv rejects invalid inputs before transport", async () => {
+  const sparse = ["tool"];
+  sparse.length = 2;
+  let requests = 0;
+  const adapter = new CommandsAdapter({}, {
+    baseUrl: "http://localhost",
+    fetch: async () => { requests++; throw new Error("unexpected request"); },
+  });
+  for (const input of [null, 123, {0: "tool", length: 1}, sparse, [], [""], ["tool", null], ["tool", "\0"]]) {
+    await assert.rejects(adapter.run(input), /argv requires/);
+    await assert.rejects(async () => {
+      for await (const _ of adapter.runStream(input)) { /* consume */ }
+    }, /argv requires/);
+  }
+  assert.equal(requests, 0);
+});
+
+for (const failure of [false, true]) {
+  for (const lateOutput of [false, true]) {
+    test(`foreground drains and releases stream: failure=${failure}, lateOutput=${lateOutput}`, async () => {
+      const terminal = failure
+        ? {type: "error", error: {ename: "CommandExecError", evalue: "7", traceback: []}}
+        : {type: "execution_complete", execution_time: 1};
+      const output = [{type: "stdout", text: "tail"}, {type: "stderr", text: "error-tail"}];
+      const events = lateOutput ? [terminal, ...output] : [...output, terminal];
+      const chunks = events.flatMap((event) => {
+        const frame = new TextEncoder().encode(`data: ${JSON.stringify({...event, timestamp: 1})}\n\n`);
+        return [frame.slice(0, 7), frame.slice(7)];
+      });
+      let exhausted = false;
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (chunks.length) controller.enqueue(chunks.shift());
+          else { exhausted = true; controller.close(); }
+        },
+      });
+      const execution = await createAdapter(stream).run("echo test");
+      assert.deepEqual(execution.logs.stdout.map((item) => item.text), ["tail"]);
+      assert.deepEqual(execution.logs.stderr.map((item) => item.text), ["error-tail"]);
+      assert.equal(execution.exitCode, failure ? 7 : 0);
+      assert.equal(exhausted, true);
+      assert.equal(stream.locked, false);
+    });
+  }
+}

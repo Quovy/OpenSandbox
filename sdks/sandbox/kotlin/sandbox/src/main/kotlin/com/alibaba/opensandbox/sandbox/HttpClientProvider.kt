@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,12 @@ package com.alibaba.opensandbox.sandbox
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.models.execd.SECURE_ACCESS_HEADER
 import com.alibaba.opensandbox.sandbox.transport.RetryInterceptor
+import io.opentelemetry.api.GlobalOpenTelemetry
+import io.opentelemetry.context.Context
+import io.opentelemetry.context.propagation.TextMapPropagator
+import io.opentelemetry.context.propagation.TextMapSetter
 import okhttp3.ConnectionPool
+import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -44,12 +49,27 @@ class HttpClientProvider(
     private val connectionPoolOwnedBySdk: Boolean = config.connectionPool == null
 
     private val baseBuilder: OkHttpClient.Builder
-        get() =
-            OkHttpClient.Builder()
-                .connectionPool(connectionPool)
-                .addInterceptor(UserAgentInterceptor(config.userAgent))
-                .addInterceptor(ExtraHeadersInterceptor(config.headers))
-                .addInterceptor(ClientIpInterceptor { ClientIpDetector.clientIp() })
+        get() {
+            val builder =
+                OkHttpClient.Builder()
+                    .connectionPool(connectionPool)
+                    .addInterceptor(UserAgentInterceptor(config.userAgent))
+                    .addInterceptor(ExtraHeadersInterceptor(config.headers))
+                    .addInterceptor(ClientIpInterceptor { ClientIpDetector.clientIp() })
+            if (config.enableTracing) {
+                // Propagate the active trace context (W3C traceparent) so the
+                // lifecycle server can join the same trace. No-op when there
+                // is no active span in the current context.
+                try {
+                    builder.addInterceptor(
+                        TraceContextInterceptor(GlobalOpenTelemetry.getPropagators().textMapPropagator),
+                    )
+                } catch (_: Throwable) {
+                    // OpenTelemetry is best-effort; keep the original request path operational.
+                }
+            }
+            return builder
+        }
 
     // 1. Explicit lazy definition to allow checking initialization status
     private val httpClientLazy =
@@ -62,6 +82,46 @@ class HttpClientProvider(
         }
 
     val httpClient: OkHttpClient by httpClientLazy
+
+    // File uploads and downloads are transfers that legitimately outlive the
+    // request timeout while they keep making progress, so this client clones the
+    // regular one without the default whole-call deadline. The connect, write,
+    // and read timeouts stay in place, and an explicit
+    // RetryPolicy.overallDeadline remains the wall-clock cap for the transfer: a
+    // stalled transfer, or one that runs past the caller's deadline, still fails
+    // instead of hanging (the Go SDK's ResponseHeaderTimeout contract).
+    private val transferClientLazy =
+        lazy {
+            // OkHttp rejects a call timeout above Int.MAX_VALUE millis, and a
+            // positive deadline that truncates to 0 would silently disable the
+            // cap, so the conversion is clamped instead of passed through.
+            val transferDeadlineMillis =
+                config.retryPolicy.overallDeadline
+                    ?.toMillis()
+                    ?.coerceIn(1L, Int.MAX_VALUE.toLong())
+                    ?: 0L
+            httpClient.newBuilder()
+                .callTimeout(transferDeadlineMillis, TimeUnit.MILLISECONDS)
+                .build()
+        }
+
+    val transferClient: OkHttpClient by transferClientLazy
+
+    // A staged warmup already retries health through its DelayQueue. Clone the
+    // regular client so the warmup-only probe shares its dispatcher, connection
+    // pool, headers, tracing, timeouts, and logging while skipping both retry
+    // owners for exactly one HTTP attempt.
+    private val singleAttemptClientLazy =
+        lazy {
+            httpClient.newBuilder()
+                .apply {
+                    interceptors().removeAll { it is RetryInterceptor }
+                }
+                .retryOnConnectionFailure(false)
+                .build()
+        }
+
+    internal val singleAttemptClient: OkHttpClient by singleAttemptClientLazy
 
     // 2. Explicit lazy definition for authenticated client
     private val authenticatedClientLazy =
@@ -107,6 +167,10 @@ class HttpClientProvider(
      * false), this is a no-op — the caller relies on OkHttp defaults.
      */
     private fun OkHttpClient.Builder.addRetryInterceptor(): OkHttpClient.Builder {
+        if (!config.retryOnConnectionFailure) {
+            retryOnConnectionFailure(false)
+            return this
+        }
         if (config.retryPolicy.wrapsTransport()) {
             retryOnConnectionFailure(false)
             addInterceptor(RetryInterceptor(config.retryPolicy))
@@ -160,8 +224,14 @@ class HttpClientProvider(
 
     private class AuthenticationInterceptor(private val apiKey: String) : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            // An explicit header from ConnectionConfig.headers (matched
+            // case-insensitively by OkHttp) wins over the configured API key.
+            if (apiKey.isBlank() || request.header("OPEN-SANDBOX-API-KEY") != null) {
+                return chain.proceed(request)
+            }
             return chain.proceed(
-                chain.request().newBuilder()
+                request.newBuilder()
                     .header("OPEN-SANDBOX-API-KEY", apiKey)
                     .build(),
             )
@@ -199,6 +269,34 @@ class HttpClientProvider(
                 builder.addHeader(name, value)
             }
             return chain.proceed(builder.build())
+        }
+    }
+
+    /**
+     * Injects the W3C `traceparent` / `tracestate` headers of the current
+     * OpenTelemetry context into every request. When no span is active the
+     * propagator injects nothing and the request passes through unchanged.
+     */
+    private class TraceContextInterceptor(
+        private val propagators: TextMapPropagator,
+    ) : Interceptor {
+        private val setter =
+            TextMapSetter<Headers.Builder> { carrier: Headers.Builder?, key, value ->
+                carrier?.set(key, value)
+            }
+
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            val headers = request.headers.newBuilder()
+            val tracedRequest =
+                try {
+                    propagators.inject(Context.current(), headers, setter)
+                    request.newBuilder().headers(headers.build()).build()
+                } catch (_: Throwable) {
+                    // Trace propagation is best-effort and must never fail an HTTP request.
+                    request
+                }
+            return chain.proceed(tracedRequest)
         }
     }
 

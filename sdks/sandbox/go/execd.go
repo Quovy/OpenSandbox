@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -108,9 +108,15 @@ func (e *ExecdClient) InterruptCode(ctx context.Context, sessionID string) error
 }
 
 // CreateSession creates a new bash session and returns it with a session ID.
-func (e *ExecdClient) CreateSession(ctx context.Context) (*Session, error) {
+// An optional CreateSessionRequest sets the session's working directory.
+// At most one option is honored (first wins, matching DownloadFile).
+func (e *ExecdClient) CreateSession(ctx context.Context, opts ...CreateSessionRequest) (*Session, error) {
+	req := CreateSessionRequest{}
+	if len(opts) > 0 {
+		req = opts[0]
+	}
 	var result Session
-	err := e.client.doRequest(ctx, http.MethodPost, "/session", struct{}{}, &result)
+	err := e.client.doRequest(ctx, http.MethodPost, "/session", req, &result)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +138,25 @@ func (e *ExecdClient) DeleteSession(ctx context.Context, sessionID string) error
 
 // RunCommand executes a shell command and streams output events via SSE.
 func (e *ExecdClient) RunCommand(ctx context.Context, req RunCommandRequest, handler EventHandler) error {
-	return e.client.doStreamRequest(ctx, http.MethodPost, "/command", req, handler)
+	if !req.Background {
+		return e.client.doStreamRequest(ctx, http.MethodPost, "/command", req, handler)
+	}
+	// Returning a private sentinel closes the response without masking callback errors.
+	complete := fmt.Errorf("background command started")
+	err := e.client.doStreamRequest(ctx, http.MethodPost, "/command", req, func(event StreamEvent) error {
+		if err := handler(event); err != nil {
+			return err
+		}
+		var payload struct{ Type string }
+		if json.Unmarshal([]byte(event.Data), &payload) == nil && payload.Type == "execution_complete" {
+			return complete
+		}
+		return nil
+	})
+	if err == complete {
+		return nil
+	}
+	return err
 }
 
 // InterruptCommand interrupts the currently running command execution.
@@ -154,10 +178,14 @@ func (e *ExecdClient) GetCommandStatus(ctx context.Context, commandID string) (*
 	return &result, nil
 }
 
-// GetCommandLogs returns stdout/stderr for a background command. Pass cursor=-1
-// or cursor=0 for the full log. The returned CommandLogsResponse includes the
-// tail cursor for incremental polling.
+// GetCommandLogs returns stdout/stderr for a background command. Pass a nil
+// cursor or cursor=0 for the full log. The returned CommandLogsResponse includes
+// the tail cursor for incremental polling.
 func (e *ExecdClient) GetCommandLogs(ctx context.Context, commandID string, cursor *int64) (*CommandLogsResponse, error) {
+	if cursor != nil && *cursor < 0 {
+		return nil, &InvalidArgumentError{Field: "cursor", Message: "must not be negative"}
+	}
+
 	path := "/command/" + url.PathEscape(commandID) + "/logs"
 	if cursor != nil {
 		path += "?cursor=" + strconv.FormatInt(*cursor, 10)
@@ -331,7 +359,7 @@ func (e *ExecdClient) UploadFiles(ctx context.Context, entries []UploadFileEntry
 		req.Header.Set(e.client.authHeader, e.client.apiKey)
 	}
 
-	resp, err := e.client.httpClient.Do(req)
+	resp, err := e.client.transferHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("opensandbox: do request: %w", err)
 	}
@@ -451,7 +479,7 @@ func (e *ExecdClient) DownloadFile(ctx context.Context, remotePath string, range
 			req.Header.Set("Range", rangeHeader)
 		}
 
-		r, err := e.client.httpClient.Do(req)
+		r, err := e.client.transferHTTPClient().Do(req)
 		if err != nil {
 			return fmt.Errorf("opensandbox: do request: %w", err)
 		}

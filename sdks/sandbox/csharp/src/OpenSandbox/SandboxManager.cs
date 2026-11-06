@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,10 @@ namespace OpenSandbox;
 public sealed class SandboxManager : IAsyncDisposable
 {
     private readonly ISandboxes _sandboxes;
+    private readonly IDiagnostics? _diagnostics;
+
+    private IDiagnostics Diagnostics => _diagnostics
+        ?? throw new NotSupportedException("The adapter factory does not provide diagnostics.");
     private readonly ConnectionConfig _connectionConfig;
     private readonly HttpClientProvider _httpClientProvider;
     private readonly ILogger _logger;
@@ -41,9 +45,11 @@ public sealed class SandboxManager : IAsyncDisposable
         ISandboxes sandboxes,
         ConnectionConfig connectionConfig,
         HttpClientProvider httpClientProvider,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        IDiagnostics? diagnostics)
     {
         _sandboxes = sandboxes;
+        _diagnostics = diagnostics;
         _connectionConfig = connectionConfig;
         _httpClientProvider = httpClientProvider;
         _logger = (loggerFactory ?? NullLoggerFactory.Instance).CreateLogger("OpenSandbox.SandboxManager");
@@ -75,7 +81,7 @@ public sealed class SandboxManager : IAsyncDisposable
                 LoggerFactory = loggerFactory
             });
 
-            return new SandboxManager(lifecycleStack.Sandboxes, connectionConfig, httpClientProvider, loggerFactory);
+            return new SandboxManager(lifecycleStack.Sandboxes, connectionConfig, httpClientProvider, loggerFactory, lifecycleStack.Diagnostics);
         }
         catch (Exception ex)
         {
@@ -111,7 +117,6 @@ public sealed class SandboxManager : IAsyncDisposable
     /// <param name="sandboxId">The sandbox ID.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The sandbox information.</returns>
-    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandboxId"/> is null or empty.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public Task<SandboxInfo> GetSandboxInfoAsync(
         string sandboxId,
@@ -121,6 +126,18 @@ public sealed class SandboxManager : IAsyncDisposable
         return _sandboxes.GetSandboxAsync(sandboxId, cancellationToken);
     }
 
+    /// <summary>Gets backend context without connecting to execd.</summary>
+    public Task<DiagnosticContext> GetDiagnosticContextAsync(string sandboxId, CancellationToken cancellationToken = default) =>
+        Diagnostics.GetContextAsync(sandboxId, cancellationToken);
+
+    /// <summary>Gets a scoped diagnostic log descriptor.</summary>
+    public Task<DiagnosticContent> GetDiagnosticLogsAsync(string sandboxId, string scope, CancellationToken cancellationToken = default) =>
+        Diagnostics.GetLogsAsync(sandboxId, scope, cancellationToken);
+
+    /// <summary>Gets a scoped diagnostic event descriptor.</summary>
+    public Task<DiagnosticContent> GetDiagnosticEventsAsync(string sandboxId, string scope, CancellationToken cancellationToken = default) =>
+        Diagnostics.GetEventsAsync(sandboxId, scope, cancellationToken);
+
     /// <summary>
     /// Patches metadata for a sandbox.
     /// </summary>
@@ -128,7 +145,6 @@ public sealed class SandboxManager : IAsyncDisposable
     /// <param name="patch">Metadata merge patch. Non-null values add or replace keys; null values delete keys.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The current sandbox information after applying the patch.</returns>
-    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandboxId"/> is null or empty.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public Task<SandboxInfo> PatchSandboxMetadataAsync(
         string sandboxId,
@@ -140,11 +156,11 @@ public sealed class SandboxManager : IAsyncDisposable
     }
 
     /// <summary>
-    /// Terminates a sandbox.
+    /// Requests irreversible sandbox termination.
+    /// Completes when deletion is accepted; runtime cleanup may continue afterward.
     /// </summary>
     /// <param name="sandboxId">The sandbox ID.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandboxId"/> is null or empty.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public Task KillSandboxAsync(
         string sandboxId,
@@ -159,7 +175,6 @@ public sealed class SandboxManager : IAsyncDisposable
     /// </summary>
     /// <param name="sandboxId">The sandbox ID.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandboxId"/> is null or empty.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public Task PauseSandboxAsync(
         string sandboxId,
@@ -174,7 +189,6 @@ public sealed class SandboxManager : IAsyncDisposable
     /// </summary>
     /// <param name="sandboxId">The sandbox ID.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="InvalidArgumentException">Thrown when <paramref name="sandboxId"/> is null or empty.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public Task ResumeSandboxAsync(
         string sandboxId,
@@ -190,7 +204,6 @@ public sealed class SandboxManager : IAsyncDisposable
     /// <param name="sandboxId">The sandbox ID.</param>
     /// <param name="timeoutSeconds">The new timeout in seconds from now.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="InvalidArgumentException">Thrown when arguments are invalid.</exception>
     /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
     public async Task RenewSandboxAsync(
         string sandboxId,
@@ -235,6 +248,75 @@ public sealed class SandboxManager : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         return _sandboxes.DeleteSnapshotAsync(snapshotId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Creates a fsb template (golden-image build).
+    /// </summary>
+    /// <remarks>
+    /// The build is asynchronous: the response starts at phase Pending;
+    /// poll <see cref="GetTemplateAsync"/> until the phase is Succeeded.
+    /// Only Succeeded templates can back template-based sandbox creation.
+    /// Template management requires a Kubernetes-backed runtime.
+    /// </remarks>
+    /// <param name="request">The create template request.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The created template.</returns>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task<TemplateInfo> CreateTemplateAsync(
+        CreateTemplateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Creating template for image: {Image}", request.Image);
+        return _sandboxes.CreateTemplateAsync(request, cancellationToken);
+    }
+
+    /// <summary>
+    /// Gets a template with its latest build status by id.
+    /// </summary>
+    /// <param name="templateId">The template ID.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The template information.</returns>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task<TemplateInfo> GetTemplateAsync(
+        string templateId,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogDebug("Fetching template: {TemplateId}", templateId);
+        return _sandboxes.GetTemplateAsync(templateId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Lists templates with optional metadata filtering (AND logic) and pagination.
+    /// </summary>
+    /// <param name="filter">Optional filter criteria.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The list of templates.</returns>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task<ListTemplatesResponse> ListTemplatesAsync(
+        TemplateFilter? filter = null,
+        CancellationToken cancellationToken = default)
+    {
+        return _sandboxes.ListTemplatesAsync(new ListTemplatesParams
+        {
+            Metadata = filter?.Metadata,
+            Page = filter?.Page,
+            PageSize = filter?.PageSize
+        }, cancellationToken);
+    }
+
+    /// <summary>
+    /// Deletes a template by id. Running sandboxes created from it are unaffected.
+    /// </summary>
+    /// <param name="templateId">The template ID.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task DeleteTemplateAsync(
+        string templateId,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Deleting template: {TemplateId}", templateId);
+        return _sandboxes.DeleteTemplateAsync(templateId, cancellationToken);
     }
 
     /// <summary>

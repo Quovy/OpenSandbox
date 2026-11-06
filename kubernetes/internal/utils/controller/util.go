@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// GetControllerKey return key of CloneSet.
+// GetControllerKey returns the namespace/name key of the given object.
 func GetControllerKey(obj metav1.Object) string {
 	return types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}.String()
 }

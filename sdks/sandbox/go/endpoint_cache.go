@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ func cloneEndpoint(ep *Endpoint) *Endpoint {
 	for k, v := range ep.Headers {
 		headers[k] = v
 	}
-	return &Endpoint{Endpoint: ep.Endpoint, Headers: headers}
+	return &Endpoint{Endpoint: ep.Endpoint, Headers: headers, Origin: ep.Origin}
 }
 
 // EndpointCache is a thread-safe LRU+TTL cache for sandbox endpoints.

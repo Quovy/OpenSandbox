@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -338,7 +338,7 @@ func TestRecreateUpdateStrategy_Compute_Sorting(t *testing.T) {
 		if pod.Labels == nil {
 			pod.Labels = make(map[string]string)
 		}
-		pod.Labels[LabelPoolRevision] = "v1"
+		pod.Labels[labelPoolRevision] = "v1"
 	}
 
 	strategy := &recreateUpdateStrategy{pool: pool}
@@ -366,7 +366,7 @@ func makePod(name, revision string, ready, idle bool) *v1.Pod {
 				metav1.Now().Add(time.Duration(podCreationCounter) * time.Second),
 			),
 			Labels: map[string]string{
-				LabelPoolRevision: revision,
+				labelPoolRevision: revision,
 			},
 		},
 		Spec: v1.PodSpec{
