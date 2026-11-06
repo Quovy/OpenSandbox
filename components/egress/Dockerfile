@@ -108,6 +108,15 @@ RUN apk add --no-cache \
         python-3.11 \
         sudo
 
+# wolfi links iptables to the legacy xtables backend, which needs the
+# iptable_nat module and CAP_NET_RAW; the sidecar runs with NET_ADMIN only
+# (nat table "does not exist"). Debian's default is the nft backend, so
+# match it.
+RUN for tool in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \
+        ln -sf xtables-nft-multi /usr/sbin/$tool; \
+    done \
+    && iptables --version | grep -q nf_tables
+
 # Python mitmproxy (transparent mode): mitmdump runs as user mitmproxy; iptables skips this uid.
 # /var/lib/mitmproxy is mitm's home, used as the confdir (CA + config.yaml live under .mitmproxy/).
 COPY components/egress/requirements-mitmproxy.txt /tmp/requirements-mitmproxy.txt
