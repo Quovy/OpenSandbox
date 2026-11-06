@@ -112,10 +112,12 @@ RUN apk add --no-cache \
 # iptable_nat module and CAP_NET_RAW; the sidecar runs with NET_ADMIN only
 # (nat table "does not exist"). Debian's default is the nft backend, so
 # match it.
+# Checked by readlink, not by running iptables: the arm64 leg of the publish
+# workflow builds under QEMU, where iptables cannot open its nft socket.
 RUN for tool in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \
         ln -sf xtables-nft-multi /usr/sbin/$tool; \
     done \
-    && iptables --version | grep -q nf_tables
+    && [ "$(readlink /usr/sbin/iptables)" = xtables-nft-multi ]
 
 # Python mitmproxy (transparent mode): mitmdump runs as user mitmproxy; iptables skips this uid.
 # /var/lib/mitmproxy is mitm's home, used as the confdir (CA + config.yaml live under .mitmproxy/).
