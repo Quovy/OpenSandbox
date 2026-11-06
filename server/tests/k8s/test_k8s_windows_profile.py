@@ -174,7 +174,11 @@ class TestApplyWindowsProfileOverrides:
             "./execd.exe /oem/execd.exe",
         ]
         security_context = pod_spec["initContainers"][0]["securityContext"]
-        assert security_context == {"privileged": True}
+        assert security_context == {
+            "privileged": True,
+            "runAsNonRoot": False,
+            "runAsUser": 0,
+        }
 
     def test_custom_entrypoint_sets_command(self):
         pod_spec = self._make_pod_spec()
