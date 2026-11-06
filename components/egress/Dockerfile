@@ -138,11 +138,13 @@ COPY --from=builder /out/egress-trace /opt/opensandbox-egress/egress-trace
 # is intentionally NOT touched — the nftables manager prepends its own delete
 # and recreates the table on every ApplyStatic, so it is idempotent.
 COPY components/egress/scripts/cleanup.sh /opt/opensandbox-egress/cleanup.sh
+# wolfi-base ships no /usr/local/bin; create it before the egress-trace link.
 RUN chmod 0755 /opt/opensandbox-egress/cleanup.sh \
             /opt/opensandbox-egress/egress \
             /opt/opensandbox-egress/supervisor \
             /opt/opensandbox-egress/egress-trace \
     && ln -s /opt/opensandbox-egress/egress /egress \
+    && mkdir -p /usr/local/bin \
     && ln -s /opt/opensandbox-egress/egress-trace /usr/local/bin/egress-trace
 
 COPY components/egress/mitmscripts /var/egress/mitmscripts
