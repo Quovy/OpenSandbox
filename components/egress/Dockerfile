@@ -120,6 +120,15 @@ RUN addgroup -S -g 10042 mitmproxy \
     && rm -rf /root/.cache \
     && mkdir -p /var/egress/mitmscripts
 
+# mitmproxy 11.0.2 (held exact by the credential_bound_h2 gate) declares
+# h11<=0.14.0 and Brotli<=1.1.0, both with Critical CVEs that the publish
+# workflow's Trivy gate rejects (CVE-2025-43859, CVE-2026-111497). mitmproxy
+# 12.x pins exactly these fixed versions, and the egress suite passes with
+# them, so they are installed past the declared bound. Re-check when the
+# mitmproxy pin moves.
+RUN pip3.11 install --no-cache-dir --no-deps h11==0.16.0 Brotli==1.2.1 \
+    && rm -rf /root/.cache
+
 # Static mitmproxy options (mode, listen_host, connection_strategy, stream_large_bodies,
 # http2, ignore_hosts, ssl_verify_upstream_trusted_confdir). mitmdump auto-loads
 # config.yaml from its confdir. Dynamic per-deployment options stay env-driven and
