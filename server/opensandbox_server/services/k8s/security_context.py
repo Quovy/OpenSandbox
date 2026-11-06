@@ -81,10 +81,10 @@ def serialize_security_context_to_dict(
     if security_context.privileged is not None:
         result["privileged"] = security_context.privileged
 
-    if getattr(security_context, "run_as_non_root", None) is not None:
+    if security_context.run_as_non_root is not None:
         result["runAsNonRoot"] = security_context.run_as_non_root
 
-    if getattr(security_context, "run_as_user", None) is not None:
+    if security_context.run_as_user is not None:
         result["runAsUser"] = security_context.run_as_user
 
     if getattr(security_context, "seccomp_profile", None) is not None:

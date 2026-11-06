@@ -40,6 +40,11 @@ from opensandbox_server.services.constants import (
 from opensandbox_server.services.helpers import upstream_proxy_egress_env
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 
+# A pod-level non-root UID would clear NET_ADMIN from the sidecar's effective
+# capability set and make the init container's sysctl write fail with EPERM,
+# so the egress containers carry an explicit, container-scoped root exception.
+_ROOT_CONTAINER_OVERRIDES: Dict[str, Any] = {"runAsNonRoot": False, "runAsUser": 0}
+
 _IPV6_DISABLE_PATH = "/proc/sys/net/ipv6/conf/all/disable_ipv6"
 
 
@@ -52,10 +57,6 @@ def prep_execd_init_for_egress(exec_install_script: str) -> tuple[str, Dict[str,
     remains fatal. The returned security context dict must be applied to the execd init
     container (typically via ``build_security_context_from_dict`` in ``security_context``).
 
-    A pod-level non-root UID otherwise overrides this init container and makes
-    the sysctl write fail with EPERM. Keep the root exception explicit and
-    local to the privileged init container.
-
     Returns:
         The prefixed shell script and its privileged root security context.
     """
@@ -64,11 +65,7 @@ def prep_execd_init_for_egress(exec_install_script: str) -> tuple[str, Dict[str,
         f"set -e; if [ -e {ipv6_disable_path} ]; then "
         f"echo 1 > {ipv6_disable_path}; fi; {exec_install_script}"
     )
-    return script, {
-        "privileged": True,
-        "runAsNonRoot": False,
-        "runAsUser": 0,
-    }
+    return script, {"privileged": True, **_ROOT_CONTAINER_OVERRIDES}
 
 
 def build_security_context_for_sandbox_container(
@@ -165,11 +162,7 @@ def apply_egress_to_spec(
         "env": env,
         "securityContext": {
             "capabilities": {"add": ["NET_ADMIN"]},
-            # A pod-level non-root UID clears NET_ADMIN from the effective
-            # capability set. The sidecar must retain it to install the
-            # nftables/iptables policy, so scope the root exception here.
-            "runAsNonRoot": False,
-            "runAsUser": 0,
+            **_ROOT_CONTAINER_OVERRIDES,
         },
         "ports": [{"name": "egress-api", "containerPort": 18080}],
         "readinessProbe": {
