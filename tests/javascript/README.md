@@ -26,7 +26,8 @@ cd OpenSandbox/tests/javascript
 source ~/.nvm/nvm.sh
 nvm use 26
 
-# Ensure pnpm is available (repo pins pnpm@9.x); Node 26 no longer bundles corepack
+# Ensure pnpm is available (repo pins pnpm@9.x)
+# Node 26 no longer bundles corepack; skip this install on Node 20-24, which bundle it
 npm install -g corepack@0.36.0
 corepack enable
 corepack prepare pnpm@9.15.0 --activate
