@@ -77,7 +77,8 @@ sleep 10
 # run JavaScript/TypeScript e2e (SDK builds are handled by the test script)
 cd tests/javascript
 
-# Pin pnpm via corepack (repo expects pnpm@9.x)
+# Pin pnpm via corepack (repo expects pnpm@9.x). Node 26 no longer bundles corepack.
+npm install -g corepack@0.36.0
 corepack enable
 corepack prepare pnpm@9.15.0 --activate
 
