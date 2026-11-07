@@ -24,9 +24,11 @@ cd OpenSandbox/tests/javascript
 
 # Node >= 20 is required (SDK engines: node >= 20)
 source ~/.nvm/nvm.sh
-nvm use 22
+nvm use 26
 
 # Ensure pnpm is available (repo pins pnpm@9.x)
+# Node 26 no longer bundles corepack; skip this install on Node 20-24, which bundle it
+npm install -g corepack@0.36.0
 corepack enable
 corepack prepare pnpm@9.15.0 --activate
 
