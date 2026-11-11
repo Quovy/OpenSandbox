@@ -75,7 +75,7 @@ def sandbox_pair(tmp_path, request):
     delay = mode if isinstance(mode, int) else 0
     response_status = 500 if mode == "retry" else 200
     try:
-        collector = client.containers.run("node:24-bookworm-slim", ["node", "-e", f"""
+        collector = client.containers.run("node:26-bookworm-slim", ["node", "-e", f"""
 const events = [];
 require('http').createServer((req, res) => {{
   if (req.method === 'GET') {{ res.end(JSON.stringify(events)); return; }}
@@ -106,7 +106,7 @@ require('http').createServer((req, res) => {{
         sidecar.reload()
         port = sidecar.attrs["NetworkSettings"]["Ports"]["18080/tcp"][0]["HostPort"]
         wait_http(f"http://127.0.0.1:{port}/healthz")
-        app = client.containers.run("node:24-bookworm-slim", ["sleep", "600"], detach=True,
+        app = client.containers.run("node:26-bookworm-slim", ["sleep", "600"], detach=True,
                                     name=f"sandbox-{sandbox_id}", network_mode=f"container:{sidecar.id}",
                                     volumes=mount, labels={SANDBOX_ID_LABEL: sandbox_id,
                                     SANDBOX_MANAGED_VOLUMES_LABEL: json.dumps([volume.name])})
