@@ -38,7 +38,11 @@ from websockets.typing import Origin
 from opensandbox_server.api import lifecycle
 from opensandbox_server.config import get_config
 from opensandbox_server.api.schema import Endpoint
-from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
+from opensandbox_server.middleware.auth import (
+    SANDBOX_API_KEY_HEADER,
+    configured_api_keys,
+    is_valid_api_key,
+)
 from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADER, OPEN_SANDBOX_SECURE_ACCESS_HEADER
 from opensandbox_server.tenants.context import set_current_tenant
 from opensandbox_server.tenants.provider import TenantProviderUnavailable
@@ -257,15 +261,16 @@ def _schedule_proxy_renew(request: Request | WebSocket, sandbox_id: str) -> None
         proxy_renew.schedule(sandbox_id)
 
 
-async def _authenticate_websocket_tenant(websocket: WebSocket) -> bool:
-    """Authenticate WebSocket connections in multi-tenant mode.
+async def _authenticate_websocket(websocket: WebSocket) -> bool:
+    """Apply AuthMiddleware's API-key rules to a WebSocket.
 
     BaseHTTPMiddleware only intercepts HTTP requests, so WebSocket
-    connections must be authenticated here to establish tenant context.
-    Returns True if the request is authorized (or single-tenant mode).
+    connections must be authenticated here, and in multi-tenant mode this
+    also establishes tenant context. Returns True if the request is authorized.
     """
     provider = getattr(websocket.app.state, "tenant_provider", None)
-    if provider is None:
+    valid_api_keys = configured_api_keys(get_config())
+    if provider is None and not valid_api_keys:
         return True
 
     api_key = websocket.headers.get(SANDBOX_API_KEY_HEADER)
@@ -274,6 +279,15 @@ async def _authenticate_websocket_tenant(websocket: WebSocket) -> bool:
             websocket, status.WS_1008_POLICY_VIOLATION, "missing API key"
         )
         return False
+
+    if provider is None:
+        if not is_valid_api_key(api_key, valid_api_keys):
+            await _fail_client_websocket(
+                websocket, status.WS_1008_POLICY_VIOLATION, "invalid API key"
+            )
+            return False
+        set_current_tenant(None)
+        return True
 
     try:
         tenant = await asyncio.to_thread(provider.lookup, api_key)
@@ -583,7 +597,7 @@ async def _proxy_websocket_request(
     port: int,
     full_path: str,
 ) -> None:
-    if not await _authenticate_websocket_tenant(websocket):
+    if not await _authenticate_websocket(websocket):
         return
 
     try:

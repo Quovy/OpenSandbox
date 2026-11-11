@@ -245,8 +245,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
         # No tenant provider (single-tenant mode): the server owns exactly
         # its configured namespace. Resolving beyond it could reach sandboxes
-        # of other servers in the cluster, and single-tenant proxy routes
-        # are unauthenticated, so the lookup stays namespace-scoped.
+        # of other servers in the cluster, so the lookup stays namespace-scoped.
         return None
 
     def _find_sandbox_namespace_cluster_wide(self, sandbox_id: str) -> Optional[str]:
