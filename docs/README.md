@@ -5,7 +5,7 @@ This directory hosts the VitePress site for OpenSandbox.
 ## Local development
 
 ```bash
-nvm use 22
+nvm use 26
 cd docs
 pnpm install
 pnpm docs:dev
@@ -14,7 +14,7 @@ pnpm docs:dev
 ## Build
 
 ```bash
-nvm use 22
+nvm use 26
 cd docs
 pnpm install
 pnpm docs:build

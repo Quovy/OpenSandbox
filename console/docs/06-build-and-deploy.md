@@ -32,12 +32,12 @@ docker login "${REGISTRY}"
 
 ### Base image `--build-arg`
 
-Defaults: `python:3.12-slim`, `node:22-alpine`, `nginx:1.27-alpine`. Mirror to private registry if needed:
+Defaults: `python:3.12-slim`, `node:26-alpine`, `nginx:1.27-alpine`. Mirror to private registry if needed:
 
 ```bash
 export BASE=YOUR_REGISTRY.example.com/mirror
 export PYTHON_IMAGE="${BASE}/python:3.12-slim"
-export NODE_IMAGE="${BASE}/node:22-alpine"
+export NODE_IMAGE="${BASE}/node:26-alpine"
 export NGINX_IMAGE="${BASE}/nginx:1.27-alpine"
 ```
 
@@ -56,7 +56,7 @@ docker buildx build --platform "${PLATFORM}" \
 
 ```bash
 docker buildx build --platform "${PLATFORM}" \
-  --build-arg NODE_IMAGE="${NODE_IMAGE:-node:22-alpine}" \
+  --build-arg NODE_IMAGE="${NODE_IMAGE:-node:26-alpine}" \
   --build-arg NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.27-alpine}" \
   -t "${REGISTRY}/opensandbox-console-web:${TAG}" \
   -f console/web/Dockerfile \

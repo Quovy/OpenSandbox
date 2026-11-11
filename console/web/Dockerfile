@@ -14,7 +14,7 @@
 
 # 默认非 root nginx（uid 101，监听 8080）。内网：--build-arg NODE_IMAGE=... --build-arg NGINX_IMAGE=...
 # 平台由 buildx --platform linux/amd64 指定
-ARG NODE_IMAGE=node:22-alpine
+ARG NODE_IMAGE=node:26-alpine
 ARG NGINX_IMAGE=nginxinc/nginx-unprivileged:1.27-alpine
 
 FROM ${NODE_IMAGE} AS build
