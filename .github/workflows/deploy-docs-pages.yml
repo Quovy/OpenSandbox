@@ -28,10 +28,10 @@ jobs:
         id: pages
         uses: actions/configure-pages@v5
 
-      - name: Setup Node 22
+      - name: Setup Node 26
         uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "26"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -39,7 +39,7 @@ jobs:
           version: 9.15.0
 
       - name: Enable corepack
-        run: corepack enable
+        run: npm install -g corepack@0.36.0 && corepack enable
 
       - name: Install docs dependencies
         working-directory: docs
