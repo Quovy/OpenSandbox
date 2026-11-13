@@ -16,7 +16,9 @@ concurrency:
 jobs:
   system-prune:
     name: Runner system prune
+    if: vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

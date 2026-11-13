@@ -32,7 +32,7 @@ jobs:
   integration:
     name: Integration Env (self-hosted kvm)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: kvm
     timeout-minutes: 240
     env:

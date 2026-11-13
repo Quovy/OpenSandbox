@@ -30,8 +30,9 @@ jobs:
   python-e2e:
     name: Python E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -134,8 +135,9 @@ jobs:
   python-execd-init-e2e:
     name: Python Execd-Init E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -212,8 +214,9 @@ jobs:
   python-execd-hardening-e2e:
     name: Python Execd-Hardening E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -266,8 +269,9 @@ jobs:
   java-e2e:
     name: Java E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -386,8 +390,9 @@ jobs:
   javascript-e2e:
     name: JavaScript E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -495,8 +500,9 @@ jobs:
   csharp-e2e:
     name: C# E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -589,8 +595,9 @@ jobs:
   go-e2e:
     name: Go E2E (docker bridge)
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 30
     env:
       RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
@@ -698,12 +705,16 @@ jobs:
           JAVASCRIPT_RESULT: ${{ needs.javascript-e2e.result }}
           CSHARP_RESULT: ${{ needs.csharp-e2e.result }}
           GO_RESULT: ${{ needs.go-e2e.result }}
+          SELF_HOSTED: ${{ vars.ENABLE_SELF_HOSTED_RUNNERS == 'true' }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change detection failed: $CHANGES_RESULT"
             exit 1
           fi
-          if [[ "$RELEVANT" == "true" ]]; then
+          if [[ "$RELEVANT" == "true" && "$SELF_HOSTED" != "true" ]]; then
+            echo "::warning::Self-hosted jobs skipped: repo variable ENABLE_SELF_HOSTED_RUNNERS is not 'true'"
+            [[ "$PYTHON_RESULT" == "skipped" && "$JAVA_RESULT" == "skipped" && "$JAVASCRIPT_RESULT" == "skipped" && "$CSHARP_RESULT" == "skipped" && "$GO_RESULT" == "skipped" ]]
+          elif [[ "$RELEVANT" == "true" ]]; then
             [[ "$PYTHON_RESULT" == "success" && "$JAVA_RESULT" == "success" && "$JAVASCRIPT_RESULT" == "success" && "$CSHARP_RESULT" == "success" && "$GO_RESULT" == "success" ]]
           else
             [[ "$RELEVANT" == "false" && "$PYTHON_RESULT" == "skipped" && "$JAVA_RESULT" == "skipped" && "$JAVASCRIPT_RESULT" == "skipped" && "$CSHARP_RESULT" == "skipped" && "$GO_RESULT" == "skipped" ]]

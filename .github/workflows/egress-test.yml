@@ -284,8 +284,9 @@ jobs:
 
   smoke:
     needs: changes
-    if: needs.changes.outputs.relevant == 'true'
+    if: needs.changes.outputs.relevant == 'true' && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: self-hosted
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -386,12 +387,16 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
           FAST_SANDBOX_SMOKE_RESULT: ${{ needs.fast-sandbox-smoke.result }}
+          SELF_HOSTED: ${{ vars.ENABLE_SELF_HOSTED_RUNNERS == 'true' }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change detection failed: $CHANGES_RESULT"
             exit 1
           fi
-          if [[ "$RELEVANT" == "true" ]]; then
+          if [[ "$RELEVANT" == "true" && "$SELF_HOSTED" != "true" ]]; then
+            echo "::warning::Self-hosted jobs skipped: repo variable ENABLE_SELF_HOSTED_RUNNERS is not 'true'"
+            [[ "$TEST_RESULT" == "success" && "$SMOKE_RESULT" == "skipped" && "$FAST_SANDBOX_SMOKE_RESULT" == "success" ]]
+          elif [[ "$RELEVANT" == "true" ]]; then
             [[ "$TEST_RESULT" == "success" && "$SMOKE_RESULT" == "success" && "$FAST_SANDBOX_SMOKE_RESULT" == "success" ]]
           else
             [[ "$RELEVANT" == "false" && "$TEST_RESULT" == "skipped" && "$SMOKE_RESULT" == "skipped" && "$FAST_SANDBOX_SMOKE_RESULT" == "skipped" ]]

@@ -365,7 +365,7 @@ jobs:
   # nightly/dispatch only, KVM runner.
   fast-sandbox-full-stack:
     name: Fast Sandbox Full-Stack E2E (KVM)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.ENABLE_SELF_HOSTED_RUNNERS == 'true'
     runs-on: kvm
     timeout-minutes: 180
     env:
