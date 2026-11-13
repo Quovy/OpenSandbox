@@ -23,6 +23,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
+from starlette.websockets import WebSocketDisconnect
 from starlette.types import Message
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close, CloseCode
@@ -31,6 +32,7 @@ from websockets.typing import Origin
 import opensandbox_server.api.proxy as proxy_api
 from opensandbox_server.api import lifecycle
 from opensandbox_server.api.schema import Endpoint
+from opensandbox_server.config import get_config
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
 from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADER, OPEN_SANDBOX_INGRESS_HEADER
 from opensandbox_server.services.constants import OPEN_SANDBOX_SECURE_ACCESS_HEADER
@@ -1423,6 +1425,39 @@ def test_proxy_websocket_endpoint_lookup_sees_the_tenant(
     assert seen == [tenant]
 
 
+@pytest.mark.parametrize(
+    ("headers", "reason"),
+    [({}, "missing API key"), ({SANDBOX_API_KEY_HEADER: "wrong-key"}, "invalid API key")],
+)
+def test_proxy_websocket_requires_server_api_key_in_single_tenant_mode(
+    client: TestClient,
+    monkeypatch,
+    headers: dict,
+    reason: str,
+) -> None:
+    # AuthMiddleware never sees a WebSocket; without this check a sandbox that
+    # reaches the server could open exec or CDP sockets in any other sandbox.
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            raise AssertionError("an unauthenticated WebSocket must not resolve a sandbox")
+
+    monkeypatch.setattr(client.app.state, "tenant_provider", None, raising=False)
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    monkeypatch.setattr(
+        proxy_api,
+        "get_config",
+        lambda: SimpleNamespace(server=SimpleNamespace(api_key="server-key")),
+    )
+
+    with client.websocket_connect("/v1/sandboxes/sbx-123/proxy/44772/ws", headers=headers) as websocket:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            websocket.receive_text()
+
+    assert exc_info.value.code == CloseCode.POLICY_VIOLATION
+    assert exc_info.value.reason == reason
+
+
 @pytest.mark.parametrize("configured_resolve_internal", [True, False])
 def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     client: TestClient,
@@ -1451,7 +1486,8 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
         proxy_api,
         "get_config",
         lambda: SimpleNamespace(
-            proxy=SimpleNamespace(resolve_internal=configured_resolve_internal)
+            server=get_config().server,
+            proxy=SimpleNamespace(resolve_internal=configured_resolve_internal),
         ),
     )
     backend = _FakeBackendWebSocket()

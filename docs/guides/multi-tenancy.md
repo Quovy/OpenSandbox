@@ -14,8 +14,8 @@ Multi-tenancy enables a single OpenSandbox Server deployment to serve multiple i
 - One Kubernetes namespace per tenant, **pre-created by a cluster admin**
 - Default Helm chart RBAC (already includes ClusterRole with cross-namespace access)
 
-::: tip Proxy routes in multi-tenant mode
-Unlike single-tenant mode, proxy routes require `OPEN-SANDBOX-API-KEY` when multi-tenancy is enabled. Ensure clients include the header for proxy requests.
+::: tip Proxy routes require the API key
+Proxy routes, HTTP and WebSocket, require `OPEN-SANDBOX-API-KEY` whenever multi-tenancy is enabled or the server has an API key. Ensure clients include the header for proxy requests.
 :::
 
 ::: warning Docker not supported

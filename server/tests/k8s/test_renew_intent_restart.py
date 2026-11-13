@@ -221,7 +221,7 @@ def test_single_tenant_lookup_stays_in_configured_namespace(k8s_service, mock_wo
 
     A server without a tenant provider owns exactly its configured
     namespace; resolving a foreign id beyond it could reach other servers'
-    sandboxes, and single-tenant proxy routes are unauthenticated.
+    sandboxes.
     """
     k8s_service.workload_provider.get_workload.return_value = None
 

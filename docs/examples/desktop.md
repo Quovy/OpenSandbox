@@ -97,9 +97,9 @@ server {
 }
 ```
 
-This direct browser URL works when the OpenSandbox proxy route does not require browser-supplied authentication headers, including the default single-tenant mode. In multi-tenant mode, the proxy route requires `OPEN-SANDBOX-API-KEY` on both the initial noVNC HTTP request and the WebSocket upgrade. The SDK adds this header to its own requests, but a browser navigation or WebSocket cannot add it.
+This direct browser URL works only when the server has no API key configured and runs single-tenant. Whenever the server has an API key, or runs multi-tenant, the proxy route requires `OPEN-SANDBOX-API-KEY` on both the initial noVNC HTTP request and the WebSocket upgrade. The SDK adds this header to its own requests, but a browser navigation or WebSocket cannot add it.
 
-For multi-tenant browser access, put a trusted, browser-authenticated reverse proxy in front of OpenSandbox. It must authorize access to the requested sandbox, map the browser identity to the correct tenant, and inject that tenant's `OPEN-SANDBOX-API-KEY` header for both HTTP and WebSocket traffic. Do not put the API key in the noVNC URL or expose a reverse proxy that adds one shared key to unauthenticated traffic.
+For browser access to a server with an API key, put a trusted, browser-authenticated reverse proxy in front of OpenSandbox. It must authorize access to the requested sandbox, map the browser identity to the correct tenant, and inject that tenant's `OPEN-SANDBOX-API-KEY` header for both HTTP and WebSocket traffic. Do not put the API key in the noVNC URL or expose a reverse proxy that adds one shared key to unauthenticated traffic.
 
 ::: warning
 Do not expose a direct `http://<sandbox-host>:<mapped-port>` URL in an HTTPS iframe. That endpoint has no TLS termination and the browser will reject it as mixed content. This SDK configuration uses one protocol for the management API and sandbox service requests, so the example requires `SANDBOX_USE_SERVER_PROXY=true` whenever the management API uses HTTPS. This keeps lifecycle, execd, noVNC page, and WebSocket traffic on the HTTPS server origin instead of incorrectly sending HTTPS to a direct sandbox endpoint. Server proxy mode does not support the raw TCP protocol used by native VNC clients, so the example omits the native VNC endpoint in this mode.

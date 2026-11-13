@@ -20,8 +20,8 @@ Supports two modes:
 - Multi-tenant: delegates to a TenantProvider for key→tenant resolution
 """
 
+import hmac
 import logging
-import re
 from typing import Callable, Optional
 
 from fastapi import Request, Response, status
@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 SANDBOX_API_KEY_HEADER = "OPEN-SANDBOX-API-KEY"
 
 
+def configured_api_keys(config: AppConfig) -> set[str]:
+    """Single-tenant keys; empty means single-tenant auth is off."""
+    api_key = config.server.api_key
+    if api_key and api_key.strip():
+        return {api_key}
+    return set()
+
+
+def is_valid_api_key(supplied: str, valid_api_keys: set[str]) -> bool:
+    return any(hmac.compare_digest(supplied.encode(), key.encode()) for key in valid_api_keys)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """
     Middleware for API Key authentication.
@@ -48,28 +60,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
     # Paths that don't require authentication
     EXEMPT_PATHS = ["/health", "/version", "/docs", "/redoc", "/openapi.json"]
 
-    # Strict pattern for proxy-to-sandbox: /sandboxes/{id}/proxy/{port}/... with numeric port only.
-    # Matches the actual route in proxy.py; rejects path traversal (..) and malformed port.
-    _PROXY_PATH_RE = re.compile(r"^(/v1)?/sandboxes/[^/]+/proxy/\d+(/|$)")
-
-    @staticmethod
-    def _is_proxy_path(path: str) -> bool:
-        """True only for the exact proxy-route shape; rejects path traversal (..)."""
-        if ".." in path:
-            return False
-        return bool(AuthMiddleware._PROXY_PATH_RE.match(path))
-
     def __init__(self, app, config: Optional[AppConfig] = None, tenant_provider: Optional[TenantProvider] = None):
         super().__init__(app)
         self.config = config or get_config()
         self.tenant_provider = tenant_provider
-        self.valid_api_keys = self._load_api_keys()
-
-    def _load_api_keys(self) -> set:
-        api_key = self.config.server.api_key
-        if api_key and api_key.strip():
-            return {api_key}
-        return set()
+        self.valid_api_keys = configured_api_keys(self.config)
 
     @property
     def _is_multi_tenant(self) -> bool:
@@ -77,9 +72,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if any(request.url.path.startswith(path) for path in self.EXEMPT_PATHS):
-            return await call_next(request)
-
-        if self._is_proxy_path(request.url.path) and not self._is_multi_tenant:
             return await call_next(request)
 
         # If no API keys configured AND no tenant provider → skip auth
@@ -138,7 +130,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def _authenticate_single_tenant(
         self, api_key: str, request: Request, call_next: Callable
     ) -> Response:
-        if self.valid_api_keys and api_key not in self.valid_api_keys:
+        if self.valid_api_keys and not is_valid_api_key(api_key, self.valid_api_keys):
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 content={
